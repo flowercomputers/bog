@@ -1,0 +1,189 @@
+use std::borrow::Cow;
+
+use crate::Delta;
+
+pub(crate) enum ValOp<M: Merge> {
+    Store(M::Value),
+    Modify(M::Diff),
+    Delete,
+}
+
+pub trait Merge: 'static {
+    type Diff: 'static + Clone;
+    type Value: Clone;
+
+    fn base() -> Self::Value;
+    fn merge<'a>(val: &mut Self::Value, diffs: impl Iterator<Item = Cow<'a, Self::Diff>>);
+    fn combine<'a>(old: &mut Self::Diff, new: impl Iterator<Item = Cow<'a, Self::Diff>>);
+    fn scale(diff: &mut Self::Diff, times: Delta);
+
+    /// Optional fast path for determining when a value should automatically be considered deleted
+    fn consider_delete(val: &Self::Value) -> bool {
+        false
+    }
+    /// Optional fast path for determining if a diff is a no-op
+    fn noop(diff: &Self::Diff) -> bool {
+        false
+    }
+}
+
+impl Merge for () {
+    type Diff = ();
+    type Value = ();
+    fn base() -> Self::Value {}
+    fn merge<'a>(_: &mut Self::Value, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {}
+    fn combine<'a>(_: &mut Self::Diff, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {}
+    fn scale(_: &mut Self::Diff, _: Delta) {}
+}
+
+impl Merge for i64 {
+    type Diff = i64;
+    type Value = i64;
+    fn base() -> i64 {
+        0
+    }
+    #[inline]
+    fn merge<'a>(val: &mut i64, diffs: impl Iterator<Item = Cow<'a, i64>>) {
+        *val += diffs.map(|d| *d).sum::<i64>();
+    }
+    #[inline]
+    fn combine<'a>(old: &mut i64, new: impl Iterator<Item = Cow<'a, i64>>) {
+        *old += new.map(|d| *d).sum::<i64>();
+    }
+    #[inline]
+    fn noop(diff: &Self::Diff) -> bool {
+        *diff == 0
+    }
+    fn scale(d: &mut i64, n: Delta) {
+        *d *= n;
+    }
+}
+
+impl<A: Merge, B: Merge> Merge for (A, B) {
+    type Diff = (A::Diff, B::Diff);
+    type Value = (A::Value, B::Value);
+    fn base() -> Self::Value {
+        (A::base(), B::base())
+    }
+    #[inline]
+    fn merge<'a>(val: &mut Self::Value, diffs: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        for d in diffs {
+            let (a, b) = match d {
+                Cow::Borrowed((a, b)) => (Cow::Borrowed(a), Cow::Borrowed(b)),
+                Cow::Owned((a, b)) => (Cow::Owned(a), Cow::Owned(b)),
+            };
+            A::merge(&mut val.0, std::iter::once(a));
+            B::merge(&mut val.1, std::iter::once(b));
+        }
+    }
+    #[inline]
+    fn combine<'a>(old: &mut Self::Diff, new: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        for d in new {
+            let (a, b) = match d {
+                Cow::Borrowed((a, b)) => (Cow::Borrowed(a), Cow::Borrowed(b)),
+                Cow::Owned((a, b)) => (Cow::Owned(a), Cow::Owned(b)),
+            };
+            A::combine(&mut old.0, std::iter::once(a));
+            B::combine(&mut old.1, std::iter::once(b));
+        }
+    }
+    #[inline]
+    fn scale(d: &mut Self::Diff, n: Delta) {
+        A::scale(&mut d.0, n);
+        B::scale(&mut d.1, n);
+    }
+}
+
+pub struct Sparse<M>(M);
+impl<M: Merge> Merge for Sparse<M> {
+    type Diff = Option<M::Diff>;
+    type Value = M::Value;
+    fn base() -> Self::Value {
+        M::base()
+    }
+    #[inline]
+    fn merge<'a>(val: &mut Self::Value, diffs: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        M::merge(
+            val,
+            diffs.filter_map(|d| match d {
+                Cow::Borrowed(o) => o.as_ref().map(Cow::Borrowed),
+                Cow::Owned(o) => o.map(Cow::Owned),
+            }),
+        );
+    }
+    #[inline]
+    fn combine<'a>(old: &mut Self::Diff, new: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        for n in new.filter_map(|d| match d {
+            Cow::Borrowed(o) => o.as_ref().map(Cow::Borrowed),
+            Cow::Owned(o) => o.map(Cow::Owned),
+        }) {
+            match old {
+                Some(o) => M::combine(o, std::iter::once(n)),
+                None => *old = Some(n.into_owned()),
+            }
+        }
+    }
+    #[inline]
+    fn scale(d: &mut Self::Diff, n: Delta) {
+        if let Some(d) = d {
+            M::scale(d, n)
+        }
+    }
+}
+
+impl<M: Merge> ValOp<M> {
+    #[inline]
+    fn apply<'a>(&mut self, diffs: impl Iterator<Item = Cow<'a, M::Diff>>) {
+        match self {
+            ValOp::Store(v) => M::merge(v, diffs),
+            ValOp::Modify(s) => M::combine(s, diffs),
+            ValOp::Delete => {
+                let mut v = M::base();
+                M::merge(&mut v, diffs);
+                *self = ValOp::Store(v);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn absorb_one(&mut self, new: Self) {
+        // this is the absorb used on the write path
+        match new {
+            ValOp::Delete | ValOp::Store(_) => *self = new,
+            ValOp::Modify(d) => {
+                if !M::noop(&d) {
+                    self.apply(std::iter::once(Cow::Owned(d)))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn absorb(&mut self, ops: &[Self]) {
+        // this is the absorb used on the read path
+        // to reconstruct values from storage
+        let reset = ops.iter().rposition(|op| !matches!(op, ValOp::Modify(_)));
+        let tail = match reset {
+            Some(i) => {
+                *self = match &ops[i] {
+                    ValOp::Store(v) => ValOp::Store(v.clone()),
+                    ValOp::Delete => ValOp::Delete,
+                    ValOp::Modify(_) => unreachable!("rposition excluded Modify"),
+                };
+                &ops[i + 1..]
+            }
+            None => ops,
+        };
+        if tail.is_empty() {
+            return;
+        }
+        self.apply(
+            tail.iter()
+                .map(|op| match op {
+                    ValOp::Modify(d) => Cow::Borrowed(d),
+                    _ => unreachable!("everything after the last reset is a Modify"),
+                })
+                .filter(|d| !M::noop(d)),
+        );
+    }
+}
