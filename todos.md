@@ -1,0 +1,3 @@
+- add a stub for store that just extends to memtables (keyspace erased registers)
+- WAL*mart
+- move all ops to Register semantics

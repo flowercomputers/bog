@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::{any::Any, borrow::Cow, marker::PhantomData};
 
-use crate::tx::WriteTx;
+use crate::tx::{KeyspaceId, WriteTx};
 mod consolidate;
 pub mod graph;
 pub mod merge;
@@ -10,17 +12,149 @@ mod tx;
 type Delta = i64;
 pub struct Diff<T>(T, Delta);
 
+pub trait Buffer: Any + Send {
+    fn empty() -> Self
+    where
+        Self: Sized;
+    fn len(&self) -> usize;
+    fn clear(&mut self);
+    /// Fold `other` into self, leaving `other` empty. Bags append;
+    /// registers compose per key.
+    fn absorb(&mut self, other: &mut Self)
+    where
+        Self: Sized;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
 pub type Bag<T> = Vec<Diff<T>>;
 
-pub enum Change<V, D> {
-    Insert(V),
-    Delete(V),     // old value attached
-    Replace(V, V), // old, new
-    Modify(D),     // a Merge diff, no values needed
+/// TODO: move to register2 and bag2 everywhere
+#[repr(transparent)]
+struct Register2<K, M: Merge> {
+    inner: BTreeMap<K, Change<M>>,
 }
-pub type Reg<K, V, D> = Vec<(K, Change<V, D>)>; // sorted by K, one entry per key after consolidation
+// an opaque type without merges (emitted by tables, etc)
+#[repr(transparent)]
+pub struct Mergeless<T>(T);
+impl<T: 'static + Send + Clone> Merge for Mergeless<T> {
+    type Diff = Infallible;
+    type Value = T;
+    fn base() -> Self::Value {
+        unreachable!("")
+    }
+    fn merge<'a>(val: &mut Self::Value, diffs: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        unreachable!("")
+    }
+    fn combine<'a>(old: &mut Self::Diff, new: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        unreachable!("")
+    }
+    fn scale(diff: &mut Self::Diff, times: Delta) {
+        unreachable!("")
+    }
+}
+pub type Delta2 = i64;
+pub type Bag2<T> = Register2<T, Delta2>;
 
-type Batch<T> = Vec<Diff<T>>;
+// todo: make Underlay carry Change instead of ValOp?
+// when flushed to the storage, we convert it INTO valops
+pub enum Change<M: Merge> {
+    Insert(M::Value),
+    Delete(M::Value),            // old value attached
+    Replace(M::Value, M::Value), // old, new
+    Modify(M::Diff),             // a Merge diff, no values needed
+}
+
+pub type Register<K, M> = BTreeMap<K, Change<M>>;
+
+impl<M: Merge> Change<M> {
+    pub fn compose(self, next: Self) -> Option<Self> {
+        use Change::*;
+        Some(match (self, next) {
+            (Insert(_), Delete(_)) => return None,
+            (Insert(_), Insert(b)) | (Insert(_), Replace(_, b)) => Insert(b),
+            (Insert(mut a), Modify(d)) => {
+                M::merge(&mut a, std::iter::once(Cow::Owned(d)));
+                Insert(a)
+            }
+            (Delete(o), Insert(b)) | (Delete(o), Replace(_, b)) => Replace(o, b),
+            (Delete(o), Delete(_)) => Delete(o),
+            (Delete(o), Modify(d)) => {
+                let mut v = M::base();
+                M::merge(&mut v, std::iter::once(Cow::Owned(d)));
+                Replace(o, v)
+            }
+            (Replace(o, _), Insert(b)) | (Replace(o, _), Replace(_, b)) => Replace(o, b),
+            (Replace(o, _), Delete(_)) => Delete(o),
+            (Replace(o, mut a), Modify(d)) => {
+                M::merge(&mut a, std::iter::once(Cow::Owned(d)));
+                Replace(o, a)
+            }
+            (Modify(mut a), Modify(b)) => {
+                M::combine(&mut a, std::iter::once(Cow::Owned(b)));
+                Modify(a)
+            }
+            (Modify(_), _) => unreachable!("change register into delta register"),
+        })
+    }
+}
+
+impl<T: Send + 'static> Buffer for Bag<T> {
+    fn empty() -> Self {
+        Vec::new()
+    }
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn clear(&mut self) {
+        Vec::clear(self)
+    }
+    fn absorb(&mut self, other: &mut Self) {
+        self.append(other)
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+impl<K: Ord + Send + 'static, M: Merge + Send> Buffer for Register<K, M>
+where
+    M::Value: Send,
+    M::Diff: Send,
+{
+    fn empty() -> Self {
+        BTreeMap::new()
+    }
+    fn len(&self) -> usize {
+        BTreeMap::len(self)
+    }
+    fn clear(&mut self) {
+        BTreeMap::clear(self)
+    }
+    fn absorb(&mut self, other: &mut Self) {
+        for (k, next) in std::mem::take(other) {
+            match self.remove(&k) {
+                None => {
+                    self.insert(k, next);
+                }
+                Some(prev) => {
+                    if let Some(c) = prev.compose(next) {
+                        self.insert(k, c);
+                    }
+                }
+            }
+        }
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
 
 // todo: NodeTx that can be unboxed once, holding its exact set of keyspaces as tuples?
 
@@ -30,74 +164,71 @@ pub trait Node: Send {
 
 /// Commutative, variable-arity
 pub trait Nary: Send {
-    type In: 'static;
-    type Out: 'static;
-    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Batch<Self::In>], out: &mut Batch<Self::Out>);
+    // TODO: In/Out are redundant with Takes/Gives
+    type Takes: Buffer;
+    type Gives: Buffer;
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Self::Takes], out: &mut Self::Gives);
 }
 
 pub trait Unary: Send {
-    type In: 'static;
-    type Out: 'static;
-    fn eval(&mut self, tx: &mut WriteTx, batch: &Batch<Self::In>, out: &mut Batch<Self::Out>);
+    type Takes: Buffer;
+    type Gives: Buffer;
+    fn eval(&mut self, tx: &mut WriteTx, batch: &Self::Takes, out: &mut Self::Gives);
 }
 
 impl<N: Nary> Unary for N {
-    type In = N::In;
-    type Out = N::Out;
+    type Takes = N::Takes;
+    type Gives = N::Gives;
     #[inline]
-    fn eval(&mut self, tx: &mut WriteTx, batch: &Batch<Self::In>, out: &mut Batch<Self::Out>) {
+    fn eval(&mut self, tx: &mut WriteTx, batch: &Self::Takes, out: &mut Self::Gives) {
         N::eval(self, tx, &[batch], out);
     }
 }
 
 pub trait Binary: Send {
-    type Left: 'static;
-    type Right: 'static;
-    type Out: 'static;
+    type Left: Buffer;
+    type Right: Buffer;
+    type Gives: Buffer;
+    fn eval(&mut self, tx: &mut WriteTx, l: &Self::Left, r: &Self::Right, out: &mut Self::Gives);
+}
+
+pub struct Sum<K, V: Merge> {
+    ks: KeyspaceId,
+    scratch: Register<K, (i64, V)>,
+}
+
+impl<K, V> Nary for Sum<K, V>
+where
+    K: Ord + Clone + Send + 'static,
+    V: Merge<Diff = V, Value = V> + Clone + PartialEq + Send,
+{
+    type Takes = Bag<(K, V)>;
+    type Gives = Register<K, (i64, V)>;
+
     fn eval(
         &mut self,
         tx: &mut WriteTx,
-        l: &Batch<Self::Left>,
-        r: &Batch<Self::Right>,
-        out: &mut Batch<Self::Out>,
-    );
-}
+        batches: &[&Bag<(K, V)>],
+        out: &mut Register<K, (i64, V)>,
+    ) {
+        // 1. every row becomes a Modify; equal keys combine on the way in
+        // self.scratch.clear();
+        // for b in batches {
+        //     for Diff((k, v), d) in b.iter() {
+        //         let mut diff = (1, v.clone());
+        //         <(i64, V)>::scale(&mut diff, *d);
+        //         self.scratch.absorb_one(k.clone(), Change::Modify(diff));
+        //     }
+        // }
 
-struct Sum<K, V> {
-    scratch: Vec<(K, (i64, V))>,
-    _p: PhantomData<fn() -> (K, V)>,
-}
-impl<K, V> Nary for Sum<K, V>
-where
-    K: Ord + Clone + 'static + Send,
-    V: Merge<Diff = V, Value = V> + Clone + PartialEq + Send,
-{
-    type In = (K, V);
-    type Out = (K, V);
-    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Batch<(K, V)>], out: &mut Batch<(K, V)>) {
-        let ks = tx.keyspace(0);
-
-        self.scratch.clear();
-        for b in batches {
-            for Diff((k, v), d) in b.iter() {
-                let mut diff = (1, v.clone());
-                <(i64, V)>::scale(&mut diff, *d);
-                self.scratch.push((k.clone(), diff));
-            }
-        }
-        // sort by key, fold runs with <(i64, V)>::combine
-        for (k, d) in self.scratch.drain(..) {
-            let old = ks.get(tx, &k).cloned().unwrap_or_else(<(i64, V)>::base);
-            let mut new = old.clone();
-            <(i64, V)>::merge(&mut new, std::iter::once(Cow::Borrowed(&d)));
-            if new.0 == 0 {
-                ks.del(tx, k.clone())
-            } else {
-                ks.modify(tx, k.clone(), d)
-            }
-            // emit (k, old.1) at -1 if old.0 != 0, (k, new.1) at +1 if new.0 != 0,
-            // skipping both when the total did not change
-        }
+        // // 2. resolve each Modify against the keyspace, write and emit the result
+        // let ks = tx.keyspace2::<K, (i64, V)>(self.ks);
+        // for (k, change) in std::mem::take(&mut self.scratch) {
+        //     if let Some(resolved) = ks.resolve(&k, change) {
+        //         ks.absorb(k.clone(), resolved.clone());
+        //         out.insert(k, resolved);
+        //     }
+        // }
     }
 }
 
@@ -106,13 +237,14 @@ where
 pub struct FusedLinears<In, X>(X, PhantomData<fn() -> In>);
 impl<In, Out, X> Nary for FusedLinears<In, X>
 where
-    In: Clone + 'static,
-    Out: Clone + 'static,
+    In: Clone + 'static + Send,
+    Out: Clone + 'static + Send,
     X: Emit<In, Emits = Out>,
 {
-    type In = In;
-    type Out = Out;
-    fn eval(&mut self, _tx: &mut WriteTx, batches: &[&Batch<In>], out: &mut Batch<Out>) {
+    type Takes = Bag<In>;
+    type Gives = Bag<Out>;
+
+    fn eval(&mut self, _tx: &mut WriteTx, batches: &[&Bag<In>], out: &mut Bag<Out>) {
         // implicitly concatenates batches
         for batch in batches {
             for entry in *batch {

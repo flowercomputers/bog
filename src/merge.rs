@@ -9,8 +9,8 @@ pub(crate) enum ValOp<M: Merge> {
 }
 
 pub trait Merge: 'static {
-    type Diff: 'static + Clone;
-    type Value: Clone;
+    type Diff: 'static + Clone + Send;
+    type Value: Clone + Send;
 
     fn base() -> Self::Value;
     fn merge<'a>(val: &mut Self::Value, diffs: impl Iterator<Item = Cow<'a, Self::Diff>>);
@@ -92,6 +92,14 @@ impl<A: Merge, B: Merge> Merge for (A, B) {
         A::scale(&mut d.0, n);
         B::scale(&mut d.1, n);
     }
+    #[inline]
+    fn consider_delete(val: &Self::Value) -> bool {
+        A::consider_delete(&val.0) && B::consider_delete(&val.1)
+    }
+    #[inline]
+    fn noop(diff: &Self::Diff) -> bool {
+        A::noop(&diff.0) && B::noop(&diff.1)
+    }
 }
 
 pub struct Sparse<M>(M);
@@ -127,6 +135,18 @@ impl<M: Merge> Merge for Sparse<M> {
     fn scale(d: &mut Self::Diff, n: Delta) {
         if let Some(d) = d {
             M::scale(d, n)
+        }
+    }
+    #[inline]
+    fn consider_delete(val: &Self::Value) -> bool {
+        M::consider_delete(&val)
+    }
+    #[inline]
+    fn noop(diff: &Self::Diff) -> bool {
+        if let Some(inner) = diff {
+            M::noop(&inner)
+        } else {
+            true
         }
     }
 }

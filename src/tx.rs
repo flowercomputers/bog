@@ -4,13 +4,13 @@ use std::{
 };
 
 use crate::{
-    Batch, Delta, Diff,
+    Change, Register,
     merge::{Merge, ValOp},
 };
 
 type Epoch = u64;
 
-type KeyspaceId = u64;
+pub type KeyspaceId = u64;
 
 pub trait ErasedUnderlay: Any {
     fn as_any(&self) -> &dyn Any;
@@ -93,25 +93,9 @@ impl<K: Ord + 'static, M: Merge> Underlay<K, M> {
     pub fn drain(&mut self) -> impl Iterator<Item = (K, ValOp<M>)> {
         std::mem::take(&mut self.inner).into_iter()
     }
-
-    pub fn emit_changes(&self, target: &mut Batch<(K, M::Value)>) {
-        self.inner.iter().flat_map(|(key, op)| match op {
-            ValOp::Store(v) => std::iter::once(Diff((key.to_owned(), v.to_owned()), 1)),
-
-            // todo: delete and modify need to perform a full
-            // read to materialize their retracted values
-            //
-            // ok, but if a downstream op only uses the keyspace handles,
-            // we actually don't need to push anything downstream at all?
-            // becuase this btree is already the consolidated, keyed list
-            // of relevant deltas...
-            ValOp::Delete => std::iter::once(Diff((key.to_owned(), todo!()), -1)),
-            ValOp::Modify(_) => todo!(),
-        });
-        // target.extend();
-    }
 }
 
+#[derive(Default)]
 pub struct WriteTx {
     epoch: Epoch,
     pub(crate) overlay: HashMap<KeyspaceId, Box<dyn ErasedUnderlay>>,
@@ -121,8 +105,41 @@ pub struct WriteTx {
     // by flushing the overlay into packed runs & the wal!
 }
 
+pub struct KeyspaceHandle<K, M: Merge> {
+    inner: Register<K, M>,
+}
+
+impl<K: 'static + Ord, M: Merge> KeyspaceHandle<K, M> {
+    fn absorb(&mut self, key: K, change: Change<M>) {
+        match self.inner.entry(key) {
+            Entry::Vacant(vac) => {
+                vac.insert(change);
+            }
+            Entry::Occupied(occ) => {
+                let (key, prev) = occ.remove_entry();
+                if let Some(c) = prev.compose(change) {
+                    self.inner.insert(key, c);
+                }
+                // check if the change is a noop?
+            }
+        }
+    }
+}
+
 impl WriteTx {
     pub fn keyspace<K: 'static + Ord, M: Merge>(&mut self, id: KeyspaceId) -> &mut Underlay<K, M> {
+        self.overlay
+            .entry(id)
+            .or_insert(Box::new(Underlay::<K, M>::default()))
+            .as_any_mut()
+            .downcast_mut()
+            .unwrap()
+    }
+
+    pub fn keyspace2<K: 'static + Ord, M: Merge>(
+        &mut self,
+        id: KeyspaceId,
+    ) -> &mut KeyspaceHandle<K, M> {
         self.overlay
             .entry(id)
             .or_insert(Box::new(Underlay::<K, M>::default()))

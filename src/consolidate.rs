@@ -1,8 +1,8 @@
 use std::ops::AddAssign;
 
-use crate::Batch;
+use crate::Bag;
 
-pub fn consolidate<T: Ord>(batch: &mut Batch<T>) {
+pub fn consolidate<T: Ord>(batch: &mut Bag<T>) {
     batch.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     consolidate_sorted(batch);
 }
@@ -10,7 +10,7 @@ pub fn consolidate<T: Ord>(batch: &mut Batch<T>) {
 /// The merge half of [`consolidate`], for batches already sorted by key:
 /// sum equal-keyed diffs, drop zeroes, in place, no allocation.
 #[inline]
-pub fn consolidate_sorted<T: PartialOrd>(batch: &mut Batch<T>) {
+pub fn consolidate_sorted<T: PartialOrd>(batch: &mut Bag<T>) {
     debug_assert!(batch.is_sorted_by(|a, b| a.0 <= b.0));
     let mut write = 0usize;
     for read in 0..batch.len() {
