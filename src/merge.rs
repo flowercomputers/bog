@@ -1,9 +1,12 @@
 use std::borrow::Cow;
 
+use bytes::Bytes;
+
 use crate::Delta;
 
-pub(crate) enum ValOp<M: Merge> {
+pub enum ValOp<M: Merge> {
     Store(M::Value),
+    // todo: Remove modify
     Modify(M::Diff),
     Delete,
 }
@@ -206,4 +209,21 @@ impl<M: Merge> ValOp<M> {
                 .filter(|d| !M::noop(d)),
         );
     }
+}
+
+// TODO: figure this shit out
+
+pub trait RunIndex<K, M: Merge>: 'static {
+    const NAME: &'static str;
+    type Builder: IndexBuilder<K, M>;
+    /// Streams the run's rows in key order as the run is written.
+    fn builder() -> Self::Builder;
+    /// A zero-copy view over the sealed section bytes.
+    fn open(bytes: Bytes) -> Self;
+}
+
+pub trait IndexBuilder<K, M: Merge> {
+    fn push(&mut self, key: &K, op: &ValOp<M>);
+    /// `None` declines: not worth a section for this run.
+    fn finish(self) -> Option<Bytes>;
 }

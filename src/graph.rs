@@ -172,7 +172,7 @@ impl OpDag {
                 }
             }
 
-            if node.out.len() > 0 {
+            if !node.out.is_empty() {
                 self.pending.extend(node.children.iter());
             }
         }
@@ -227,7 +227,8 @@ impl<N: Nary> Node for NaryNode<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Bag, Diff};
+    use crate::Bag;
+    use crate::store::{DurabilityPolicy, StoreBuilder};
 
     struct Double;
     impl Nary for Double {
@@ -235,8 +236,8 @@ mod tests {
         type Gives = Bag<u32>;
         fn eval(&mut self, _: &mut WriteTx, batches: &[&Bag<u32>], out: &mut Bag<u32>) {
             for b in batches {
-                for Diff(x, d) in b.iter() {
-                    out.push(Diff(x * 2, *d));
+                for (x, d) in b.diffs() {
+                    out.push(x * 2, d);
                 }
             }
         }
@@ -250,9 +251,14 @@ mod tests {
         let d = g.nary(&[a, b], Double);
         let dd = g.unary(d, Double);
 
-        g.give(a, &mut vec![Diff(1, 1)]);
-        g.give(b, &mut vec![Diff(2, -1)]);
-        g.run(&mut WriteTx::default());
+        let mut in_a = Bag::new();
+        in_a.push(1, 1);
+        let mut in_b = Bag::new();
+        in_b.push(2, -1);
+        g.give(a, &mut in_a);
+        g.give(b, &mut in_b);
+        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        g.run(&mut store.begin());
 
         assert!(g.pending.is_empty());
         assert!(g.touched.is_empty());

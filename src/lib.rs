@@ -1,16 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::convert::Infallible;
 use std::{any::Any, borrow::Cow, marker::PhantomData};
 
 use crate::tx::{KeyspaceId, WriteTx};
-mod consolidate;
 pub mod graph;
 pub mod merge;
 use crate::merge::*;
+mod store;
 mod tx;
-
-type Delta = i64;
-pub struct Diff<T>(T, Delta);
 
 pub trait Buffer: Any + Send {
     fn empty() -> Self
@@ -25,15 +22,90 @@ pub trait Buffer: Any + Send {
         Self: Sized;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
-pub type Bag<T> = Vec<Diff<T>>;
-
-/// TODO: move to register2 and bag2 everywhere
+/// A keyed, consolidated batch: at most one `Change` per key. Composing
+/// into it keeps it consolidated, so there is no separate consolidate step.
 #[repr(transparent)]
-struct Register2<K, M: Merge> {
+pub struct Register<K, M: Merge> {
     inner: BTreeMap<K, Change<M>>,
 }
+
+impl<K: Ord, M: Merge> Default for Register<K, M> {
+    fn default() -> Self {
+        Register {
+            inner: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord, M: Merge> Register<K, M> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Compose `change` onto whatever is already at `key`. Cancelling pairs
+    /// (Insert then Delete) and no-op modifies drop the key entirely.
+    pub fn absorb_one(&mut self, key: K, change: Change<M>) {
+        if let Change::Modify(d) = &change {
+            if M::noop(d) {
+                return;
+            }
+        }
+        match self.inner.entry(key) {
+            Entry::Vacant(vac) => {
+                vac.insert(change);
+            }
+            Entry::Occupied(occ) => {
+                let (key, prev) = occ.remove_entry();
+                if let Some(c) = prev.compose(change) {
+                    if let Change::Modify(d) = &c {
+                        if M::noop(d) {
+                            return;
+                        }
+                    }
+                    self.inner.insert(key, c);
+                }
+            }
+        }
+    }
+    pub fn get(&self, key: &K) -> Option<&Change<M>> {
+        self.inner.get(key)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &Change<M>)> {
+        self.inner.iter()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn drain(&mut self) -> impl Iterator<Item = (K, Change<M>)> {
+        std::mem::take(&mut self.inner).into_iter()
+    }
+}
+
+impl<K: Ord, M: Merge> IntoIterator for Register<K, M> {
+    type Item = (K, Change<M>);
+    type IntoIter = std::collections::btree_map::IntoIter<K, Change<M>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
+/// Bag-specific helpers: every entry is a `Modify(delta)`.
+impl<T: Ord> Register<T, Delta> {
+    pub fn push(&mut self, data: T, delta: Delta) {
+        self.absorb_one(data, Change::Modify(delta));
+    }
+    pub fn diffs(&self) -> impl Iterator<Item = (&T, Delta)> {
+        self.inner.iter().map(|(k, c)| match c {
+            Change::Modify(d) => (k, *d),
+            _ => unreachable!("bags only hold Modify"),
+        })
+    }
+}
+
 // an opaque type without merges (emitted by tables, etc)
 #[repr(transparent)]
 pub struct Mergeless<T>(T);
@@ -53,8 +125,8 @@ impl<T: 'static + Send + Clone> Merge for Mergeless<T> {
         unreachable!("")
     }
 }
-pub type Delta2 = i64;
-pub type Bag2<T> = Register2<T, Delta2>;
+pub type Delta = i64;
+pub type Bag<T> = Register<T, Delta>;
 
 // todo: make Underlay carry Change instead of ValOp?
 // when flushed to the storage, we convert it INTO valops
@@ -64,10 +136,27 @@ pub enum Change<M: Merge> {
     Replace(M::Value, M::Value), // old, new
     Modify(M::Diff),             // a Merge diff, no values needed
 }
-
-pub type Register<K, M> = BTreeMap<K, Change<M>>;
+impl<M: Merge> Clone for Change<M> {
+    fn clone(&self) -> Self {
+        use Change::*;
+        match self {
+            Insert(v) => Insert(v.clone()),
+            Delete(v) => Delete(v.clone()),
+            Replace(o, n) => Replace(o.clone(), n.clone()),
+            Modify(d) => Modify(d.clone()),
+        }
+    }
+}
 
 impl<M: Merge> Change<M> {
+    /// The value at this key after the change, if any.
+    pub fn new_value(&self) -> Option<&M::Value> {
+        match self {
+            Change::Insert(v) | Change::Replace(_, v) => Some(v),
+            Change::Delete(_) => None,
+            Change::Modify(_) => unreachable!("Modify has no materialized value"),
+        }
+    }
     pub fn compose(self, next: Self) -> Option<Self> {
         use Change::*;
         Some(match (self, next) {
@@ -99,53 +188,24 @@ impl<M: Merge> Change<M> {
     }
 }
 
-impl<T: Send + 'static> Buffer for Bag<T> {
-    fn empty() -> Self {
-        Vec::new()
-    }
-    fn len(&self) -> usize {
-        Vec::len(self)
-    }
-    fn clear(&mut self) {
-        Vec::clear(self)
-    }
-    fn absorb(&mut self, other: &mut Self) {
-        self.append(other)
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
 impl<K: Ord + Send + 'static, M: Merge + Send> Buffer for Register<K, M>
 where
     M::Value: Send,
     M::Diff: Send,
 {
     fn empty() -> Self {
-        BTreeMap::new()
+        Self::default()
     }
     fn len(&self) -> usize {
-        BTreeMap::len(self)
+        BTreeMap::len(&self.inner)
     }
     fn clear(&mut self) {
-        BTreeMap::clear(self)
+        BTreeMap::clear(&mut self.inner)
     }
+    #[inline]
     fn absorb(&mut self, other: &mut Self) {
-        for (k, next) in std::mem::take(other) {
-            match self.remove(&k) {
-                None => {
-                    self.insert(k, next);
-                }
-                Some(prev) => {
-                    if let Some(c) = prev.compose(next) {
-                        self.insert(k, c);
-                    }
-                }
-            }
+        for (k, next) in other.drain() {
+            self.absorb_one(k, next);
         }
     }
     fn as_any(&self) -> &dyn Any {
@@ -193,14 +253,25 @@ pub trait Binary: Send {
 }
 
 pub struct Sum<K, V: Merge> {
-    ks: KeyspaceId,
+    ks: KeyspaceId<K, (i64, V)>,
     scratch: Register<K, (i64, V)>,
+    resolved: Vec<(K, Change<(i64, V)>)>,
+}
+
+impl<K: Ord, V: Merge> Sum<K, V> {
+    pub fn new(ks: KeyspaceId<K, (i64, V)>) -> Self {
+        Sum {
+            ks,
+            scratch: Register::new(),
+            resolved: Vec::new(),
+        }
+    }
 }
 
 impl<K, V> Nary for Sum<K, V>
 where
     K: Ord + Clone + Send + 'static,
-    V: Merge<Diff = V, Value = V> + Clone + PartialEq + Send,
+    V: Ord + Merge<Diff = V, Value = V> + Clone + PartialEq + Send,
 {
     type Takes = Bag<(K, V)>;
     type Gives = Register<K, (i64, V)>;
@@ -212,23 +283,28 @@ where
         out: &mut Register<K, (i64, V)>,
     ) {
         // 1. every row becomes a Modify; equal keys combine on the way in
-        // self.scratch.clear();
-        // for b in batches {
-        //     for Diff((k, v), d) in b.iter() {
-        //         let mut diff = (1, v.clone());
-        //         <(i64, V)>::scale(&mut diff, *d);
-        //         self.scratch.absorb_one(k.clone(), Change::Modify(diff));
-        //     }
-        // }
+        self.scratch.clear();
+        for b in batches {
+            for ((k, v), d) in b.diffs() {
+                let mut diff = (1, v.clone());
+                <(i64, V)>::scale(&mut diff, d);
+                self.scratch.absorb_one(k.clone(), Change::Modify(diff));
+            }
+        }
 
-        // // 2. resolve each Modify against the keyspace, write and emit the result
-        // let ks = tx.keyspace2::<K, (i64, V)>(self.ks);
-        // for (k, change) in std::mem::take(&mut self.scratch) {
-        //     if let Some(resolved) = ks.resolve(&k, change) {
-        //         ks.absorb(k.clone(), resolved.clone());
-        //         out.insert(k, resolved);
-        //     }
-        // }
+        // 2. one sorted sweep resolves every Modify against the keyspace
+        let mut ks = tx.keyspace(self.ks);
+        ks.resolve_sorted(std::mem::take(&mut self.scratch), &mut self.resolved);
+        for (k, resolved) in self.resolved.drain(..) {
+            // a count of zero means the key is gone
+            let resolved = match resolved {
+                Change::Insert(n) if n.0 == 0 => continue,
+                Change::Replace(o, n) if n.0 == 0 => Change::Delete(o),
+                r => r,
+            };
+            ks.absorb(k.clone(), resolved.clone());
+            out.absorb_one(k, resolved);
+        }
     }
 }
 
@@ -237,8 +313,8 @@ where
 pub struct FusedLinears<In, X>(X, PhantomData<fn() -> In>);
 impl<In, Out, X> Nary for FusedLinears<In, X>
 where
-    In: Clone + 'static + Send,
-    Out: Clone + 'static + Send,
+    In: Clone + 'static + Send + Ord,
+    Out: Clone + 'static + Send + Ord,
     X: Emit<In, Emits = Out>,
 {
     type Takes = Bag<In>;
@@ -247,11 +323,10 @@ where
     fn eval(&mut self, _tx: &mut WriteTx, batches: &[&Bag<In>], out: &mut Bag<Out>) {
         // implicitly concatenates batches
         for batch in batches {
-            for entry in *batch {
-                self.0
-                    .emit(Cow::Borrowed(&entry.0), entry.1, &mut |data, diff| {
-                        out.push(Diff(data.into_owned(), diff))
-                    });
+            for (data, diff) in batch.diffs() {
+                self.0.emit(Cow::Borrowed(data), diff, &mut |data, diff| {
+                    out.push(data.into_owned(), diff)
+                });
             }
         }
     }
@@ -372,5 +447,47 @@ where
     #[inline]
     fn emit<S: FnMut(Cow<In>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
         sink(data, diff.checked_neg().expect("negate overflowed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::OpDag;
+    use crate::store::{DurabilityPolicy, StoreBuilder};
+
+    #[test]
+    fn sum_inserts_then_replaces_then_deletes() {
+        let mut g = OpDag::new();
+        let src = g.source::<Bag<(u8, i64)>>();
+        const TOTALS: KeyspaceId<u8, (i64, i64)> = KeyspaceId::new(7);
+        let sum = g.nary(&[src], Sum::<u8, i64>::new(TOTALS));
+        let _ = sum;
+        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let mut tx = store.begin();
+
+        let mut b = Bag::new();
+        b.push((1, 10), 1);
+        b.push((1, 5), 1);
+        g.give(src, &mut b);
+        g.run(&mut tx);
+        let ks = tx.keyspace(TOTALS);
+        assert_eq!(ks.get(&1).as_deref(), Some(&(2, 15)));
+
+        let mut b = Bag::new();
+        b.push((1, 10), -1);
+        g.give(src, &mut b);
+        g.run(&mut tx);
+        let ks = tx.keyspace(TOTALS);
+        assert_eq!(ks.get(&1).as_deref(), Some(&(1, 5)));
+
+        let mut b = Bag::new();
+        b.push((1, 5), -1);
+        g.give(src, &mut b);
+        g.run(&mut tx);
+        let ks = tx.keyspace(TOTALS);
+        assert_eq!(ks.get(&1).as_deref(), None);
+        // insert then delete within one tx cancels out entirely
+        assert!(ks.inner_is_empty());
     }
 }
