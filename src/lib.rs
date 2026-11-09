@@ -14,6 +14,7 @@ pub mod error;
 
 pub mod index;
 mod manifest;
+pub mod ops;
 mod store;
 mod table;
 mod tx;
@@ -551,6 +552,13 @@ where
 //// LINEARS
 
 pub struct FusedLinears<In, X>(X, PhantomData<fn() -> In>);
+
+impl<In, X> FusedLinears<In, X> {
+    /// One node running the chain of linear stages `x` over each row.
+    pub fn new(x: X) -> Self {
+        FusedLinears(x, PhantomData)
+    }
+}
 impl<In, Out, X> Nary for FusedLinears<In, X>
 where
     In: Clone + 'static + Send + Ord,
@@ -577,7 +585,7 @@ pub trait Emit<In: Clone>: 'static + Send {
     fn emit<S: FnMut(Cow<Self::Emits>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S);
 }
 
-pub struct Then<A, B>(A, B);
+pub struct Then<A, B>(pub A, pub B);
 impl<In, Mid, Out, A, B> Emit<In> for Then<A, B>
 where
     In: Clone + 'static,
@@ -594,7 +602,7 @@ where
     }
 }
 
-pub struct Filter<F>(F);
+pub struct Filter<F>(pub F);
 impl<In, F> Emit<In> for Filter<F>
 where
     In: Clone + 'static,
@@ -609,7 +617,7 @@ where
     }
 }
 
-pub struct Map<F>(F);
+pub struct Map<F>(pub F);
 impl<In, Out, F> Emit<In> for Map<F>
 where
     In: Clone + 'static,
@@ -623,7 +631,7 @@ where
     }
 }
 
-pub struct FilterMap<F>(F);
+pub struct FilterMap<F>(pub F);
 impl<In, Out, F> Emit<In> for FilterMap<F>
 where
     In: Clone + 'static,
@@ -639,7 +647,7 @@ where
     }
 }
 
-pub struct FlatMap<F>(F);
+pub struct FlatMap<F>(pub F);
 impl<In, Out, I, F> Emit<In> for FlatMap<F>
 where
     In: Clone + 'static,
@@ -656,7 +664,7 @@ where
     }
 }
 
-pub struct Explode<F>(F);
+pub struct Explode<F>(pub F);
 impl<In, Out, I, F> Emit<In> for Explode<F>
 where
     In: Clone + 'static,
