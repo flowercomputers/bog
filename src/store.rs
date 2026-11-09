@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions, TryLockError},
     io::Write,
+    marker::PhantomData,
     ops::{Bound, Deref, Range, RangeBounds},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
@@ -23,6 +24,7 @@ use crate::{
     cursor::{Cursor, Source},
     error::{Error, IoContext, Result},
     graph::Fingerprint,
+    index::{Aux, EncodedBuilder, IndexKind, IndexedRun, LayerIndexes, Run, RunIndex, table_index},
     manifest::{self, Checkpoint, InstallError, MANIFEST_TMP, Manifest, Segment},
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
@@ -126,6 +128,9 @@ pub(crate) struct MemoryStats {
     pub cache_bytes: usize,
     /// Table indexes, which stay in memory while the table is open.
     pub index_bytes: usize,
+    /// Run indexes built or loaded so far, over layers and tables. Those
+    /// of layers pinned only by old snapshots are not counted.
+    pub run_index_bytes: usize,
     pub tables: usize,
 }
 
@@ -246,11 +251,13 @@ pub(crate) type Resident<K, V> = BTreeMap<K, Option<V>>;
 /// trees of keyspaces only one side touched.
 type Tree = Arc<dyn Any + Send + Sync>;
 
-/// One keyspace's tree in a layer, with its estimated resident bytes.
+/// One keyspace's tree in a layer, with its estimated resident bytes and
+/// its run indexes, which are shared wherever the tree is.
 #[derive(Clone)]
 struct LayerTree {
     tree: Tree,
     bytes: usize,
+    indexes: Arc<LayerIndexes>,
 }
 
 /// What one or more consecutive epochs committed, keyed by keyspace id:
@@ -604,6 +611,65 @@ impl<'s> Snapshot<'s> {
         )
     }
 
+    /// Every run of `keyspace`, newest first, each with its index of type
+    /// `I`, which must be registered on the keyspace. Indexes not built yet
+    /// are built, or loaded from their table, now.
+    pub(crate) fn runs_indexed<K, M, I>(
+        &self,
+        keyspace: KeyspaceId<K, M>,
+    ) -> Result<Vec<IndexedRun<'_, K, M, I>>>
+    where
+        K: OrderedCodec + Clone + 'static,
+        M: Merge,
+        M::Value: Codec,
+        I: 'static,
+    {
+        let ks = keyspace.raw();
+        let kinds = &self.store.keyspaces[&ks].indexes;
+        let slot = kinds
+            .iter()
+            .position(|k| k.id == std::any::TypeId::of::<I>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "index {} is not registered on keyspace {ks}",
+                    type_name::<I>()
+                )
+            });
+        let kind = &kinds[slot];
+        let mut runs = Vec::new();
+        for layer in self.version.layers.iter().rev() {
+            if let Some(t) = layer.trees.get(&ks) {
+                let tree = t
+                    .tree
+                    .downcast_ref::<Resident<K, M::Value>>()
+                    .expect("keyspace id reused with a different type");
+                runs.push(IndexedRun {
+                    run: Run::Layer {
+                        tree,
+                        epoch: layer.epoch,
+                    },
+                    index: t.indexes.get(slot, kind, &*t.tree),
+                    _i: PhantomData,
+                });
+            }
+        }
+        for table in self.version.tables_for(ks) {
+            if !table.keyspaces().any(|k| k == ks) {
+                continue;
+            }
+            runs.push(IndexedRun {
+                index: table_index(table, ks, kind)?,
+                run: Run::Table {
+                    table,
+                    ks,
+                    cache: &self.store.cache,
+                },
+                _i: PhantomData,
+            });
+        }
+        Ok(runs)
+    }
+
     /// A merged cursor over `keyspace`, with `overlay`, a write tx's own
     /// changes, on top when given.
     pub(crate) fn cursor<'a, K, M>(
@@ -660,6 +726,8 @@ struct KeyspaceDecl {
     measure: fn(&(dyn Any + Send + Sync)) -> usize,
     /// Fold trees, oldest first, into one; see [`fold_trees`].
     fold: fn(&[&LayerTree], bool) -> LayerTree,
+    /// Run indexes, in slot order.
+    indexes: Vec<IndexKind>,
 }
 
 /// One tree holding `trees`, oldest first, each overwriting the ones
@@ -701,6 +769,8 @@ where
     LayerTree {
         tree: Arc::new(tree),
         bytes,
+        // the caller registers and builds them
+        indexes: Arc::default(),
     }
 }
 
@@ -891,6 +961,7 @@ impl StoreBuilder {
             write_run: write_run::<K, M::Value>,
             measure: measure_tree::<K, M::Value>,
             fold: fold_trees::<K, M::Value>,
+            indexes: Vec::new(),
         };
         if let Some(prev) = self.keyspaces.get(&id.raw()) {
             assert!(
@@ -898,8 +969,41 @@ impl StoreBuilder {
                 "keyspace {} declared twice differently",
                 id.raw()
             );
+            return self;
         }
         self.keyspaces.insert(id.raw(), decl);
+        self
+    }
+
+    /// Keep a run index of type `I` on every run of keyspace `id`, which
+    /// must already be declared. See [`RunIndex`].
+    pub(crate) fn indexed<K, M, I>(mut self, id: KeyspaceId<K, M>) -> Self
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Sync,
+        I: RunIndex<K, M::Value>,
+    {
+        let decl = self
+            .keyspaces
+            .get_mut(&id.raw())
+            .unwrap_or_else(|| panic!("keyspace {} indexed before it is declared", id.raw()));
+        assert_eq!(
+            (decl.key, decl.merge),
+            (type_name::<K>(), type_name::<M>()),
+            "keyspace {} indexed with other types than declared",
+            id.raw()
+        );
+        let kind = IndexKind::of::<K, M::Value, I>();
+        assert!(
+            decl.indexes
+                .iter()
+                .all(|k| k.id != kind.id && k.name != kind.name),
+            "index {} registered twice on keyspace {}",
+            kind.name,
+            id.raw()
+        );
+        decl.indexes.push(kind);
         self
     }
 
@@ -1480,9 +1584,18 @@ impl Store {
         let wal: HashMap<u64, LayerTree> = wal
             .into_iter()
             .map(|(ks, tree)| {
-                let bytes = (keyspaces[&ks].measure)(&*tree);
+                let decl = &keyspaces[&ks];
+                let bytes = (decl.measure)(&*tree);
                 let tree = Arc::from(tree);
-                (ks, LayerTree { tree, bytes })
+                let indexes = Arc::new(LayerIndexes::new(decl.indexes.len()));
+                (
+                    ks,
+                    LayerTree {
+                        tree,
+                        bytes,
+                        indexes,
+                    },
+                )
             })
             .collect();
         let bytes = wal.values().map(|t| t.bytes).sum();
@@ -1546,8 +1659,26 @@ impl Shared {
             wal_bytes: self.wal_bytes.load(Relaxed),
             cache_bytes: self.cache.used(),
             index_bytes: version.tables.iter().map(|t| t.index_bytes()).sum(),
+            run_index_bytes: self.run_index_bytes(&version),
             tables: version.tables.len(),
         }
+    }
+
+    fn run_index_bytes(&self, version: &Version) -> usize {
+        let kinds =
+            |ks: u64| -> &[IndexKind] { self.keyspaces.get(&ks).map_or(&[], |d| &d.indexes[..]) };
+        let layers: usize = version
+            .layers
+            .iter()
+            .flat_map(|l| l.trees.iter())
+            .map(|(ks, t)| t.indexes.bytes(kinds(*ks)))
+            .sum();
+        let tables: usize = version
+            .tables
+            .iter()
+            .map(|t| t.indexes().bytes(kinds))
+            .sum();
+        layers + tables
     }
 
     /// Whether the WAL or the memtable is at `factor` times its limit, and
@@ -1658,11 +1789,14 @@ impl Store {
                     None => underlay.seal(None),
                 };
                 bytes += n;
+                // built by the first reader that wants them
+                let indexes = Arc::new(LayerIndexes::new(self.keyspaces[&ks].indexes.len()));
                 trees.insert(
                     ks,
                     LayerTree {
                         tree: Arc::from(tree),
                         bytes: n,
+                        indexes,
                     },
                 );
             }
@@ -2024,9 +2158,17 @@ impl Shared {
         let mut trees = HashMap::with_capacity(ids.len());
         for ks in ids {
             let parts: Vec<&LayerTree> = layers.iter().filter_map(|l| l.trees.get(&ks)).collect();
+            let decl = &self.keyspaces[&ks];
             let folded = match parts[..] {
                 [only] if !drop_tombstones => only.clone(),
-                _ => (self.keyspaces[&ks].fold)(&parts, drop_tombstones),
+                _ => {
+                    let mut folded = (decl.fold)(&parts, drop_tombstones);
+                    // off the commit path, so build the indexes now
+                    let indexes = LayerIndexes::new(decl.indexes.len());
+                    indexes.build_all(&decl.indexes, &*folded.tree);
+                    folded.indexes = Arc::new(indexes);
+                    folded
+                }
             };
             // every entry costs at least ENTRY_OVERHEAD, so no bytes means
             // deletes emptied the tree
@@ -2169,6 +2311,7 @@ impl Shared {
     /// Write `version`'s layers to a checkpoint table at `path`.
     fn write_checkpoint(&self, path: &Path, version: &Version, ckpt: Checkpoint) -> Result<Table> {
         let mut table = TableBuilder::create(path, self.opts.block_size)?;
+        let mut built = BuiltIndexes::default();
         let ids: BTreeSet<u64> = version
             .layers
             .iter()
@@ -2181,11 +2324,19 @@ impl Shared {
                 .rev()
                 .filter_map(|l| l.trees.get(&ks).map(|t| &*t.tree))
                 .collect();
+            let decl = &self.keyspaces[&ks];
+            let mut indexing = RunIndexing::start(ks, &decl.indexes);
             table.begin_keyspace(ks)?;
-            (self.keyspaces[&ks].write_run)(&trees, &mut |k, v| table.push(k, v))?;
+            (decl.write_run)(&trees, &mut |k, v| {
+                indexing.push(k, v, path)?;
+                table.push(k, v)
+            })?;
+            indexing.seal(&mut table, &mut built)?;
         }
         table.finish(ckpt.epoch)?;
-        Table::open(path, ckpt.number)
+        let table = Table::open(path, ckpt.number)?;
+        built.keep(&table);
+        Ok(table)
     }
 
     /// Merge windows of adjacent tables until no more than `max_tables`
@@ -2278,6 +2429,7 @@ impl Shared {
         let mut out = TableBuilder::create(&path, self.opts.block_size)?;
         let ids: BTreeSet<u64> = inputs.iter().flat_map(|t| t.keyspaces()).collect();
         let (mut key, mut value) = (Vec::new(), Vec::new());
+        let mut built = BuiltIndexes::default();
         for ks in ids {
             // newest first, so the first cursor holding a key wins; inputs
             // at or below the keyspace's floor hold nothing visible for it
@@ -2291,6 +2443,7 @@ impl Shared {
             if cursors.is_empty() {
                 continue;
             }
+            let mut indexing = RunIndexing::start(ks, &self.keyspaces[&ks].indexes);
             out.begin_keyspace(ks)?;
             for c in &mut cursors {
                 c.start()?;
@@ -2316,12 +2469,16 @@ impl Shared {
                     }
                 }
                 if !(drop_tombstones && value == TOMBSTONE) {
+                    indexing.push(&key, &value, &path)?;
                     out.push(&key, &value)?;
                 }
             }
+            indexing.seal(&mut out, &mut built)?;
         }
         out.finish(epoch)?;
-        let merged = Arc::new(Table::open(&path, number)?);
+        let merged = Table::open(&path, number)?;
+        built.keep(&merged);
+        let merged = Arc::new(merged);
 
         {
             let mut w = self.lock_writer();
@@ -2363,6 +2520,53 @@ impl Shared {
         for t in inputs {
             let _ = fs::remove_file(t.path());
             self.cache.forget(t.number());
+        }
+        Ok(())
+    }
+}
+
+/// Builds a keyspace's run indexes as its rows are written to a table.
+struct RunIndexing {
+    ks: u64,
+    builders: Vec<(&'static str, Box<dyn EncodedBuilder>)>,
+}
+
+/// Indexes built while writing a table, to keep once it is open.
+#[derive(Default)]
+struct BuiltIndexes(Vec<(u64, &'static str, Aux)>);
+
+impl BuiltIndexes {
+    fn keep(self, table: &Table) {
+        for (ks, name, aux) in self.0 {
+            table.indexes().insert(ks, name, aux);
+        }
+    }
+}
+
+impl RunIndexing {
+    fn start(ks: u64, kinds: &[IndexKind]) -> Self {
+        RunIndexing {
+            ks,
+            builders: kinds.iter().map(|k| (k.name, (k.start)())).collect(),
+        }
+    }
+
+    fn push(&mut self, key: &[u8], value: &[u8], path: &Path) -> Result<()> {
+        for (_, b) in &mut self.builders {
+            b.push(key, value)
+                .map_err(|e| Error::corrupt(path, 0, format!("keyspace {}: {e}", self.ks)))?;
+        }
+        Ok(())
+    }
+
+    /// Finish every index, writing the frames of those that encode.
+    fn seal(self, table: &mut TableBuilder, built: &mut BuiltIndexes) -> Result<()> {
+        for (name, b) in self.builders {
+            let (aux, frame) = b.finish();
+            if let Some(frame) = frame {
+                table.index_frame(self.ks, name, &frame)?;
+            }
+            built.0.push((self.ks, name, aux));
         }
         Ok(())
     }
@@ -3540,6 +3744,154 @@ mod tests {
         assert!(store.worker.lock().unwrap().is_some());
         store.quiesce().unwrap();
         assert_eq!(live_rows(&store).len(), 2);
+    }
+
+    /// The live keys of a run: how many, and the least and greatest.
+    #[derive(Default, Debug, PartialEq)]
+    struct Zone {
+        live: u32,
+        min: Option<u8>,
+        max: Option<u8>,
+    }
+
+    static ZONE_DECODES: AtomicU64 = AtomicU64::new(0);
+
+    impl RunIndex<u8, i64> for Zone {
+        const NAME: &'static str = "zone";
+        fn push(&mut self, key: &u8, value: Option<&i64>) {
+            if value.is_some() {
+                self.live += 1;
+                self.min = Some(self.min.map_or(*key, |m| m.min(*key)));
+                self.max = Some(*key);
+            }
+        }
+        fn resident_bytes(&self) -> usize {
+            size_of::<Self>()
+        }
+        fn encode(&self, out: &mut Vec<u8>) -> bool {
+            out.extend(self.live.to_le_bytes());
+            out.extend([self.min.unwrap_or(0), self.max.unwrap_or(0)]);
+            true
+        }
+        fn decode(b: &[u8]) -> Option<Self> {
+            ZONE_DECODES.fetch_add(1, Relaxed);
+            let live = u32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+            let (min, max) = (*b.get(4)?, *b.get(5)?);
+            let some = |k| (live > 0).then_some(k);
+            Some(Zone {
+                live,
+                min: some(min),
+                max: some(max),
+            })
+        }
+    }
+
+    /// Every row of a run, tombstones included; declines empty runs and
+    /// never persists.
+    #[derive(Default)]
+    struct Rows(u32);
+
+    impl RunIndex<u8, i64> for Rows {
+        const NAME: &'static str = "rows";
+        fn push(&mut self, _: &u8, _: Option<&i64>) {
+            self.0 += 1;
+        }
+        fn finish(&mut self) -> bool {
+            self.0 > 0
+        }
+        fn resident_bytes(&self) -> usize {
+            size_of::<Self>()
+        }
+    }
+
+    fn open_indexed(dir: &Path) -> Store {
+        StoreBuilder::new(DurabilityPolicy::RELAXED)
+            .dir(dir)
+            .keyspace(KS)
+            .indexed::<_, _, Zone>(KS)
+            .indexed::<_, _, Rows>(KS)
+            .options_with(|o| {
+                o.max_tables = 3;
+                o.compaction_width = 2;
+            })
+            .build()
+            .unwrap()
+    }
+
+    /// Every run's indexes describe exactly that run.
+    fn check_runs(store: &Store) -> (usize, usize) {
+        let snap = store.snapshot();
+        let zones = snap.runs_indexed::<_, _, Zone>(KS).unwrap();
+        let rows = snap.runs_indexed::<_, _, Rows>(KS).unwrap();
+        assert_eq!(zones.len(), rows.len());
+        let mut tables = 0;
+        for (z, r) in zones.iter().zip(&rows) {
+            let live: Vec<u8> = z.range(..).map(|e| *e.unwrap().0).collect();
+            let want = Zone {
+                live: live.len() as u32,
+                min: live.first().copied(),
+                max: live.last().copied(),
+            };
+            assert_eq!(z.index(), Some(&want), "{z:?}");
+            let all = (0..=255u8).filter(|k| r.get(k).unwrap().is_some()).count();
+            assert_eq!(r.index().map(|r| r.0 as usize), Some(all));
+            tables += matches!(z.run, Run::Table { .. }) as usize;
+        }
+        (zones.len(), tables)
+    }
+
+    #[test]
+    fn run_indexes_follow_runs_through_folds_checkpoints_and_compaction() {
+        let dir = tmpdir("run-index");
+        let store = open_indexed(&dir);
+        let mut model = BTreeMap::new();
+        for round in 0..8u8 {
+            for i in 0..12u8 {
+                let k = i * 7 % 40 + round;
+                let v = (i % 4 != 3).then_some(round as i64);
+                put(&store, &[(k, v)]);
+                match v {
+                    Some(v) => model.insert(k, v),
+                    None => model.remove(&k),
+                };
+                check_runs(&store);
+            }
+            if round % 2 == 1 {
+                store.checkpoint().unwrap();
+            }
+            store.quiesce().unwrap();
+            check_runs(&store);
+        }
+        put(&store, &[(200, Some(1))]);
+        model.insert(200, 1);
+        let (runs, tables) = check_runs(&store);
+        assert!(tables > 1 && runs > tables, "{runs} runs, {tables} tables");
+        assert!(store.stats().run_index_bytes > 0);
+        let live: BTreeMap<u8, i64> = live_rows(&store).into_iter().collect();
+        assert_eq!(live, model);
+        drop(store);
+
+        // zones are decoded from the tables; row counts are rebuilt
+        let store = open_indexed(&dir);
+        assert_eq!(store.stats().run_index_bytes, 0, "loaded on first use");
+        let before = ZONE_DECODES.load(Relaxed);
+        let (_, tables) = check_runs(&store);
+        assert!(ZONE_DECODES.load(Relaxed) - before >= tables as u64);
+        assert!(store.stats().run_index_bytes > 0);
+        drop(store);
+
+        // a store without the indexes ignores their frames
+        let plain = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(live_rows(&plain).len(), model.len());
+        drop(plain);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "not registered")]
+    fn an_unregistered_index_is_a_mistake() {
+        let store = mem();
+        let _ = store.snapshot().runs_indexed::<_, _, Zone>(KS);
     }
 
     #[test]

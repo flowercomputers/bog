@@ -12,6 +12,7 @@ mod codec;
 mod cursor;
 pub mod error;
 
+pub mod index;
 mod manifest;
 mod store;
 mod table;

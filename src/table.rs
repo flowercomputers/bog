@@ -8,7 +8,10 @@
 //! ```text
 //! magic "fold3sst"
 //! data block*      entries, then crc32 of the entries
-//! index            per keyspace: the offset, length and first key of each block
+//! index frame*     a run index's encoding, then crc32 of it
+//! index            per keyspace: the offset, length and first key of each
+//!                  block; then, optionally, the keyspace, name, offset and
+//!                  length of each index frame
 //! footer           index offset u64 | index len u64 | epoch u64 | index crc32 | magic
 //! ```
 //!
@@ -31,7 +34,10 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use crate::error::{Error, IoContext, Result};
+use crate::{
+    error::{Error, IoContext, Result},
+    index::TableIndexes,
+};
 
 const MAGIC: &[u8; 8] = b"fold3sst";
 const FOOTER: usize = 8 + 8 + 8 + 4 + 8;
@@ -55,6 +61,7 @@ pub(crate) struct TableBuilder {
     block_size: usize,
     offset: u64,
     index: Vec<(u64, Vec<BlockHandle>)>,
+    frames: Vec<(u64, String, u64, u32)>,
     block: Vec<u8>,
     block_first: Option<Vec<u8>>,
 }
@@ -76,6 +83,7 @@ impl TableBuilder {
             block_size,
             offset: MAGIC.len() as u64,
             index: Vec::new(),
+            frames: Vec::new(),
             block: Vec::with_capacity(block_size * 2),
             block_first: None,
         })
@@ -102,6 +110,20 @@ impl TableBuilder {
         if self.block.len() >= self.block_size {
             self.cut_block()?;
         }
+        Ok(())
+    }
+
+    /// Keep `frame`, the encoding of run index `name` over keyspace `ks`,
+    /// in the table.
+    pub fn index_frame(&mut self, ks: u64, name: &str, frame: &[u8]) -> Result<()> {
+        self.cut_block()?;
+        self.out.write_all(frame).ctx("writing table", &self.path)?;
+        self.out
+            .write_all(&crc32fast::hash(frame).to_le_bytes())
+            .ctx("writing table", &self.path)?;
+        let len = frame.len() as u32 + 4;
+        self.frames.push((ks, name.to_string(), self.offset, len));
+        self.offset += len as u64;
         Ok(())
     }
 
@@ -146,6 +168,16 @@ impl TableBuilder {
                 index.extend(&b.first_key);
             }
         }
+        if !self.frames.is_empty() {
+            index.extend((self.frames.len() as u32).to_le_bytes());
+            for (ks, name, offset, len) in &self.frames {
+                index.extend(ks.to_le_bytes());
+                index.extend((name.len() as u32).to_le_bytes());
+                index.extend(name.as_bytes());
+                index.extend(offset.to_le_bytes());
+                index.extend(len.to_le_bytes());
+            }
+        }
         let mut footer = Vec::with_capacity(FOOTER);
         footer.extend(self.offset.to_le_bytes());
         footer.extend((index.len() as u64).to_le_bytes());
@@ -175,6 +207,10 @@ pub(crate) struct Table {
     size: u64,
     epoch: u64,
     index: HashMap<u64, Vec<BlockHandle>>,
+    /// Run index frames: (keyspace, name) to offset and length with crc.
+    frames: HashMap<(u64, String), (u64, u32)>,
+    /// Run indexes loaded so far.
+    indexes: TableIndexes,
 }
 
 /// A little-endian cursor over the index bytes.
@@ -287,6 +323,26 @@ impl Table {
             }
             index.insert(ks, blocks);
         }
+        let mut frames = HashMap::new();
+        if r.at != raw.len() {
+            for _ in 0..r.u32().ok_or_else(truncated)? {
+                let ks = r.u64().ok_or_else(truncated)?;
+                let name_len = r.u32().ok_or_else(truncated)? as usize;
+                let name = r.take(name_len).ok_or_else(truncated)?;
+                let name = String::from_utf8(name.to_vec())
+                    .map_err(|_| corrupt(index_at, "index frame name is not utf-8"))?;
+                let offset = r.u64().ok_or_else(truncated)?;
+                let len = r.u32().ok_or_else(truncated)?;
+                if offset
+                    .checked_add(len as u64)
+                    .is_none_or(|end| end > index_at)
+                    || len < 4
+                {
+                    return Err(corrupt(index_at, "index frame outside the data region"));
+                }
+                frames.insert((ks, name), (offset, len));
+            }
+        }
         if r.at != raw.len() {
             return Err(corrupt(index_at, "trailing bytes in index"));
         }
@@ -298,7 +354,32 @@ impl Table {
             size,
             epoch,
             index,
+            frames,
+            indexes: TableIndexes::default(),
         })
+    }
+
+    /// The run indexes loaded so far.
+    pub(crate) fn indexes(&self) -> &TableIndexes {
+        &self.indexes
+    }
+
+    /// The checked frame of run index `name` over keyspace `ks`, if the
+    /// table keeps one.
+    pub(crate) fn aux_frame(&self, ks: u64, name: &str) -> Result<Option<Vec<u8>>> {
+        let Some(&(offset, len)) = self.frames.get(&(ks, name.to_string())) else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; len as usize];
+        self.file
+            .read_exact_at(&mut buf, offset)
+            .ctx("reading table", &self.path)?;
+        let (frame, crc) = buf.split_at(buf.len() - 4);
+        if crc32fast::hash(frame) != u32::from_le_bytes(crc.try_into().unwrap()) {
+            return Err(self.corrupt(offset, "index frame checksum mismatch"));
+        }
+        buf.truncate(buf.len() - 4);
+        Ok(Some(buf))
     }
 
     pub fn number(&self) -> u64 {
@@ -715,6 +796,48 @@ mod tests {
             assert!(t.get(1, &key(i), &small).unwrap().is_some());
             assert!(small.stats().0 <= DEFAULT_BLOCK_SIZE * 2);
         }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn index_frames_round_trip_and_damage_is_caught() {
+        let path = tmp("frames");
+        let mut b = TableBuilder::create(&path, DEFAULT_BLOCK_SIZE).unwrap();
+        b.begin_keyspace(1).unwrap();
+        for i in 0..300 {
+            b.push(&key(i), &[1, i as u8]).unwrap();
+        }
+        b.index_frame(1, "zone", b"zone frame").unwrap();
+        b.index_frame(1, "other", b"").unwrap();
+        b.begin_keyspace(2).unwrap();
+        b.push(&key(0), TOMBSTONE).unwrap();
+        b.finish(9).unwrap();
+
+        let t = Table::open(&path, 1).unwrap();
+        assert_eq!(
+            t.aux_frame(1, "zone").unwrap().as_deref(),
+            Some(&b"zone frame"[..])
+        );
+        assert_eq!(t.aux_frame(1, "other").unwrap().as_deref(), Some(&b""[..]));
+        assert_eq!(t.aux_frame(2, "zone").unwrap(), None);
+        // the frames sit between blocks without disturbing them
+        let mut c = t.cursor(1, None);
+        c.start().unwrap();
+        let mut n = 0;
+        while c.current().is_some() {
+            n += 1;
+            c.advance().unwrap();
+        }
+        assert_eq!(n, 300);
+        let cache = BlockCache::new(1 << 20);
+        assert!(t.get(2, &key(0), &cache).unwrap().is_some());
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.windows(10).position(|w| w == b"zone frame").unwrap();
+        bytes[at] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let t = Table::open(&path, 1).unwrap();
+        assert!(matches!(t.aux_frame(1, "zone"), Err(Error::Corrupt { .. })));
         std::fs::remove_file(&path).unwrap();
     }
 
