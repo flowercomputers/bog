@@ -1,26 +1,30 @@
 //! Operators beyond the basics in the crate root, one module per family,
-//! ported from fold2:
+//! ported from fold2 and reworked to read their parents' state:
 //!
 //! - [`linear`]: per-row operators over keyed rows, fused like the rest.
+//! - [`Arrange`]: rows grouped by key, as a state other operators read.
 //! - [`join`]: the inner join, reactive on both sides.
 //! - [`semijoin`]: rows whose key the other side does (or does not) have.
-//! - [`reduce`]: per-key reductions in data position (count, min, max,
-//!   top-k, aggregate, and any other).
+//! - [`reduce`]: per-key reductions in data position (min, max, top-k,
+//!   aggregate, and any other). Totals and counts are [`Sum`](crate::Sum).
 //! - [`foreign_key`]: references to keys the other side lacks, and
 //!   [`Reject`] to refuse a tx that has any.
 //! - [`Minus`] and [`Flatten`], small adapters.
 //!
-//! Stateful operators keep their state in keyspaces the application
-//! declares, usually as derived keyspaces, so a graph change rebuilds
-//! them. Many of them keep an [`Arrangement`]: rows grouped by key, at
-//! their multiplicity.
+//! An operator that needs a parent's whole output reads the parent's
+//! [state](crate::state) instead of keeping a copy: a table, a register an
+//! operator keeps, or an [`Arrange`] node, which several operators can
+//! share. Build them with
+//! [`OpDag::binary_with`](crate::graph::OpDag::binary_with) and its
+//! siblings, which hand them their parents' state handles.
 
 use std::{error::Error as StdError, marker::PhantomData};
 
 use crate::{
-    Bag, Binary, Change, Delta, Merge, Nary, Register, Unary,
+    Bag, Binary, Buffer, Change, Delta, Merge, Nary, Register, Unary,
     codec::OrderedCodec,
     error::Result,
+    state::{Arranged, Arrangement, Declare, State, When},
     tx::{KeyspaceId, WriteTx},
 };
 
@@ -32,47 +36,31 @@ pub mod semijoin;
 
 pub use foreign_key::ForeignKey;
 pub use join::Join;
-pub use reduce::{Reduce, Take};
+pub use reduce::{Aggregate, ReduceMany, Take};
 pub use semijoin::Semijoin;
-
-/// Rows `(K, V)` at their multiplicity, grouped by `K`: the state of a
-/// join side or a reduce. Stored as `(k, Some(v)) -> count`, so that
-/// `(k, None)` sorts before every row of `k` and a key's group is one
-/// range scan; `None` is never stored. A count that reaches zero removes
-/// the row.
-pub type Arrangement<K, V> = KeyspaceId<(K, Option<V>), Delta>;
-
-/// Scratch for resolving changes to an [`Arrangement`].
-pub(crate) type Resolved<K, V> = Vec<((K, Option<V>), Change<Delta>)>;
 
 /// What a key type must be to key an arrangement or counts.
 pub trait Key: OrderedCodec + Clone + Send + Sync + 'static {}
 impl<T: OrderedCodec + Clone + Send + Sync + 'static> Key for T {}
 
-/// Read `key`'s rows from `ks` into `out`, ascending by value, as `take`
-/// says, as the tx sees them.
-pub(crate) fn read_group<K: Key, V: Key>(
+/// Scratch for resolving changes to an [`Arrangement`].
+pub(crate) type Resolved<K, V> = Vec<((K, Option<V>), Change<Delta>)>;
+
+/// Read `key`'s rows from state `s` into `out`, ascending by value, as
+/// `take` says.
+pub(crate) fn read_group<S: State>(
+    s: &S,
     tx: &mut WriteTx,
-    ks: Arrangement<K, V>,
-    key: &K,
+    key: &S::Key,
+    when: When,
     take: Take,
-    out: &mut Vec<(V, Delta)>,
+    out: &mut Vec<(S::Value, Delta)>,
 ) -> Result<()> {
     out.clear();
-    let view = tx.keyspace(ks);
-    for row in view.range((key.clone(), None)..) {
-        let (k, d) = row?;
-        let (kk, v) = &*k;
-        if kk != key {
-            break;
-        }
-        out.push((v.clone().expect("arrangements store values"), *d));
-        if let Take::First(n) = take
-            && out.len() == n
-        {
-            break;
-        }
-    }
+    s.group(tx, key, when, &mut |v, d| {
+        out.push((v.clone(), d));
+        !matches!(take, Take::First(n) if out.len() >= n)
+    })?;
     // todo: a reverse cursor would read only the last n
     if let Take::Last(n) = take {
         let extra = out.len().saturating_sub(n);
@@ -81,15 +69,33 @@ pub(crate) fn read_group<K: Key, V: Key>(
     Ok(())
 }
 
+/// The distinct keys of `delta`'s rows, in order.
+pub(crate) fn dirty_keys<S: State>(delta: &S::Delta) -> Vec<S::Key> {
+    let mut keys: Vec<S::Key> = Vec::new();
+    S::rows(delta, &mut |k, _, _| {
+        if keys.last() != Some(k) {
+            keys.push(k.clone());
+        }
+    });
+    keys
+}
+
+/// `delta`'s rows grouped by key, in key order.
+pub(crate) fn rows_by_key<S: State>(delta: &S::Delta) -> Vec<(S::Key, Vec<(S::Value, Delta)>)> {
+    let mut groups: Vec<(S::Key, Vec<(S::Value, Delta)>)> = Vec::new();
+    S::rows(delta, &mut |k, v, d| match groups.last_mut() {
+        Some((last, rows)) if last == k => rows.push((v.clone(), d)),
+        _ => groups.push((k.clone(), vec![(v.clone(), d)])),
+    });
+    groups
+}
+
 /// Add `changes` to the counts in `ks`, removing counts that reach zero.
-/// `seen` gets every key whose count moved, with its count before and
-/// after.
 pub(crate) fn update_counts<T: Key>(
     tx: &mut WriteTx,
     ks: KeyspaceId<T, Delta>,
     changes: Bag<T>,
     resolved: &mut Vec<(T, Change<Delta>)>,
-    mut seen: impl FnMut(&T, Delta, Delta),
 ) -> Result<()> {
     resolved.clear();
     if changes.is_empty() {
@@ -98,13 +104,6 @@ pub(crate) fn update_counts<T: Key>(
     let mut view = tx.keyspace(ks);
     view.resolve_sorted(changes, resolved)?;
     for (t, change) in resolved.drain(..) {
-        let (old, new) = match &change {
-            Change::Insert(n) => (0, *n),
-            Change::Delete(o) => (*o, 0),
-            Change::Replace(o, n) => (*o, *n),
-            Change::Modify(_) => unreachable!("resolved"),
-        };
-        seen(&t, old, new);
         let change = match change {
             Change::Insert(0) => continue,
             Change::Replace(o, 0) => Change::Delete(o),
@@ -115,37 +114,55 @@ pub(crate) fn update_counts<T: Key>(
     Ok(())
 }
 
-/// The count at `key` in `ks`, as the tx sees it.
-pub(crate) fn count_of<T: Key>(
-    tx: &mut WriteTx,
-    ks: KeyspaceId<T, Delta>,
-    key: &T,
-) -> Result<Delta> {
-    Ok(tx.keyspace(ks).get(key)?.map_or(0, |c| *c))
-}
-
 /// `a * b`, which must not overflow.
 pub(crate) fn multiply(a: Delta, b: Delta) -> Delta {
     a.checked_mul(b).expect("multiplicity overflowed")
 }
 
-/// `rows`, which are sorted, split into runs of equal keys.
-pub(crate) fn by_key<'r, K, V>(
-    rows: &'r Bag<(K, V)>,
-) -> impl Iterator<Item = (&'r K, Vec<(&'r V, Delta)>)> + 'r
-where
-    K: Ord,
-    V: Ord,
-{
-    let mut rows = rows.diffs().peekable();
-    std::iter::from_fn(move || {
-        let ((k, v), d) = rows.next()?;
-        let mut group = vec![(v, d)];
-        while let Some(((_, v), d)) = rows.next_if(|((kk, _), _)| kk == k) {
-            group.push((v, d));
+/// Keeps rows `(K, V)` grouped by key, at their multiplicity, in
+/// `arrangement`, and passes them on. Its [`Arranged`] state is what
+/// joins, semijoins and reductions over rows read, and several of them
+/// can share one.
+pub struct Arrange<K, V> {
+    id: Arrangement<K, V>,
+    resolved: Resolved<K, V>,
+}
+
+impl<K, V> Arrange<K, V> {
+    pub fn new(arrangement: Arrangement<K, V>) -> Self {
+        Arrange {
+            id: arrangement,
+            resolved: Vec::new(),
         }
-        Some((k, group))
-    })
+    }
+}
+
+impl<K: Key, V: Key + Ord> Nary for Arrange<K, V> {
+    type Takes = Bag<(K, V)>;
+    type Gives = Bag<(K, V)>;
+    type State = Arranged<K, V>;
+
+    fn state(&self) -> Arranged<K, V> {
+        Arranged::new(self.id)
+    }
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.id)]
+    }
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<(K, V)>], out: &mut Bag<(K, V)>) {
+        let mut rows = Bag::new();
+        for b in batches {
+            for ((k, v), d) in b.diffs() {
+                rows.push((k.clone(), Some(v.clone())), d);
+                out.push((k.clone(), v.clone()), d);
+            }
+        }
+        if update_counts(tx, self.id, rows, &mut self.resolved).is_err() {
+            // the tx failed; the graph stops here
+            out.clear();
+        }
+    }
 }
 
 /// Bag difference: the left input plus the negation of the right, so
@@ -163,6 +180,8 @@ impl<T: Ord + Clone + Send + 'static> Binary for Minus<T> {
     type Left = Bag<T>;
     type Right = Bag<T>;
     type Gives = Bag<T>;
+    type State = ();
+    fn state(&self) {}
     fn eval(&mut self, _: &mut WriteTx, l: &Bag<T>, r: &Bag<T>, out: &mut Bag<T>) {
         for (t, d) in l.diffs() {
             out.push(t.clone(), d);
@@ -174,8 +193,9 @@ impl<T: Ord + Clone + Send + 'static> Binary for Minus<T> {
 }
 
 /// A register's changes as rows: an insert is the new row at `+1`, a
-/// delete the old row at `-1`, a replace both. Turns a view, such as
-/// [`Sum`](crate::Sum)'s output, into rows every other operator takes.
+/// delete the old row at `-1`, a replace both. Turns a register, such as
+/// a table or [`Sum`](crate::Sum)'s output, into rows for the linear
+/// operators and [`Arrange`].
 pub struct Flatten<K, M>(PhantomData<fn() -> (K, M)>);
 
 impl<K, M> Default for Flatten<K, M> {
@@ -193,18 +213,14 @@ where
 {
     type Takes = Register<K, M>;
     type Gives = Bag<(K, M::Value)>;
+    type State = ();
+    fn state(&self) {}
     fn eval(&mut self, _: &mut WriteTx, batch: &Register<K, M>, out: &mut Self::Gives) {
         for (k, change) in batch.iter() {
-            let (old, new) = match change {
-                Change::Insert(v) => (None, Some(v)),
-                Change::Delete(o) => (Some(o), None),
-                Change::Replace(o, n) => (Some(o), Some(n)),
-                Change::Modify(_) => unreachable!("views hold materialized changes"),
-            };
-            if let Some(o) = old {
+            if let Some(o) = change.old_value() {
                 out.push((k.clone(), o.clone()), -1);
             }
-            if let Some(n) = new {
+            if let Some(n) = change.new_value() {
                 out.push((k.clone(), n.clone()), 1);
             }
         }
@@ -234,6 +250,8 @@ where
 {
     type Takes = Bag<T>;
     type Gives = Bag<()>;
+    type State = ();
+    fn state(&self) {}
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], _: &mut Bag<()>) {
         if tx.rebuilding() {
             return;

@@ -35,6 +35,16 @@ pub(crate) enum Source<'a, K, M: Merge> {
         it: btree_map::Range<'a, K, Change<M>>,
         head: Option<(&'a K, &'a Change<M>)>,
     },
+    /// A write tx's changes as of the start of a graph run: `map`, with
+    /// each key in `prior` as it was before the run. A key the overlay
+    /// did not hold then is skipped, so the snapshot below decides it.
+    OverlayAsOf {
+        map: &'a BTreeMap<K, Change<M>>,
+        prior: &'a BTreeMap<K, Option<Change<M>>>,
+        it: std::iter::Peekable<btree_map::Range<'a, K, Change<M>>>,
+        pit: std::iter::Peekable<btree_map::Range<'a, K, Option<Change<M>>>>,
+        head: Option<(&'a K, &'a Change<M>)>,
+    },
     /// A committed layer in memory.
     Layer {
         map: &'a Resident<K, M::Value>,
@@ -61,6 +71,47 @@ where
         Source::Overlay { map, it, head }
     }
 
+    pub fn overlay_as_of(
+        map: &'a BTreeMap<K, Change<M>>,
+        prior: &'a BTreeMap<K, Option<Change<M>>>,
+        lower: Bound<&K>,
+    ) -> Self {
+        let mut s = Source::OverlayAsOf {
+            map,
+            prior,
+            it: map.range::<K, _>((lower, Bound::Unbounded)).peekable(),
+            pit: prior.range::<K, _>((lower, Bound::Unbounded)).peekable(),
+            head: None,
+        };
+        s.next_as_of();
+        s
+    }
+
+    /// Move an [`OverlayAsOf`](Source::OverlayAsOf) to its next entry.
+    fn next_as_of(&mut self) {
+        let Source::OverlayAsOf { it, pit, head, .. } = self else {
+            unreachable!("only for overlays as of a run")
+        };
+        *head = loop {
+            match (it.peek(), pit.peek()) {
+                (None, None) => break None,
+                (Some(_), None) => break it.next(),
+                (Some((k, _)), Some((p, _))) if k < p => break it.next(),
+                (a, Some((p, prior))) => {
+                    let (p, prior) = (*p, *prior);
+                    if a.is_some_and(|(k, _)| *k == p) {
+                        it.next();
+                    }
+                    pit.next();
+                    match prior {
+                        Some(c) => break Some((p, c)),
+                        None => continue,
+                    }
+                }
+            }
+        };
+    }
+
     pub fn layer(map: &'a Resident<K, M::Value>, lower: Bound<&K>) -> Self {
         let mut it = map.range::<K, _>((lower, Bound::Unbounded));
         let head = it.next();
@@ -77,7 +128,7 @@ where
 
     fn head_key(&self) -> Option<&K> {
         match self {
-            Source::Overlay { head, .. } => head.map(|(k, _)| k),
+            Source::Overlay { head, .. } | Source::OverlayAsOf { head, .. } => head.map(|(k, _)| k),
             Source::Layer { head, .. } => head.map(|(k, _)| k),
             Source::Table { head, .. } => head.as_ref().map(|(k, _)| k),
         }
@@ -86,7 +137,9 @@ where
     /// The head's value without consuming it; `Some(None)` is a tombstone.
     fn peek_value(&self) -> Option<Option<Cow<'a, M::Value>>> {
         match self {
-            Source::Overlay { head, .. } => head.map(|(_, c)| c.new_value().map(Cow::Borrowed)),
+            Source::Overlay { head, .. } | Source::OverlayAsOf { head, .. } => {
+                head.map(|(_, c)| c.new_value().map(Cow::Borrowed))
+            }
             Source::Layer { head, .. } => head.map(|(_, v)| v.as_ref().map(Cow::Borrowed)),
             Source::Table { head, .. } => head
                 .as_ref()
@@ -97,7 +150,7 @@ where
     /// Consume the head; the source must then [`advance`](Self::advance).
     fn take_head(&mut self) -> Option<Entry<'a, K, M::Value>> {
         match self {
-            Source::Overlay { head, .. } => head
+            Source::Overlay { head, .. } | Source::OverlayAsOf { head, .. } => head
                 .take()
                 .map(|(k, c)| (Cow::Borrowed(k), c.new_value().map(Cow::Borrowed))),
             Source::Layer { head, .. } => head
@@ -131,6 +184,7 @@ where
     fn advance(&mut self) -> Result<()> {
         match self {
             Source::Overlay { it, head, .. } => *head = it.next(),
+            Source::OverlayAsOf { .. } => self.next_as_of(),
             Source::Layer { it, head, .. } => *head = it.next(),
             Source::Table { cursor, .. } => {
                 cursor.advance()?;
@@ -150,6 +204,21 @@ where
             Source::Overlay { map, it, head } => {
                 *it = map.range::<K, _>((Bound::Included(key), Bound::Unbounded));
                 *head = it.next();
+            }
+            Source::OverlayAsOf {
+                map,
+                prior,
+                it,
+                pit,
+                ..
+            } => {
+                *it = map
+                    .range::<K, _>((Bound::Included(key), Bound::Unbounded))
+                    .peekable();
+                *pit = prior
+                    .range::<K, _>((Bound::Included(key), Bound::Unbounded))
+                    .peekable();
+                self.next_as_of();
             }
             Source::Layer { map, it, head } => {
                 *it = map.range::<K, _>((Bound::Included(key), Bound::Unbounded));
@@ -229,6 +298,12 @@ where
             probe: Vec::new(),
             tx,
         }
+    }
+
+    /// Put `source` above every other, before the cursor starts.
+    pub(crate) fn push_newest(&mut self, source: Source<'a, K, M>) {
+        debug_assert!(!self.started, "sources are fixed once started");
+        self.sources.insert(0, source);
     }
 
     fn start(&mut self) -> Result<()> {

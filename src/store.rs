@@ -670,6 +670,27 @@ impl<'s> Snapshot<'s> {
         Ok(runs)
     }
 
+    /// A merged cursor over `keyspace` with a write tx's changes as of the
+    /// start of a graph run on top; see [`Source::overlay_as_of`].
+    pub(crate) fn cursor_as_of<'a, K, M>(
+        &'a self,
+        keyspace: KeyspaceId<K, M>,
+        overlay: &'a BTreeMap<K, Change<M>>,
+        prior: &'a BTreeMap<K, Option<Change<M>>>,
+        lower: Bound<&K>,
+        upper: Bound<K>,
+        tx: Option<&'a TxState>,
+    ) -> Cursor<'a, K, M>
+    where
+        K: OrderedCodec + Clone + 'static,
+        M: Merge,
+        M::Value: Codec,
+    {
+        let mut cursor = self.cursor(keyspace, None, lower, upper, tx);
+        cursor.push_newest(Source::overlay_as_of(overlay, prior, lower));
+        cursor
+    }
+
     /// A merged cursor over `keyspace`, with `overlay`, a write tx's own
     /// changes, on top when given.
     pub(crate) fn cursor<'a, K, M>(
@@ -3197,21 +3218,29 @@ mod tests {
     fn tx_memory_tracks_entries_that_change_and_cancel() {
         let store = mem();
         let mut tx = store.begin().unwrap();
+        // what a graph run remembers about the keys it wrote is counted
+        // until the run ends
+        let settle = |tx: &mut WriteTx<'_>| {
+            tx.end_run();
+            drop(tx.keyspace(KS));
+            tx.memory_used()
+        };
         let mut ks = tx.keyspace(KS);
         ks.absorb(1, Change::Insert(10)).unwrap();
         ks.absorb(2, Change::Insert(20)).unwrap();
         drop(ks);
-        let two = tx.memory_used();
-        assert!(two > 0);
+        let in_run = tx.memory_used();
+        let two = settle(&mut tx);
+        assert!(two > 0 && in_run > two, "{in_run} {two}");
         let mut ks = tx.keyspace(KS);
         // insert then delete cancels: the entry is gone, and so are its bytes
         ks.absorb(2, Change::Delete(20)).unwrap();
         drop(ks);
-        assert_eq!(tx.memory_used(), two / 2);
+        assert_eq!(settle(&mut tx), two / 2);
         let mut ks = tx.keyspace(KS);
         ks.absorb(1, Change::Delete(10)).unwrap();
         drop(ks);
-        assert_eq!(tx.memory_used(), 0);
+        assert_eq!(settle(&mut tx), 0);
     }
 
     #[test]

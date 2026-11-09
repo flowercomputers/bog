@@ -12,9 +12,12 @@ mod codec;
 mod cursor;
 pub mod error;
 
+pub mod db;
 pub mod index;
 mod manifest;
 pub mod ops;
+pub mod state;
+use crate::state::{Declare, Stored};
 mod store;
 mod table;
 mod tx;
@@ -188,6 +191,14 @@ impl<M: Merge> Change<M> {
             Change::Modify(_) => unreachable!("Modify has no materialized value"),
         }
     }
+    /// The value at this key before the change, if any.
+    pub fn old_value(&self) -> Option<&M::Value> {
+        match self {
+            Change::Delete(v) | Change::Replace(v, _) => Some(v),
+            Change::Insert(_) => None,
+            Change::Modify(_) => unreachable!("Modify has no materialized value"),
+        }
+    }
     pub fn compose(self, next: Self) -> Option<Self> {
         use Change::*;
         Some(match (self, next) {
@@ -259,16 +270,31 @@ pub trait Nary: Send {
     // TODO: In/Out are redundant with Takes/Gives
     type Takes: Buffer;
     type Gives: Buffer;
+    /// What children can read of this node's output; see [`state`]. `()`
+    /// for none.
+    type State: Clone + Send + 'static;
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Self::Takes], out: &mut Self::Gives);
-    /// Add whatever the operator's type does not already say, such as
-    /// the keyspaces it writes, to the graph's fingerprint.
+    /// The handle children get to this node's state.
+    fn state(&self) -> Self::State;
+    /// The keyspaces this node writes. Each is owned by one node.
+    fn keyspaces(&self) -> Vec<Declare> {
+        Vec::new()
+    }
+    /// Add whatever the operator's type does not already say to the
+    /// graph's fingerprint. Owned keyspaces are added for it.
     fn fingerprint(&self, _fp: &mut Fingerprint) {}
 }
 
 pub trait Unary: Send {
     type Takes: Buffer;
     type Gives: Buffer;
+    /// See [`Nary::State`].
+    type State: Clone + Send + 'static;
     fn eval(&mut self, tx: &mut WriteTx, batch: &Self::Takes, out: &mut Self::Gives);
+    fn state(&self) -> Self::State;
+    fn keyspaces(&self) -> Vec<Declare> {
+        Vec::new()
+    }
     /// See [`Nary::fingerprint`].
     fn fingerprint(&self, _fp: &mut Fingerprint) {}
 }
@@ -276,9 +302,16 @@ pub trait Unary: Send {
 impl<N: Nary> Unary for N {
     type Takes = N::Takes;
     type Gives = N::Gives;
+    type State = N::State;
     #[inline]
     fn eval(&mut self, tx: &mut WriteTx, batch: &Self::Takes, out: &mut Self::Gives) {
         N::eval(self, tx, &[batch], out);
+    }
+    fn state(&self) -> N::State {
+        N::state(self)
+    }
+    fn keyspaces(&self) -> Vec<Declare> {
+        N::keyspaces(self)
     }
     fn fingerprint(&self, fp: &mut Fingerprint) {
         N::fingerprint(self, fp)
@@ -289,7 +322,13 @@ pub trait Binary: Send {
     type Left: Buffer;
     type Right: Buffer;
     type Gives: Buffer;
+    /// See [`Nary::State`].
+    type State: Clone + Send + 'static;
     fn eval(&mut self, tx: &mut WriteTx, l: &Self::Left, r: &Self::Right, out: &mut Self::Gives);
+    fn state(&self) -> Self::State;
+    fn keyspaces(&self) -> Vec<Declare> {
+        Vec::new()
+    }
     /// See [`Nary::fingerprint`].
     fn fingerprint(&self, _fp: &mut Fingerprint) {}
 }
@@ -317,6 +356,15 @@ where
 {
     type Takes = Bag<(K, V)>;
     type Gives = Register<K, (i64, V)>;
+    type State = Stored<K, (i64, V)>;
+
+    fn state(&self) -> Self::State {
+        Stored::new(self.ks)
+    }
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.ks)]
+    }
 
     fn fingerprint(&self, fp: &mut Fingerprint) {
         fp.write_u64(self.ks.raw());
@@ -390,6 +438,13 @@ where
 {
     type Takes = Bag<T>;
     type Gives = Bag<T>;
+    type State = ();
+
+    fn state(&self) {}
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.counts)]
+    }
 
     fn fingerprint(&self, fp: &mut Fingerprint) {
         fp.write_u64(self.counts.raw());
@@ -461,6 +516,9 @@ where
 {
     type Takes = Register<K, M>;
     type Gives = Bag<()>;
+    type State = ();
+
+    fn state(&self) {}
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Register<K, M>], _out: &mut Bag<()>) {
         if tx.rebuilding() {
@@ -512,6 +570,15 @@ where
 {
     type Takes = Register<K, M>;
     type Gives = Bag<K2>;
+    type State = Stored<K2, ()>;
+
+    fn state(&self) -> Self::State {
+        Stored::new(self.index)
+    }
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.index)]
+    }
 
     fn fingerprint(&self, fp: &mut Fingerprint) {
         fp.write_u64(self.index.raw());
@@ -567,6 +634,9 @@ where
 {
     type Takes = Bag<In>;
     type Gives = Bag<Out>;
+    type State = ();
+
+    fn state(&self) {}
 
     fn eval(&mut self, _tx: &mut WriteTx, batches: &[&Bag<In>], out: &mut Bag<Out>) {
         // implicitly concatenates batches

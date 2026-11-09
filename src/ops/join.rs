@@ -1,106 +1,89 @@
 //! [`Join`]: the inner join, reactive on both sides.
 
-use crate::{Bag, Binary, Delta, graph::Fingerprint, tx::WriteTx};
+use crate::{
+    Bag, Binary,
+    error::Result,
+    state::{State, When},
+    tx::WriteTx,
+};
 
-use super::{Arrangement, Key, Resolved, Take, by_key, multiply, read_group, update_counts};
+use super::{Take, multiply, read_group, rows_by_key};
 
 /// Pairs each left row `(k, a)` with every right row `(k, b)` and emits
 /// `logic(&k, &a, &b)` at the product of their multiplicities: SQL's
 /// INNER JOIN. Retracting a row on either side retracts its pairs.
 ///
-/// Each side is arranged in its own keyspace. A run emits the bilinear
-/// delta `ΔA ⋈ B + A' ⋈ ΔB`, where `A'` already includes `ΔA`, so rows
-/// arriving on both sides at once pair exactly once. Reading a dirty key
-/// costs its group on the other side.
-pub struct Join<K, A, B, F> {
-    left: Arrangement<K, A>,
-    right: Arrangement<K, B>,
+/// It keeps nothing: it reads its parents' states, which must be grouped
+/// by the join key: tables and other registers keyed by it, or
+/// [`Arrange`](super::Arrange) nodes. A run emits
+/// `ΔA ⋈ B_old + A_new ⋈ ΔB`, so rows arriving on both sides at once
+/// pair exactly once. A dirty key costs reading its group on the other
+/// side: one lookup for a register.
+pub struct Join<L, R, F> {
+    left: L,
+    right: R,
     logic: F,
-    group_a: Vec<(A, Delta)>,
-    group_b: Vec<(B, Delta)>,
-    resolved: Resolved<K, A>,
-    resolved_b: Resolved<K, B>,
 }
 
-impl<K, A, B, F> Join<K, A, B, F> {
-    pub fn new(left: Arrangement<K, A>, right: Arrangement<K, B>, logic: F) -> Self {
-        Join {
-            left,
-            right,
-            logic,
-            group_a: Vec::new(),
-            group_b: Vec::new(),
-            resolved: Vec::new(),
-            resolved_b: Vec::new(),
-        }
+impl<L, R, F> Join<L, R, F> {
+    /// Build with [`OpDag::binary_with`](crate::graph::OpDag::binary_with),
+    /// which hands over the parents' states.
+    pub fn new(left: L, right: R, logic: F) -> Self {
+        Join { left, right, logic }
     }
 }
 
-impl<K, A, B, O, F> Join<K, A, B, F>
+impl<L, R, O, F> Join<L, R, F>
 where
-    K: Key,
-    A: Key + Ord,
-    B: Key + Ord,
+    L: State,
+    R: State<Key = L::Key>,
     O: Ord + Send + 'static,
-    F: FnMut(&K, &A, &B) -> O + Send,
+    F: FnMut(&L::Key, &L::Value, &R::Value) -> O + Send,
 {
     fn run(
         &mut self,
         tx: &mut WriteTx,
-        l: &Bag<(K, A)>,
-        r: &Bag<(K, B)>,
+        l: &L::Delta,
+        r: &R::Delta,
         out: &mut Bag<O>,
-    ) -> crate::error::Result<()> {
-        // ΔA ⋈ B, against the right side as it was
-        for (k, rows) in by_key(l) {
-            read_group(tx, self.right, k, Take::Whole, &mut self.group_b)?;
+    ) -> Result<()> {
+        let mut group_b = Vec::new();
+        for (k, rows) in rows_by_key::<L>(l) {
+            read_group(&self.right, tx, &k, When::Old, Take::Whole, &mut group_b)?;
             for (a, da) in &rows {
-                for (b, db) in &self.group_b {
-                    out.push((self.logic)(k, a, b), multiply(*da, *db));
+                for (b, db) in &group_b {
+                    out.push((self.logic)(&k, a, b), multiply(*da, *db));
                 }
             }
         }
-        let mut arranged = Bag::new();
-        for ((k, a), d) in l.diffs() {
-            arranged.push((k.clone(), Some(a.clone())), d);
-        }
-        update_counts(tx, self.left, arranged, &mut self.resolved, |_, _, _| {})?;
-
-        // A' ⋈ ΔB, against the left side including ΔA
-        for (k, rows) in by_key(r) {
-            read_group(tx, self.left, k, Take::Whole, &mut self.group_a)?;
+        let mut group_a = Vec::new();
+        for (k, rows) in rows_by_key::<R>(r) {
+            read_group(&self.left, tx, &k, When::New, Take::Whole, &mut group_a)?;
             for (b, db) in &rows {
-                for (a, da) in &self.group_a {
-                    out.push((self.logic)(k, a, b), multiply(*da, *db));
+                for (a, da) in &group_a {
+                    out.push((self.logic)(&k, a, b), multiply(*da, *db));
                 }
             }
         }
-        let mut arranged = Bag::new();
-        for ((k, b), d) in r.diffs() {
-            arranged.push((k.clone(), Some(b.clone())), d);
-        }
-        update_counts(tx, self.right, arranged, &mut self.resolved_b, |_, _, _| {})
+        Ok(())
     }
 }
 
-impl<K, A, B, O, F> Binary for Join<K, A, B, F>
+impl<L, R, O, F> Binary for Join<L, R, F>
 where
-    K: Key,
-    A: Key + Ord,
-    B: Key + Ord,
+    L: State,
+    R: State<Key = L::Key>,
     O: Ord + Send + 'static,
-    F: FnMut(&K, &A, &B) -> O + Send,
+    F: FnMut(&L::Key, &L::Value, &R::Value) -> O + Send,
 {
-    type Left = Bag<(K, A)>;
-    type Right = Bag<(K, B)>;
+    type Left = L::Delta;
+    type Right = R::Delta;
     type Gives = Bag<O>;
+    type State = ();
 
-    fn fingerprint(&self, fp: &mut Fingerprint) {
-        fp.write_u64(self.left.raw());
-        fp.write_u64(self.right.raw());
-    }
+    fn state(&self) {}
 
-    fn eval(&mut self, tx: &mut WriteTx, l: &Bag<(K, A)>, r: &Bag<(K, B)>, out: &mut Bag<O>) {
+    fn eval(&mut self, tx: &mut WriteTx, l: &L::Delta, r: &R::Delta, out: &mut Bag<O>) {
         // on failure the tx has failed, and the graph stops after this node
         let _ = self.run(tx, l, r, out);
     }

@@ -1,14 +1,21 @@
-//! [`Reduce`]: per-key reductions that put aggregates in data position,
-//! and the built-in ones: [`count`], [`min`], [`max`], [`top_k`] and
-//! [`aggregate`].
+//! Per-key reductions that put aggregates in data position:
+//! [`Aggregate`], one value per key, kept as a register, and
+//! [`ReduceMany`], any number of values per key, kept as an arrangement.
+//! The built-ins are [`min`], [`max`], [`aggregate`] and [`top_k`].
 //!
-//! Totals that only add up need no group; see [`Sum`](crate::Sum).
+//! Totals and counts need no group; see [`Sum`](crate::Sum).
 
-use crate::{Bag, Delta, Nary, error::Result, graph::Fingerprint, tx::WriteTx};
+use crate::{
+    Bag, Change, Delta, Mergeless, Nary, Register,
+    codec::Codec,
+    error::Result,
+    state::{Arranged, Arrangement, Declare, State, Stored, When},
+    tx::{KeyspaceId, WriteTx},
+};
 
-use super::{Arrangement, Key, Resolved, read_group, update_counts};
+use super::{Key, Resolved, dirty_keys, read_group, update_counts};
 
-/// How much of a dirty key's group a reduce reads before calling its
+/// How much of a dirty key's group a reduction reads before calling its
 /// logic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Take {
@@ -21,45 +28,38 @@ pub enum Take {
     Last(usize),
 }
 
-/// Recomputes a key's output from its group of values whenever the group
-/// changes, and emits the difference from what it emitted before, so
-/// downstream always holds exactly `logic` of the current groups.
+/// What a reduction's logic is: given a key and its values, ascending,
+/// each with its nonzero multiplicity, as much of the group as [`Take`]
+/// says.
+pub trait Logic<K, V, O>: FnMut(&K, &[(V, Delta)]) -> O + Send {}
+impl<K, V, O, F: FnMut(&K, &[(V, Delta)]) -> O + Send> Logic<K, V, O> for F {}
+
+/// Keeps `logic` of each key's group, one value per key, in `output`, a
+/// register keyed like its parent, and emits its changes.
 ///
-/// `logic` gets the key and its live values, ascending by value, each
-/// with its nonzero multiplicity, as much of the group as [`Take`] says,
-/// and pushes the output rows for the key into its buffer, which is
-/// cleared beforehand. It is not called for a key whose group emptied;
-/// that key's old output is retracted. It must be deterministic.
+/// It reads its group from its parent's state, which must be grouped by
+/// the key: an [`Arrange`](super::Arrange) node, or a register. `logic`
+/// is not called for a key whose group emptied; that key's value is
+/// deleted. It must be deterministic.
 ///
-/// The input is arranged in `state`, and what was emitted in `output`,
-/// to retract exactly. A dirty key costs reading its group, as far as
-/// `Take` says, and its old output.
-pub struct Reduce<K, V, O, F> {
-    state: Arrangement<K, V>,
-    output: Arrangement<K, O>,
+/// A dirty key costs reading its group, as far as `Take` says, and one
+/// lookup of its old value.
+pub struct Aggregate<S: State, O: Clone + Send + 'static, F> {
+    parent: S,
+    output: KeyspaceId<S::Key, Mergeless<O>>,
     take: Take,
     logic: F,
-    dirty: Vec<K>,
-    vals: Vec<(V, Delta)>,
-    fresh: Vec<(O, Delta)>,
-    old: Vec<(O, Delta)>,
-    resolved: Resolved<K, V>,
-    resolved_out: Resolved<K, O>,
+    vals: Vec<(S::Value, Delta)>,
 }
 
-impl<K, V, O, F> Reduce<K, V, O, F> {
-    pub fn new(state: Arrangement<K, V>, output: Arrangement<K, O>, logic: F) -> Self {
-        Reduce {
-            state,
+impl<S: State, O: Clone + Send + 'static, F> Aggregate<S, O, F> {
+    pub fn new(parent: S, output: KeyspaceId<S::Key, Mergeless<O>>, logic: F) -> Self {
+        Aggregate {
+            parent,
             output,
             take: Take::Whole,
             logic,
-            dirty: Vec::new(),
             vals: Vec::new(),
-            fresh: Vec::new(),
-            old: Vec::new(),
-            resolved: Vec::new(),
-            resolved_out: Vec::new(),
         }
     }
 
@@ -71,164 +71,257 @@ impl<K, V, O, F> Reduce<K, V, O, F> {
     }
 }
 
-impl<K, V, O, F> Reduce<K, V, O, F>
+impl<S, O, F> Aggregate<S, O, F>
 where
-    K: Key,
-    V: Key + Ord,
-    O: Key + Ord,
-    F: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send,
+    S: State,
+    S::Key: Key,
+    O: Codec + Clone + PartialEq + Send + Sync + 'static,
+    F: Logic<S::Key, S::Value, O>,
 {
     fn run(
         &mut self,
         tx: &mut WriteTx,
-        batches: &[&Bag<(K, V)>],
-        out: &mut Bag<(K, O)>,
+        batches: &[&S::Delta],
+        out: &mut Register<S::Key, Mergeless<O>>,
     ) -> Result<()> {
-        let mut arranged = Bag::new();
-        for b in batches {
-            for ((k, v), d) in b.diffs() {
-                arranged.push((k.clone(), Some(v.clone())), d);
-            }
+        let mut dirty: Vec<S::Key> = batches.iter().flat_map(|b| dirty_keys::<S>(b)).collect();
+        if batches.len() > 1 {
+            dirty.sort();
+            dirty.dedup();
         }
-        // cancelling rows leave no key dirty
-        self.dirty.clear();
-        for ((k, _), _) in arranged.iter() {
-            if self.dirty.last() != Some(k) {
-                self.dirty.push(k.clone());
-            }
+        for k in dirty {
+            read_group(&self.parent, tx, &k, When::New, self.take, &mut self.vals)?;
+            let new = (!self.vals.is_empty()).then(|| (self.logic)(&k, &self.vals));
+            let mut ks = tx.keyspace(self.output);
+            let old = ks.get(&k)?.map(|o| o.into_owned());
+            let change = match (old, new) {
+                (None, None) => continue,
+                (Some(o), Some(n)) if o == n => continue,
+                (None, Some(n)) => Change::Insert(n),
+                (Some(o), None) => Change::Delete(o),
+                (Some(o), Some(n)) => Change::Replace(o, n),
+            };
+            ks.absorb(k.clone(), change.clone())?;
+            out.absorb_one(k, change);
         }
-        update_counts(tx, self.state, arranged, &mut self.resolved, |_, _, _| {})?;
+        Ok(())
+    }
+}
 
+impl<S, O, F> Nary for Aggregate<S, O, F>
+where
+    S: State,
+    S::Key: Key,
+    O: Codec + Clone + PartialEq + Send + Sync + 'static,
+    F: Logic<S::Key, S::Value, O>,
+{
+    type Takes = S::Delta;
+    type Gives = Register<S::Key, Mergeless<O>>;
+    type State = Stored<S::Key, Mergeless<O>>;
+
+    fn state(&self) -> Self::State {
+        Stored::new(self.output)
+    }
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.output)]
+    }
+
+    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+        take_fingerprint(self.take, fp);
+    }
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {
+        let _ = self.run(tx, batches, out);
+    }
+}
+
+fn take_fingerprint(take: Take, fp: &mut crate::graph::Fingerprint) {
+    match take {
+        Take::Whole => fp.write_u64(0),
+        Take::First(n) => fp.write_u64(1 << 32 | n as u64),
+        Take::Last(n) => fp.write_u64(2 << 32 | n as u64),
+    }
+}
+
+/// Keeps `logic` of each key's group, any number of rows per key, in
+/// `output`, an arrangement, and emits the difference from what it held:
+/// so downstream always holds `logic` of the current groups. See
+/// [`Aggregate`] for one value per key, which is cheaper.
+pub struct ReduceMany<S: State, O, F> {
+    parent: S,
+    output: Arrangement<S::Key, O>,
+    take: Take,
+    logic: F,
+    vals: Vec<(S::Value, Delta)>,
+    fresh: Vec<(O, Delta)>,
+    old: Vec<(O, Delta)>,
+    resolved: Resolved<S::Key, O>,
+}
+
+impl<S: State, O, F> ReduceMany<S, O, F> {
+    pub fn new(parent: S, output: Arrangement<S::Key, O>, logic: F) -> Self {
+        ReduceMany {
+            parent,
+            output,
+            take: Take::Whole,
+            logic,
+            vals: Vec::new(),
+            fresh: Vec::new(),
+            old: Vec::new(),
+            resolved: Vec::new(),
+        }
+    }
+
+    /// See [`Aggregate::reading`].
+    pub fn reading(mut self, take: Take) -> Self {
+        self.take = take;
+        self
+    }
+}
+
+impl<S, O, F> ReduceMany<S, O, F>
+where
+    S: State,
+    S::Key: Key,
+    O: Key + Ord,
+    F: FnMut(&S::Key, &[(S::Value, Delta)], &mut Vec<(O, Delta)>) + Send,
+{
+    fn run(
+        &mut self,
+        tx: &mut WriteTx,
+        batches: &[&S::Delta],
+        out: &mut Bag<(S::Key, O)>,
+    ) -> Result<()> {
+        let mut dirty: Vec<S::Key> = batches.iter().flat_map(|b| dirty_keys::<S>(b)).collect();
+        if batches.len() > 1 {
+            dirty.sort();
+            dirty.dedup();
+        }
+        let output = Arranged::new(self.output);
         let mut corrections = Bag::new();
-        for key in &self.dirty {
-            read_group(tx, self.state, key, self.take, &mut self.vals)?;
+        for k in dirty {
+            read_group(&self.parent, tx, &k, When::New, self.take, &mut self.vals)?;
             if !self.vals.is_empty() {
                 self.fresh.clear();
-                (self.logic)(key, &self.vals, &mut self.fresh);
+                (self.logic)(&k, &self.vals, &mut self.fresh);
                 for (o, d) in self.fresh.drain(..) {
-                    corrections.push((key.clone(), Some(o)), d);
+                    corrections.push((k.clone(), Some(o)), d);
                 }
             }
-            read_group(tx, self.output, key, super::Take::Whole, &mut self.old)?;
+            read_group(&output, tx, &k, When::New, Take::Whole, &mut self.old)?;
             for (o, d) in self.old.drain(..) {
-                corrections.push((key.clone(), Some(o)), -d);
+                corrections.push((k.clone(), Some(o)), -d);
             }
         }
         for ((k, o), d) in corrections.diffs() {
             out.push((k.clone(), o.clone().expect("outputs are values")), d);
         }
-        update_counts(
-            tx,
-            self.output,
-            corrections,
-            &mut self.resolved_out,
-            |_, _, _| {},
-        )
+        update_counts(tx, self.output, corrections, &mut self.resolved)
     }
 }
 
-impl<K, V, O, F> Nary for Reduce<K, V, O, F>
+impl<S, O, F> Nary for ReduceMany<S, O, F>
 where
-    K: Key,
-    V: Key + Ord,
+    S: State,
+    S::Key: Key,
     O: Key + Ord,
-    F: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send,
+    F: FnMut(&S::Key, &[(S::Value, Delta)], &mut Vec<(O, Delta)>) + Send,
 {
-    type Takes = Bag<(K, V)>;
-    type Gives = Bag<(K, O)>;
+    type Takes = S::Delta;
+    type Gives = Bag<(S::Key, O)>;
+    type State = Arranged<S::Key, O>;
 
-    fn fingerprint(&self, fp: &mut Fingerprint) {
-        fp.write_u64(self.state.raw());
-        fp.write_u64(self.output.raw());
-        match self.take {
-            Take::Whole => fp.write_u64(0),
-            Take::First(n) => fp.write_u64(1 << 32 | n as u64),
-            Take::Last(n) => fp.write_u64(2 << 32 | n as u64),
-        }
+    fn state(&self) -> Self::State {
+        Arranged::new(self.output)
     }
 
-    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<(K, V)>], out: &mut Bag<(K, O)>) {
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.output)]
+    }
+
+    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+        take_fingerprint(self.take, fp);
+    }
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {
         let _ = self.run(tx, batches, out);
     }
 }
 
-/// What a reduce's logic is; see [`Reduce`].
-pub trait ReduceLogic<K, V, O>: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send {}
-impl<K, V, O, F: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send> ReduceLogic<K, V, O> for F {}
-
-/// The logic of the built-in reductions: a plain `fn`, so their types
-/// stay nameable.
-pub type ReduceFn<K, V, O> = fn(&K, &[(V, Delta)], &mut Vec<(O, Delta)>);
-
-/// Logic that captures configuration, such as [`top_k`]'s `k`.
-pub type BoxedReduceFn<K, V, O> = Box<dyn FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send>;
-
-/// The multiplicity of each key, `(k, total)`: with ±1 rows, how many
-/// there are. Takes unit values, so its state is one row per key; map
-/// values away first with [`MapVal`](super::linear::MapVal).
-pub fn count<K: Key>(
-    state: Arrangement<K, ()>,
-    output: Arrangement<K, Delta>,
-) -> Reduce<K, (), Delta, ReduceFn<K, (), Delta>> {
-    fn logic<K>(_: &K, vals: &[((), Delta)], out: &mut Vec<(Delta, Delta)>) {
-        out.push((vals.iter().map(|(_, d)| d).sum(), 1));
-    }
-    Reduce::new(state, output, logic::<K> as ReduceFn<K, (), Delta>)
-}
+/// The logic of the built-in one-value reductions: a plain `fn`, so their
+/// types stay nameable.
+pub type AggregateFn<K, V, O> = fn(&K, &[(V, Delta)]) -> O;
 
 /// The least value of each key. Retracting it resurfaces the runner-up,
-/// which the arrangement remembers.
-pub fn min<K: Key, V: Key + Ord>(
-    state: Arrangement<K, V>,
-    output: Arrangement<K, V>,
-) -> Reduce<K, V, V, ReduceFn<K, V, V>> {
-    fn logic<K, V: Clone>(_: &K, vals: &[(V, Delta)], out: &mut Vec<(V, Delta)>) {
-        out.push((vals[0].0.clone(), 1));
+/// which the parent's state holds.
+pub fn min<S>(
+    parent: S,
+    output: KeyspaceId<S::Key, Mergeless<S::Value>>,
+) -> Aggregate<S, S::Value, AggregateFn<S::Key, S::Value, S::Value>>
+where
+    S: State,
+{
+    fn logic<K, V: Clone>(_: &K, vals: &[(V, Delta)]) -> V {
+        vals[0].0.clone()
     }
-    Reduce::new(state, output, logic::<K, V> as ReduceFn<K, V, V>).reading(Take::First(1))
+    Aggregate::new(
+        parent,
+        output,
+        logic::<S::Key, S::Value> as AggregateFn<_, _, _>,
+    )
+    .reading(Take::First(1))
 }
 
 /// The greatest value of each key. See [`min`].
-pub fn max<K: Key, V: Key + Ord>(
-    state: Arrangement<K, V>,
-    output: Arrangement<K, V>,
-) -> Reduce<K, V, V, ReduceFn<K, V, V>> {
-    fn logic<K, V: Clone>(_: &K, vals: &[(V, Delta)], out: &mut Vec<(V, Delta)>) {
-        out.push((vals[vals.len() - 1].0.clone(), 1));
+pub fn max<S>(
+    parent: S,
+    output: KeyspaceId<S::Key, Mergeless<S::Value>>,
+) -> Aggregate<S, S::Value, AggregateFn<S::Key, S::Value, S::Value>>
+where
+    S: State,
+{
+    fn logic<K, V: Clone>(_: &K, vals: &[(V, Delta)]) -> V {
+        vals[vals.len() - 1].0.clone()
     }
-    Reduce::new(state, output, logic::<K, V> as ReduceFn<K, V, V>).reading(Take::Last(1))
+    Aggregate::new(
+        parent,
+        output,
+        logic::<S::Key, S::Value> as AggregateFn<_, _, _>,
+    )
+    .reading(Take::Last(1))
 }
+
+/// `f` of each key's whole group.
+pub fn aggregate<S, O: Clone + Send + 'static, F>(
+    parent: S,
+    output: KeyspaceId<S::Key, Mergeless<O>>,
+    f: F,
+) -> Aggregate<S, O, F>
+where
+    S: State,
+    F: Logic<S::Key, S::Value, O>,
+{
+    Aggregate::new(parent, output, f)
+}
+
+/// The logic of [`top_k`].
+pub type TopK<K, V> = Box<dyn FnMut(&K, &[(V, Delta)], &mut Vec<(V, Delta)>) + Send>;
 
 /// The `k` greatest distinct values of each key, each once. Retracting
 /// one resurfaces the next.
-pub fn top_k<K: Key, V: Key + Ord>(
-    state: Arrangement<K, V>,
-    output: Arrangement<K, V>,
+pub fn top_k<S>(
+    parent: S,
+    output: Arrangement<S::Key, S::Value>,
     k: usize,
-) -> Reduce<K, V, V, BoxedReduceFn<K, V, V>> {
-    let logic: BoxedReduceFn<K, V, V> = Box::new(move |_, vals, out| {
+) -> ReduceMany<S, S::Value, TopK<S::Key, S::Value>>
+where
+    S: State,
+{
+    let logic: TopK<S::Key, S::Value> = Box::new(move |_, vals, out| {
         for (v, _) in vals.iter().rev().take(k) {
             out.push((v.clone(), 1));
         }
     });
-    Reduce::new(state, output, logic).reading(Take::Last(k))
-}
-
-/// Exactly one output per key, `f` of its whole group.
-pub fn aggregate<K, V, O, F>(
-    state: Arrangement<K, V>,
-    output: Arrangement<K, O>,
-    mut f: F,
-) -> Reduce<K, V, O, impl ReduceLogic<K, V, O>>
-where
-    K: Key,
-    V: Key + Ord,
-    O: Key + Ord,
-    F: FnMut(&K, &[(V, Delta)]) -> O + Send,
-{
-    Reduce::new(
-        state,
-        output,
-        move |k: &K, vals: &[(V, Delta)], out: &mut Vec<(O, Delta)>| out.push((f(k, vals), 1)),
-    )
+    ReduceMany::new(parent, output, logic).reading(Take::Last(k))
 }

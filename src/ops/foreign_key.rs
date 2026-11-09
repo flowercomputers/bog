@@ -1,74 +1,54 @@
 //! [`ForeignKey`]: references to keys the parent side lacks.
 
-use std::{collections::BTreeSet, marker::PhantomData};
-
 use crate::{
-    Bag, Binary, Change, Delta,
+    Bag, Binary,
     error::Result,
-    graph::Fingerprint,
-    tx::{KeyspaceId, WriteTx},
+    state::{State, When},
+    tx::WriteTx,
 };
-
-use super::{Key, count_of, update_counts};
 
 /// Emits, at `+1`, every key that after a run is referenced by a child
 /// row `(k, a)` on the left but has no parent row `(k, b)` on the right:
 /// the run's foreign-key violations. Feed it to a
 /// [`Reject`](super::Reject) to refuse transactions that have any.
 ///
-/// It keeps only two counts per parent key, child references and parent
-/// rows, never the rows themselves, so its state is bounded by the keys
-/// referenced however many children there are. Its output is the
-/// violations of each run, not a maintained relation: a rejected tx
-/// leaves nothing to retract.
-pub struct ForeignKey<K, A, B> {
-    refs: KeyspaceId<K, Delta>,
-    parents: KeyspaceId<K, Delta>,
-    resolved: Vec<(K, Change<Delta>)>,
-    _p: PhantomData<fn() -> (A, B)>,
+/// It keeps nothing: the children must be grouped by the key they
+/// reference, typically by an [`Arrange`](super::Arrange) node, and the
+/// parents are usually a table keyed by it. Its output is each run's
+/// violations, not a maintained relation: a rejected tx leaves nothing to
+/// retract.
+pub struct ForeignKey<L, R> {
+    children: L,
+    parents: R,
 }
 
-impl<K, A, B> ForeignKey<K, A, B> {
-    pub fn new(refs: KeyspaceId<K, Delta>, parents: KeyspaceId<K, Delta>) -> Self {
-        ForeignKey {
-            refs,
-            parents,
-            resolved: Vec::new(),
-            _p: PhantomData,
-        }
+impl<L, R> ForeignKey<L, R> {
+    pub fn new(children: L, parents: R) -> Self {
+        ForeignKey { children, parents }
     }
 }
 
-impl<K, A, B> ForeignKey<K, A, B>
+impl<L, R> ForeignKey<L, R>
 where
-    K: Key,
-    A: Ord + Send + 'static,
-    B: Ord + Send + 'static,
+    L: State,
+    R: State<Key = L::Key>,
 {
     fn run(
         &mut self,
         tx: &mut WriteTx,
-        l: &Bag<(K, A)>,
-        r: &Bag<(K, B)>,
-        out: &mut Bag<K>,
+        l: &L::Delta,
+        r: &R::Delta,
+        out: &mut Bag<L::Key>,
     ) -> Result<()> {
-        let mut drefs = Bag::new();
-        for ((k, _), d) in l.diffs() {
-            drefs.push(k.clone(), d);
-        }
-        let mut dparents = Bag::new();
-        for ((k, _), d) in r.diffs() {
-            dparents.push(k.clone(), d);
-        }
-        let touched: BTreeSet<K> = drefs
-            .iter()
-            .chain(dparents.iter())
-            .map(|(k, _)| k.clone())
-            .collect();
-        update_counts(tx, self.refs, drefs, &mut self.resolved, |_, _, _| {})?;
-        update_counts(tx, self.parents, dparents, &mut self.resolved, |_, _, _| {})?;
-        for k in touched {
-            if count_of(tx, self.refs, &k)? > 0 && count_of(tx, self.parents, &k)? <= 0 {
+        let mut dirty = Vec::new();
+        L::rows(l, &mut |k, _, _| dirty.push(k.clone()));
+        R::rows(r, &mut |k, _, _| dirty.push(k.clone()));
+        dirty.sort();
+        dirty.dedup();
+        for k in dirty {
+            if self.children.exists(tx, &k, When::New)?
+                && !self.parents.exists(tx, &k, When::New)?
+            {
                 out.push(k, 1);
             }
         }
@@ -76,22 +56,19 @@ where
     }
 }
 
-impl<K, A, B> Binary for ForeignKey<K, A, B>
+impl<L, R> Binary for ForeignKey<L, R>
 where
-    K: Key,
-    A: Ord + Send + 'static,
-    B: Ord + Send + 'static,
+    L: State,
+    R: State<Key = L::Key>,
 {
-    type Left = Bag<(K, A)>;
-    type Right = Bag<(K, B)>;
-    type Gives = Bag<K>;
+    type Left = L::Delta;
+    type Right = R::Delta;
+    type Gives = Bag<L::Key>;
+    type State = ();
 
-    fn fingerprint(&self, fp: &mut Fingerprint) {
-        fp.write_u64(self.refs.raw());
-        fp.write_u64(self.parents.raw());
-    }
+    fn state(&self) {}
 
-    fn eval(&mut self, tx: &mut WriteTx, l: &Bag<(K, A)>, r: &Bag<(K, B)>, out: &mut Bag<K>) {
+    fn eval(&mut self, tx: &mut WriteTx, l: &L::Delta, r: &R::Delta, out: &mut Bag<L::Key>) {
         let _ = self.run(tx, l, r, out);
     }
 }

@@ -2,7 +2,7 @@ use std::{
     any::Any,
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     marker::PhantomData,
     ops::{Bound, RangeBounds},
@@ -157,6 +157,8 @@ pub struct WriteTx<'tx> {
     writer: WriterGuard<'tx>,
     /// Part of a rebuild of derived state at open.
     rebuilding: bool,
+    /// Which graph run this is; see [`WriteTx::end_run`].
+    run: u64,
 }
 
 impl<'tx> WriteTx<'tx> {
@@ -176,7 +178,15 @@ impl<'tx> WriteTx<'tx> {
             snapshot,
             writer,
             rebuilding: false,
+            run: 0,
         }
+    }
+
+    /// End a graph run: what was written so far becomes the "old" state
+    /// of the next run, and nothing counts as changed in it yet. See
+    /// [`Keyspace::get_old`] and [`Keyspace::run_changes`].
+    pub(crate) fn end_run(&mut self) {
+        self.run += 1;
     }
 
     /// Whether this tx is one chunk of a rebuild of derived state, replaying
@@ -223,6 +233,7 @@ impl<'tx> WriteTx<'tx> {
             snapshot,
             writer,
             rebuilding: _,
+            run: _,
         } = self;
         let overlay = state.check().map(|()| overlay);
         (epoch, overlay, snapshot, writer)
@@ -237,6 +248,12 @@ impl<'tx> WriteTx<'tx> {
 /// [`Keyspace`] view turns incoming Modifies into those.
 pub struct KeyspaceHandle<K, M: Merge> {
     inner: Register<K, M>,
+    /// Keys written in run `run`, each with its overlay entry from before
+    /// that run: `None` if it had none.
+    touched: BTreeMap<K, Option<Change<M>>>,
+    run: u64,
+    /// Estimated bytes `touched` holds.
+    touched_bytes: usize,
 }
 
 /// A transaction's view of one keyspace: its own writes plus the
@@ -244,6 +261,8 @@ pub struct KeyspaceHandle<K, M: Merge> {
 pub struct Keyspace<'a, 'tx, K, M: Merge> {
     id: KeyspaceId<K, M>,
     writes: &'a mut Register<K, M>,
+    touched: &'a mut BTreeMap<K, Option<Change<M>>>,
+    touched_bytes: &'a mut usize,
     state: &'a TxState,
     snap: &'a Snapshot<'tx>,
 }
@@ -252,6 +271,9 @@ impl<K: Ord, M: Merge> Default for KeyspaceHandle<K, M> {
     fn default() -> Self {
         Self {
             inner: Register::new(),
+            touched: BTreeMap::new(),
+            run: 0,
+            touched_bytes: 0,
         }
     }
 }
@@ -328,22 +350,56 @@ where
 
     /// Record a materialized change. Fails if the tx has failed, including
     /// by this write taking it over its memory limit.
-    pub fn absorb(&mut self, key: K, change: Change<M>) -> Result<()> {
+    pub fn absorb(&mut self, key: K, change: Change<M>) -> Result<()>
+    where
+        K: Clone,
+    {
         debug_assert!(
             !matches!(change, Change::Modify(_)),
             "resolve before absorbing"
         );
         self.state.check()?;
-        let delta = self
+        let mut delta = 0;
+        if !self.touched.contains_key(&key) {
+            // remember the key's entry from before this run
+            let prior = self.writes.get(&key).cloned();
+            let bytes = key.resident_size()
+                + prior.as_ref().map_or(0, |c| change_bytes::<K, M>(&key, c))
+                + ENTRY_OVERHEAD;
+            *self.touched_bytes += bytes;
+            delta += bytes as isize;
+            self.touched.insert(key.clone(), prior);
+        }
+        delta += self
             .writes
             .absorb_one_measured(key, change, change_bytes::<K, M>);
         if self.state.grow(delta) {
             // release this keyspace's writes now; the tx drops the rest
             // the next time it opens a keyspace, or when it ends
             *self.writes = Register::new();
+            self.touched.clear();
+            *self.touched_bytes = 0;
             return self.state.check();
         }
         Ok(())
+    }
+
+    /// Set `key` to `value`, or delete it with `None`: reads the old
+    /// value to record the change.
+    pub fn set(&mut self, key: K, value: Option<M::Value>) -> Result<()>
+    where
+        K: Clone,
+        M::Value: PartialEq,
+    {
+        let old = self.get(&key)?.map(Cow::into_owned);
+        let change = match (old, value) {
+            (None, None) => return Ok(()),
+            (Some(o), Some(n)) if o == n => return Ok(()),
+            (None, Some(n)) => Change::Insert(n),
+            (Some(o), None) => Change::Delete(o),
+            (Some(o), Some(n)) => Change::Replace(o, n),
+        };
+        self.absorb(key, change)
     }
 
     /// Current value of `key` as seen by this transaction: the overlay
@@ -395,6 +451,77 @@ where
         K: Clone,
     {
         self.cursor(range.start_bound(), range.end_bound().cloned())
+    }
+
+    /// The value of `key` as of the start of this graph run: what
+    /// [`get`](Self::get) returned before anything this run wrote.
+    pub fn get_old(&self, key: &K) -> Result<Option<Cow<'_, M::Value>>> {
+        match self.touched.get(key) {
+            None => self.get(key),
+            Some(Some(prior)) => Ok(prior.new_value().map(Cow::Borrowed)),
+            // not in the overlay before this run: as of before the tx,
+            // which the entry written since remembers, or which the
+            // snapshot holds if the writes cancelled out
+            Some(None) => match self.writes.get(key) {
+                Some(c) => Ok(c.old_value().map(Cow::Borrowed)),
+                None => self.state.read(|| self.snap.get(self.id, key)),
+            },
+        }
+    }
+
+    /// [`range`](Self::range) as of the start of this graph run.
+    pub fn range_old(&self, range: impl RangeBounds<K>) -> Cursor<'_, K, M>
+    where
+        K: Clone,
+    {
+        let (lower, upper) = (range.start_bound(), range.end_bound().cloned());
+        self.snap.cursor_as_of(
+            self.id,
+            self.writes.map(),
+            &*self.touched,
+            lower,
+            upper,
+            Some(self.state),
+        )
+    }
+
+    /// Whether anything was written to this keyspace in this graph run.
+    pub fn changed_this_run(&self) -> bool {
+        !self.touched.is_empty()
+    }
+
+    /// Every key whose value this graph run changed, from its value at
+    /// the start of the run to its value now, in key order. Needs no
+    /// reads: the overlay remembers values from before the tx.
+    pub fn run_changes(&self, out: &mut Register<K, M>)
+    where
+        K: Clone,
+        M::Value: PartialEq,
+    {
+        for (k, prior) in self.touched.iter() {
+            let now = self.writes.get(k);
+            let old = match prior {
+                Some(c) => c.new_value(),
+                None => match now {
+                    Some(c) => c.old_value(),
+                    // written and cancelled within the run
+                    None => continue,
+                },
+            };
+            let new = match now {
+                Some(c) => c.new_value(),
+                // cancelled back to its value before the tx
+                None => prior.as_ref().and_then(|c| c.old_value()),
+            };
+            let change = match (old, new) {
+                (None, None) => continue,
+                (Some(o), Some(n)) if o == n => continue,
+                (None, Some(n)) => Change::Insert(n.clone()),
+                (Some(o), None) => Change::Delete(o.clone()),
+                (Some(o), Some(n)) => Change::Replace(o.clone(), n.clone()),
+            };
+            out.absorb_one(k.clone(), change);
+        }
     }
 
     fn cursor(&self, lower: Bound<&K>, upper: Bound<K>) -> Cursor<'_, K, M>
@@ -462,9 +589,18 @@ impl<'tx> WriteTx<'tx> {
             .as_any_mut()
             .downcast_mut()
             .expect("keyspace id reused with a different type");
+        if handle.run != self.run {
+            // a new graph run: nothing written in it yet
+            handle.run = self.run;
+            handle.touched.clear();
+            self.state
+                .grow(-(std::mem::take(&mut handle.touched_bytes) as isize));
+        }
         Keyspace {
             id,
             writes: &mut handle.inner,
+            touched: &mut handle.touched,
+            touched_bytes: &mut handle.touched_bytes,
             state: &self.state,
             snap: &self.snapshot,
         }
@@ -520,5 +656,88 @@ mod tests {
         // key 1 is deleted in the overlay, so the snapshot's 10 is invisible
         assert!(matches!(out[0], (1, Change::Insert(1))));
         assert!(matches!(out[1], (3, Change::Insert(7))));
+    }
+
+    fn changes(ks: &Keyspace<'_, '_, u8, i64>) -> Vec<(u8, Option<i64>, Option<i64>)> {
+        let mut out = Register::new();
+        ks.run_changes(&mut out);
+        out.iter()
+            .map(|(k, c)| (*k, c.old_value().copied(), c.new_value().copied()))
+            .collect()
+    }
+
+    #[test]
+    fn runs_see_old_and_new_state_and_their_own_changes() {
+        let store = StoreBuilder::new(DurabilityPolicy::NONE)
+            .keyspace(KS)
+            .build()
+            .unwrap();
+        let mut tx = store.begin().unwrap();
+        let mut ks = tx.keyspace(KS);
+        for k in 1..=4 {
+            ks.absorb(k, Change::Insert(k as i64 * 10)).unwrap();
+        }
+        store.finish(tx).unwrap();
+
+        let mut tx = store.begin().unwrap();
+        // run 0: change 1, delete 2, insert 5, insert then cancel 6
+        let mut ks = tx.keyspace(KS);
+        ks.absorb(1, Change::Replace(10, 11)).unwrap();
+        ks.absorb(2, Change::Delete(20)).unwrap();
+        ks.absorb(5, Change::Insert(50)).unwrap();
+        ks.absorb(6, Change::Insert(60)).unwrap();
+        ks.absorb(6, Change::Delete(60)).unwrap();
+        assert_eq!(
+            changes(&ks),
+            vec![
+                (1, Some(10), Some(11)),
+                (2, Some(20), None),
+                (5, None, Some(50))
+            ]
+        );
+        assert_eq!(ks.get_old(&1).unwrap().as_deref(), Some(&10));
+        assert_eq!(ks.get_old(&2).unwrap().as_deref(), Some(&20));
+        assert_eq!(ks.get_old(&5).unwrap().as_deref(), None);
+        assert_eq!(ks.get_old(&3).unwrap().as_deref(), Some(&30), "untouched");
+        let old: Vec<(u8, i64)> = ks
+            .range_old(..)
+            .map(|r| r.map(|(k, v)| (*k, *v)).unwrap())
+            .collect();
+        assert_eq!(old, vec![(1, 10), (2, 20), (3, 30), (4, 40)]);
+
+        // run 1: the old state is what run 0 left
+        tx.end_run();
+        let mut ks = tx.keyspace(KS);
+        assert!(!ks.changed_this_run());
+        assert_eq!(ks.get_old(&1).unwrap().as_deref(), Some(&11));
+        ks.absorb(1, Change::Replace(11, 10)).unwrap(); // back to before the tx
+        ks.absorb(5, Change::Delete(50)).unwrap(); // cancels run 0's insert
+        ks.absorb(2, Change::Insert(21)).unwrap();
+        ks.absorb(3, Change::Delete(30)).unwrap();
+        assert_eq!(
+            changes(&ks),
+            vec![
+                (1, Some(11), Some(10)),
+                (2, None, Some(21)),
+                (3, Some(30), None),
+                (5, Some(50), None)
+            ]
+        );
+        assert_eq!(ks.get_old(&5).unwrap().as_deref(), Some(&50));
+        assert_eq!(ks.get_old(&2).unwrap().as_deref(), None);
+        let old: Vec<(u8, i64)> = ks
+            .range_old(..)
+            .map(|r| r.map(|(k, v)| (*k, *v)).unwrap())
+            .collect();
+        assert_eq!(old, vec![(1, 11), (3, 30), (4, 40), (5, 50)]);
+        let new: Vec<(u8, i64)> = ks
+            .range(..)
+            .map(|r| r.map(|(k, v)| (*k, *v)).unwrap())
+            .collect();
+        assert_eq!(new, vec![(1, 10), (2, 21), (4, 40)]);
+        let from3: Vec<u8> = ks.range_old(3..).map(|r| *r.unwrap().0).collect();
+        assert_eq!(from3, vec![3, 4, 5]);
+        store.finish(tx).unwrap();
+        assert_eq!(store.snapshot().get(KS, &1).unwrap().as_deref(), Some(&10));
     }
 }
