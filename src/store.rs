@@ -4,12 +4,12 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{File, OpenOptions},
     io::Write,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering::Acquire},
-    },
+    path::PathBuf,
+    sync::{Arc, Mutex},
     time::Instant,
 };
+
+use arc_swap::ArcSwap;
 
 use crate::{
     merge::Merge,
@@ -60,7 +60,7 @@ impl DurabilityPolicy {
         if matches!(&self.write, DurabilityPolicyCadence::Never)
             && !matches!(&self.fsync, DurabilityPolicyCadence::Never)
         {
-            return Err("cannot fsync unwritten data");
+            return Err("invalid durability policy: cannot fsync unwritten data");
             // Err(Error::DurabilityPolicy(self.disk))
         }
 
@@ -114,59 +114,120 @@ impl Default for DurabilityPolicy {
     }
 }
 
+/// One committed keyspace in one epoch: every key the epoch wrote, with
+/// `None` as a tombstone. Commit builds these; reads downcast to them.
+pub(crate) type Resident<K, V> = BTreeMap<K, Option<V>>;
+
+/// Everything one epoch committed, keyed by keyspace id. Each value is a
+/// `Resident<K, V>` for that keyspace's types.
+struct Layer {
+    epoch: u64,
+    trees: HashMap<u64, Box<dyn Any + Send + Sync>>,
+}
+
+/// An immutable view of committed state. Commit builds a new one and swaps
+/// it in; a snapshot holds one for its whole life, so its epoch and its
+/// contents always agree.
+struct Version {
+    epoch: u64,
+    /// Oldest first.
+    layers: Vec<Arc<Layer>>,
+}
+
 struct Wal {
     file: File,
-    dp: DurabilityPolicy,
-    last_write: Option<Instant>,
-    last_fsync: Option<Instant>,
     buffer: Vec<u8>,
     size: usize,
 }
 impl Wal {
-    // todo: park the WAL on its own thread? only matters if we go multi-writer...
     // todo: make this fallible!
-    fn append(&mut self, keyspace: u64, data: &[u8]) {
-        let now = Instant::now();
-        let (should_write, should_fsync) = self.dp.should(now, self.last_write, self.last_fsync);
+    /// Buffer one frame holding a whole transaction, so replay sees either
+    /// all of a tx or none of it:
+    /// `crc32 | epoch u64 | len u64 | payload`, little endian, with the crc
+    /// covering everything after it.
+    fn append(&mut self, epoch: u64, payload: &[u8]) {
+        let epoch = epoch.to_le_bytes();
+        let len = (payload.len() as u64).to_le_bytes();
 
-        self.buffer.extend(&crc32fast::hash(data).to_le_bytes());
-        self.buffer.extend(keyspace.to_le_bytes());
-        self.buffer.extend((data.len() as u64).to_le_bytes());
-        self.buffer.extend(data);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&epoch);
+        hasher.update(&len);
+        hasher.update(payload);
 
-        self.size += 4 + 8 + 8 + data.len();
+        // todo: check if wal + this frame would exceed max wal size
+        self.size += 4 + epoch.len() + len.len() + payload.len();
 
-        // todo: check if we would exceed max wal size
+        self.buffer.extend(hasher.finalize().to_le_bytes());
+        self.buffer.extend(epoch);
+        self.buffer.extend(len);
+        self.buffer.extend(payload);
+    }
 
-        if should_write {
+    fn flush(&mut self, write: bool, sync: bool) {
+        if write && !self.buffer.is_empty() {
             self.file.write_all(&self.buffer).unwrap();
             self.buffer.clear();
-            self.last_write = Some(now);
         }
-        if should_fsync {
+        if sync {
             self.file.sync_data().unwrap();
-            // to accurately reflect the time it actually took to fsync
-            self.last_fsync = Some(Instant::now());
         }
     }
 
     fn size(&self) -> usize {
-        debug_assert_eq!(self.size, self.file.metadata().unwrap().len() as usize);
+        debug_assert_eq!(
+            self.size,
+            self.file.metadata().unwrap().len() as usize + self.buffer.len()
+        );
         self.size
+    }
+}
+impl Drop for Wal {
+    /// A clean shutdown hands buffered frames to the OS. It does not fsync:
+    /// that is the policy's call.
+    fn drop(&mut self) {
+        self.flush(true, false);
+    }
+}
+
+/// State only the writer touches. Held locked for the life of a
+/// [`WriteTx`], which is what makes the store single-writer.
+pub(crate) struct Writer {
+    wal: Option<Wal>,
+    dp: DurabilityPolicy,
+    last_write: Option<Instant>,
+    last_fsync: Option<Instant>,
+}
+impl Writer {
+    /// Log one transaction and write/fsync as the policy says.
+    // todo: windowed policies only flush when the next tx commits; a quiet
+    // store needs a clock source to flush on its own.
+    fn log(&mut self, epoch: u64, payload: &[u8]) {
+        let Some(wal) = self.wal.as_mut() else { return };
+        wal.append(epoch, payload);
+        let now = Instant::now();
+        let (write, sync) = self.dp.should(now, self.last_write, self.last_fsync);
+        wal.flush(write, sync);
+        if write {
+            self.last_write = Some(now);
+        }
+        if sync {
+            // to accurately reflect the time it actually took to fsync
+            self.last_fsync = Some(Instant::now());
+        }
     }
 }
 
 pub struct Snapshot<'s> {
-    epoch: u64,
+    version: Arc<Version>,
     store: &'s Store,
 }
 impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
         let mut map = self.store.active_snapshots.lock().unwrap();
-        match map.get_mut(&self.epoch) {
+        match map.get_mut(&self.version.epoch) {
             Some(n) if *n > 1 => *n -= 1,
             Some(_) => {
-                map.remove(&self.epoch);
+                map.remove(&self.version.epoch);
             }
             None => unreachable!("snapshot epoch missing from map"),
         }
@@ -175,27 +236,61 @@ impl Drop for Snapshot<'_> {
 impl<'s> Snapshot<'s> {
     /// The newest epoch this snapshot can see.
     pub fn epoch(&self) -> u64 {
-        self.epoch
+        self.version.epoch
     }
+
+    pub(crate) fn store(&self) -> &'s Store {
+        self.store
+    }
+
+    /// The newest committed value of `key`: the first layer, newest first,
+    /// that mentions the key decides, and a tombstone there means absent.
     pub(crate) fn get<K: 'static + Ord, M: Merge>(
-        &'s self,
+        &self,
         keyspace: KeyspaceId<K, M>,
         key: &K,
-    ) -> Option<Cow<'s, M::Value>> {
-        self.store.get(self.epoch, keyspace, key)
+    ) -> Option<Cow<'_, M::Value>> {
+        let hit = self
+            .version
+            .layers
+            .iter()
+            .rev()
+            .filter_map(|layer| layer.trees.get(&keyspace.raw()))
+            .map(|tree| {
+                tree.downcast_ref::<Resident<K, M::Value>>()
+                    .expect("keyspace id reused with a different type")
+            })
+            .find_map(|tree| tree.get(key));
+        match hit {
+            Some(slot) => slot.as_ref().map(Cow::Borrowed),
+            // todo: check cached pages, then uncached pages.
+            // there is no disk layer yet, so a resident miss is a miss.
+            None => None,
+        }
     }
 }
 
 pub(crate) struct StoreBuilder {
     durability_policy: DurabilityPolicy,
+    wal_path: PathBuf,
 }
 
 impl StoreBuilder {
     pub(crate) fn new(durability_policy: DurabilityPolicy) -> Self {
-        StoreBuilder { durability_policy }
+        StoreBuilder {
+            durability_policy,
+            wal_path: PathBuf::from("WAL"),
+        }
+    }
+    pub(crate) fn wal_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.wal_path = path.into();
+        self
     }
     pub(crate) fn build(self) -> Result<Store, &'static str> {
-        let StoreBuilder { durability_policy } = self;
+        let StoreBuilder {
+            durability_policy,
+            wal_path,
+        } = self;
 
         durability_policy.validate()?;
         let wal = if let Never = durability_policy.write {
@@ -203,106 +298,238 @@ impl StoreBuilder {
         } else {
             let file = OpenOptions::new()
                 .create(true)
-                .write(true)
                 .append(true)
-                .open("WAL")
+                .open(wal_path)
                 .unwrap();
+            let size = file.metadata().unwrap().len() as usize;
             Some(Wal {
                 file,
-                dp: durability_policy,
-                last_write: None,
-                last_fsync: None,
                 buffer: Vec::new(),
-                size: 0,
+                size,
             })
         };
-
-        let frontier = AtomicU64::default();
-        let snapshots = Mutex::new(BTreeMap::new());
 
         // todo: replay the wal
         // even if we're configured with no wal,
         // we should try to find and replay it!
-        let residents = Default::default();
+        // this goes for any on disk-data;
+        // we can't assume the current settings
+        // were the previous run's settings
+        let version = Version {
+            epoch: 0,
+            layers: Vec::new(),
+        };
 
         Ok(Store {
-            wal,
-            frontier,
-            residents,
-            active_snapshots: snapshots,
+            current: ArcSwap::from_pointee(version),
+            writer: Mutex::new(Writer {
+                wal,
+                dp: durability_policy,
+                last_write: None,
+                last_fsync: None,
+            }),
+            active_snapshots: Mutex::new(BTreeMap::new()),
         })
     }
 }
 
 pub struct Store {
-    wal: Option<Wal>,
-    frontier: AtomicU64,
+    /// The latest committed state. Only `finish` stores into it, and only
+    /// while holding `writer`.
+    current: ArcSwap<Version>,
+    writer: Mutex<Writer>,
+    /// Live snapshot count per epoch; the minimum bounds which layers
+    /// could be folded together.
     active_snapshots: Mutex<BTreeMap<u64, usize>>,
-    // HM(keyspace, BTM(epoch, BTM(key, Option<V>)))
-    residents: HashMap<u64, BTreeMap<u64, Box<dyn Any>>>,
 }
 
 impl Store {
     pub(crate) fn snapshot(&self) -> Snapshot<'_> {
         let mut map = self.active_snapshots.lock().unwrap();
-        let epoch = self.frontier.load(Acquire);
-        *map.entry(epoch).or_default() += 1;
+        let version = self.current.load_full();
+        *map.entry(version.epoch).or_default() += 1;
         drop(map);
-        Snapshot { epoch, store: self }
-    }
-
-    /// Test hook: plant a committed epoch directly in residents.
-    #[cfg(test)]
-    pub(crate) fn insert_resident<K: 'static + Ord, M: Merge>(
-        &mut self,
-        epoch: u64,
-        keyspace: KeyspaceId<K, M>,
-        tree: BTreeMap<K, Option<M::Value>>,
-    ) {
-        self.residents
-            .entry(keyspace.raw())
-            .or_default()
-            .insert(epoch, Box::new(tree));
-    }
-
-    /// Open a write transaction over a snapshot of the latest committed
-    /// state. Single writer: a second open tx would materialize against
-    /// stale values. todo: enforce that with a writer lock.
-    pub(crate) fn begin(&self) -> WriteTx<'_> {
-        WriteTx::new(self.snapshot())
-    }
-    pub(crate) fn finish(&mut self, tx: WriteTx) {
-        let WriteTx { overlay, epoch, .. } = tx;
-        for (keyspace, underlay) in overlay {
-            let ksp = self.residents.entry(keyspace).or_default();
-            // todo: must convert changes into Option here...
-            ksp.insert(epoch, underlay);
+        Snapshot {
+            version,
+            store: self,
         }
     }
 
-    fn get<'v, K: 'static + Ord, M: Merge>(
-        &'v self,
-        epoch: u64,
-        keyspace: KeyspaceId<K, M>,
-        key: &K,
-    ) -> Option<Cow<'v, M::Value>> {
-        if let Some(ksp) = self.residents.get(&keyspace.raw())
-            && let Some(vop) = ksp
-                .range(..=epoch)
-                .rev()
-                .map(|(_, et)| et.downcast_ref::<BTreeMap<K, Option<M::Value>>>().unwrap())
-                .filter_map(|t| t.get(&key))
-                .next()
-        {
-            if let Some(v) = vop {
-                return Some(Cow::Borrowed(v));
-            } else {
-                return None;
+    /// Open a write transaction over the latest committed state. Blocks
+    /// while another write transaction is open. Dropping the tx without
+    /// [`finish`](Self::finish) aborts it.
+    pub(crate) fn begin(&self) -> WriteTx<'_> {
+        // lock first: the snapshot must not be older than the last commit
+        let writer = self.writer.lock().unwrap();
+        WriteTx::new(self.snapshot(), writer)
+    }
+
+    /// Commit `tx`: log it, then publish it to readers. Returns the epoch
+    /// it committed as, or `None` if it changed nothing, in which case no
+    /// epoch is spent and nothing is logged.
+    ///
+    /// The WAL write and fsync happen before readers can see the tx, so
+    /// under a strict policy nothing visible can be lost to a crash.
+    pub(crate) fn finish(&self, tx: WriteTx<'_>) -> Option<u64> {
+        let (epoch, overlay, snapshot, mut writer) = tx.into_parts();
+        debug_assert!(
+            std::ptr::eq(snapshot.store(), self),
+            "tx from another store"
+        );
+
+        // opening a keyspace only to read it leaves an empty handle behind
+        let mut sections: Vec<_> = overlay.into_iter().filter(|(_, u)| !u.is_empty()).collect();
+        if sections.is_empty() {
+            return None;
+        }
+        // deterministic WAL bytes for the same tx
+        sections.sort_unstable_by_key(|(ks, _)| *ks);
+
+        // payload: repeated `keyspace u64 | len u64 | (ordered key, Option<value>)*`
+        let mut payload = writer.wal.is_some().then(Vec::new);
+        let mut trees = HashMap::with_capacity(sections.len());
+        for (ks, underlay) in sections {
+            let tree = match payload.as_mut() {
+                Some(p) => {
+                    p.extend(ks.to_le_bytes());
+                    let len_at = p.len();
+                    p.extend(0u64.to_le_bytes());
+                    let tree = underlay.seal(Some(p));
+                    let len = (p.len() - len_at - 8) as u64;
+                    p[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
+                    tree
+                }
+                None => underlay.seal(None),
+            };
+            trees.insert(ks, tree);
+        }
+
+        if let Some(p) = payload {
+            writer.log(epoch, &p);
+        }
+
+        let current = self.current.load();
+        debug_assert_eq!(current.epoch + 1, epoch, "commit out of order");
+        let mut layers = current.layers.clone();
+        layers.push(Arc::new(Layer { epoch, trees }));
+        self.current.store(Arc::new(Version { epoch, layers }));
+
+        // release the writer only after publishing, so the next tx's
+        // snapshot includes this one
+        drop(writer);
+        drop(snapshot);
+        Some(epoch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Change;
+
+    const KS: KeyspaceId<u8, i64> = KeyspaceId::new(3);
+
+    fn put(store: &Store, kvs: &[(u8, Option<i64>)]) -> Option<u64> {
+        let mut tx = store.begin();
+        let mut ks = tx.keyspace(KS);
+        for &(k, v) in kvs {
+            let change = match v {
+                Some(v) => Change::Insert(v),
+                None => Change::Delete(0),
+            };
+            if let Some(r) = ks.resolve(&k, change) {
+                ks.absorb(k, r);
             }
         }
+        store.finish(tx)
+    }
 
-        // todo: check cached pages, then uncached pages.
-        // there is no disk layer yet, so a resident miss is a miss.
-        None
+    fn read(store: &Store, k: u8) -> Option<i64> {
+        store.snapshot().get(KS, &k).map(|v| *v)
+    }
+
+    #[test]
+    fn commits_are_visible_in_order_and_tombstones_shadow() {
+        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        assert_eq!(put(&store, &[(1, Some(10)), (2, Some(20))]), Some(1));
+        assert_eq!(put(&store, &[(2, None), (3, Some(30))]), Some(2));
+        assert_eq!(put(&store, &[(1, Some(11))]), Some(3));
+
+        assert_eq!(read(&store, 1), Some(11), "newest layer wins");
+        assert_eq!(read(&store, 2), None, "tombstone shadows epoch 1");
+        assert_eq!(read(&store, 3), Some(30));
+        assert_eq!(read(&store, 4), None);
+    }
+
+    #[test]
+    fn snapshots_are_isolated_from_later_commits() {
+        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        put(&store, &[(1, Some(10))]);
+        let before = store.snapshot();
+        put(&store, &[(1, Some(11))]);
+        assert_eq!(before.get(KS, &1).as_deref(), Some(&10));
+        assert_eq!(before.epoch(), 1);
+        assert_eq!(read(&store, 1), Some(11));
+    }
+
+    #[test]
+    fn empty_and_aborted_txs_spend_no_epoch() {
+        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        // read-only: the keyspace is opened but nothing is written
+        let mut tx = store.begin();
+        assert_eq!(tx.keyspace(KS).get(&1), None);
+        assert_eq!(store.finish(tx), None);
+        // aborted: dropped without finish
+        {
+            let mut tx = store.begin();
+            tx.keyspace(KS).absorb(1, Change::Insert(5));
+        }
+        assert_eq!(read(&store, 1), None);
+        assert_eq!(put(&store, &[(1, Some(10))]), Some(1));
+        assert!(store.active_snapshots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wal_gets_one_checksummed_frame_per_tx() {
+        let path = std::env::temp_dir().join(format!("fold3-wal-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = StoreBuilder::new(DurabilityPolicy::STRICT)
+                .wal_path(&path)
+                .build()
+                .unwrap();
+            put(&store, &[(1, Some(10)), (2, Some(20))]);
+            put(&store, &[(2, None)]);
+            // deleting a key that never existed writes nothing: no frame
+            assert_eq!(put(&store, &[(9, None)]), None);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut rest = &bytes[..];
+        let mut frames = Vec::new();
+        while !rest.is_empty() {
+            let crc = u32::from_le_bytes(rest[..4].try_into().unwrap());
+            let epoch = u64::from_le_bytes(rest[4..12].try_into().unwrap());
+            let len = u64::from_le_bytes(rest[12..20].try_into().unwrap()) as usize;
+            assert_eq!(crc, crc32fast::hash(&rest[4..20 + len]));
+            let payload = &rest[20..20 + len];
+            // one keyspace section: id, length, then (u8 key, Option<i64>)*
+            assert_eq!(
+                u64::from_le_bytes(payload[..8].try_into().unwrap()),
+                KS.raw()
+            );
+            let body_len = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            assert_eq!(16 + body_len, len);
+            frames.push((epoch, payload[16..].to_vec()));
+            rest = &rest[20 + len..];
+        }
+        // epoch 1: key 1 -> Some(10), key 2 -> Some(20)
+        let mut one = vec![1u8, 1];
+        one.extend(10i64.to_be_bytes());
+        one.extend([2u8, 1]);
+        one.extend(20i64.to_be_bytes());
+        // epoch 2: key 2 -> None
+        assert_eq!(frames, [(1, one), (2, vec![2u8, 0])]);
     }
 }

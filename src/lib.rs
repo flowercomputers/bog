@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, btree_map::Entry};
 use std::convert::Infallible;
 use std::{any::Any, borrow::Cow, marker::PhantomData};
 
+use crate::codec::{Codec, OrderedCodec};
 use crate::tx::{KeyspaceId, WriteTx};
 pub mod graph;
 pub mod merge;
 use crate::merge::*;
+mod codec;
 mod store;
 mod tx;
 
@@ -270,8 +272,8 @@ impl<K: Ord, V: Merge> Sum<K, V> {
 
 impl<K, V> Nary for Sum<K, V>
 where
-    K: Ord + Clone + Send + 'static,
-    V: Ord + Merge<Diff = V, Value = V> + Clone + PartialEq + Send,
+    K: OrderedCodec + Clone + Send + Sync + 'static,
+    V: Ord + Merge<Diff = V, Value = V> + Codec + Clone + PartialEq + Send + Sync,
 {
     type Takes = Bag<(K, V)>;
     type Gives = Register<K, (i64, V)>;

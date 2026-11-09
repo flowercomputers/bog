@@ -1,6 +1,17 @@
-use std::{any::Any, borrow::Cow, collections::HashMap, marker::PhantomData};
+use std::{
+    any::Any,
+    borrow::Cow,
+    collections::HashMap,
+    marker::PhantomData,
+    sync::MutexGuard,
+};
 
-use crate::{Change, Register, merge::Merge, store::Snapshot};
+use crate::{
+    Change, Register,
+    codec::{Codec, OrderedCodec},
+    merge::Merge,
+    store::{Resident, Snapshot, Writer},
+};
 
 /// Typed, copyable name of a keyspace. The key and merge types travel
 /// with the id, so opening it as the wrong type is a compile error and
@@ -28,8 +39,11 @@ pub trait ErasedUnderlay: Any {
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
 
     fn absorb_erased(&mut self, other: Box<dyn ErasedUnderlay>);
-    // fn flush_into(&mut self, out: &mut Vec<WalOp>);
     fn is_empty(&self) -> bool;
+    /// Turn this tx's changes into the committed form, a
+    /// [`Resident`] of new values and tombstones, encoding each entry
+    /// into `wal` on the way when there is one.
+    fn seal(self: Box<Self>, wal: Option<&mut Vec<u8>>) -> Box<dyn Any + Send + Sync>;
 }
 
 /// A write transaction: this tx's materialized changes layered over a
@@ -37,21 +51,42 @@ pub trait ErasedUnderlay: Any {
 /// the snapshot, so the tx reads its own writes. Open one with
 /// [`Store::begin`](crate::store::Store::begin); the snapshot must be the
 /// latest committed state or `Replace(old, new)` would carry a stale `old`.
+///
+/// The tx holds the store's writer lock until it is finished or dropped.
+/// Dropping it without [`Store::finish`](crate::store::Store::finish)
+/// aborts: the overlay is discarded and nothing is logged.
 pub struct WriteTx<'tx> {
     /// The epoch this tx will commit as: one past the snapshot's.
-    pub(crate) epoch: u64,
-    pub(crate) overlay: HashMap<u64, Box<dyn ErasedUnderlay>>,
+    epoch: u64,
+    overlay: HashMap<u64, Box<dyn ErasedUnderlay>>,
     snapshot: Snapshot<'tx>,
-    // todo: Store::commit(&self, tx) flushes the overlay into residents & the wal
+    writer: MutexGuard<'tx, Writer>,
 }
 
 impl<'tx> WriteTx<'tx> {
-    pub(crate) fn new(snapshot: Snapshot<'tx>) -> Self {
+    pub(crate) fn new(snapshot: Snapshot<'tx>, writer: MutexGuard<'tx, Writer>) -> Self {
         WriteTx {
             epoch: snapshot.epoch() + 1,
             overlay: HashMap::new(),
             snapshot,
+            writer,
         }
+    }
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        u64,
+        HashMap<u64, Box<dyn ErasedUnderlay>>,
+        Snapshot<'tx>,
+        MutexGuard<'tx, Writer>,
+    ) {
+        let WriteTx {
+            epoch,
+            overlay,
+            snapshot,
+            writer,
+        } = self;
+        (epoch, overlay, snapshot, writer)
     }
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -81,7 +116,12 @@ impl<K: Ord, M: Merge> Default for KeyspaceHandle<K, M> {
     }
 }
 
-impl<K: Ord + 'static, M: Merge> ErasedUnderlay for KeyspaceHandle<K, M> {
+impl<K, M> ErasedUnderlay for KeyspaceHandle<K, M>
+where
+    K: OrderedCodec + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Codec + Sync,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -102,6 +142,27 @@ impl<K: Ord + 'static, M: Merge> ErasedUnderlay for KeyspaceHandle<K, M> {
     }
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+    fn seal(self: Box<Self>, mut wal: Option<&mut Vec<u8>>) -> Box<dyn Any + Send + Sync> {
+        // the register is sorted, so collect bulk-builds the tree
+        let tree: Resident<K, M::Value> = self
+            .inner
+            .into_iter()
+            .map(|(k, change)| {
+                let v = match change {
+                    Change::Insert(v) | Change::Replace(_, v) => Some(v),
+                    // a surviving Delete means the key exists below this tx
+                    Change::Delete(_) => None,
+                    Change::Modify(_) => unreachable!("resolve before absorbing"),
+                };
+                if let Some(out) = wal.as_deref_mut() {
+                    k.encode_ordered(out);
+                    v.encode(out);
+                }
+                (k, v)
+            })
+            .collect();
+        Box::new(tree)
     }
 }
 
@@ -202,10 +263,12 @@ impl<'tx> WriteTx<'tx> {
     /// This transaction's view of `id`, opened on first use. The overlay
     /// and the snapshot are separate fields, so the view can hold the
     /// overlay mutably and the snapshot immutably at once.
-    pub fn keyspace<K: 'static + Ord, M: Merge>(
-        &mut self,
-        id: KeyspaceId<K, M>,
-    ) -> Keyspace<'_, 'tx, K, M> {
+    pub fn keyspace<K, M>(&mut self, id: KeyspaceId<K, M>) -> Keyspace<'_, 'tx, K, M>
+    where
+        K: OrderedCodec + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Sync,
+    {
         let handle: &mut KeyspaceHandle<K, M> = self
             .overlay
             .entry(id.raw())
@@ -221,28 +284,29 @@ impl<'tx> WriteTx<'tx> {
     }
 }
 
-// todo: drop for writetx
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{DurabilityPolicy, StoreBuilder};
-    use std::collections::BTreeMap;
 
     const KS: KeyspaceId<u8, i64> = KeyspaceId::new(1);
 
     #[test]
     fn reads_fall_through_to_snapshot_and_overlay_shadows() {
-        let mut store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
-        let mut tree = BTreeMap::new();
-        tree.insert(1u8, Some(10i64));
-        tree.insert(2u8, None);
-        store.insert_resident(0, KS, tree);
+        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let mut tx = store.begin();
+        let mut ks = tx.keyspace(KS);
+        ks.absorb(1, Change::Insert(10));
+        ks.absorb(2, Change::Insert(20));
+        store.finish(tx).unwrap();
+        let mut tx = store.begin();
+        tx.keyspace(KS).absorb(2, Change::Delete(20));
+        store.finish(tx).unwrap();
 
         let mut tx = store.begin();
         let mut ks = tx.keyspace(KS);
         assert_eq!(ks.get(&1).as_deref(), Some(&10));
-        assert_eq!(ks.get(&2).as_deref(), None, "resident tombstone");
+        assert_eq!(ks.get(&2).as_deref(), None, "committed tombstone");
         assert_eq!(ks.get(&3).as_deref(), None, "never written");
 
         // a Modify resolves against the snapshot value

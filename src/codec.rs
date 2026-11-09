@@ -4,7 +4,6 @@ use std::fmt;
 
 pub use bytes::BufMut;
 
-use crate::Change;
 
 // TODO: derive Codec, OrderedCodec needed
 
@@ -175,37 +174,6 @@ impl<T: OrderedCodec> OrderedCodec for Option<T> {
         1 + match self {
             None => 0,
             Some(inner) => inner.encode_ordered_size(),
-        }
-    }
-}
-
-impl<M: Merge> Codec for Change<M> {
-    fn encode(&self, out: &mut impl BufMut) {
-        match self {
-            Change::Delete => out.put_u8(0),
-            Change::Put(s) => {
-                out.put_u8(1);
-                s.encode(out);
-            }
-            Change::Merge(d) => {
-                out.put_u8(2);
-                d.encode(out);
-            }
-        }
-    }
-    fn decode(b: &mut &[u8]) -> Result<Self> {
-        match take_u8(b)? {
-            0 => Ok(Change::Delete),
-            1 => Ok(Change::Put(M::State::decode(b)?)),
-            2 => Ok(Change::Merge(M::Diff::decode(b)?)),
-            tag => Err(DecodeError::InvalidTag { what: "op", tag }),
-        }
-    }
-    fn encode_size(&self) -> usize {
-        1 + match self {
-            Change::Delete => 0,
-            Change::Put(inner) => inner.encode_size(),
-            Change::Merge(inner) => inner.encode_size(),
         }
     }
 }
