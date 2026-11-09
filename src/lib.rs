@@ -10,6 +10,7 @@ use crate::merge::*;
 mod codec;
 mod manifest;
 mod store;
+mod table;
 mod tx;
 
 pub trait Buffer: Any + Send {

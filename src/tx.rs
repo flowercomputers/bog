@@ -1,16 +1,10 @@
-use std::{
-    any::Any,
-    borrow::Cow,
-    collections::HashMap,
-    marker::PhantomData,
-    sync::MutexGuard,
-};
+use std::{any::Any, borrow::Cow, collections::HashMap, marker::PhantomData, sync::MutexGuard};
 
 use crate::{
     Change, Register,
     codec::{Codec, OrderedCodec},
     merge::Merge,
-    store::{Resident, Snapshot, Writer},
+    store::{Resident, Snapshot, StoreWriter},
 };
 
 /// Typed, copyable name of a keyspace. The key and merge types travel
@@ -60,11 +54,11 @@ pub struct WriteTx<'tx> {
     epoch: u64,
     overlay: HashMap<u64, Box<dyn ErasedUnderlay>>,
     snapshot: Snapshot<'tx>,
-    writer: MutexGuard<'tx, Writer>,
+    writer: MutexGuard<'tx, StoreWriter>,
 }
 
 impl<'tx> WriteTx<'tx> {
-    pub(crate) fn new(snapshot: Snapshot<'tx>, writer: MutexGuard<'tx, Writer>) -> Self {
+    pub(crate) fn new(snapshot: Snapshot<'tx>, writer: MutexGuard<'tx, StoreWriter>) -> Self {
         WriteTx {
             epoch: snapshot.epoch() + 1,
             overlay: HashMap::new(),
@@ -78,7 +72,7 @@ impl<'tx> WriteTx<'tx> {
         u64,
         HashMap<u64, Box<dyn ErasedUnderlay>>,
         Snapshot<'tx>,
-        MutexGuard<'tx, Writer>,
+        MutexGuard<'tx, StoreWriter>,
     ) {
         let WriteTx {
             epoch,
@@ -173,7 +167,12 @@ impl<K: Ord + 'static, M: Merge> KeyspaceHandle<K, M> {
     }
 }
 
-impl<'a, 'tx, K: Ord + 'static, M: Merge> Keyspace<'a, 'tx, K, M> {
+impl<'a, 'tx, K, M> Keyspace<'a, 'tx, K, M>
+where
+    K: OrderedCodec + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Codec + Sync,
+{
     #[cfg(test)]
     pub(crate) fn inner_is_empty(&self) -> bool {
         self.writes.is_empty()

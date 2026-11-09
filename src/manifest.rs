@@ -14,8 +14,9 @@
 //! policy	write=always	fsync=every:1000000000ns
 //! next-file	3
 //! keyspace	7	u8	(i64, i64)
-//! wal	1	sealed	1234
-//! wal	2	active
+//! checkpoint	1	40
+//! wal	2	sealed	1234
+//! wal	4	active
 //! ```
 
 use std::{
@@ -29,7 +30,7 @@ use std::{
 use crate::store::{DurabilityPolicy, DurabilityPolicyCadence};
 
 pub(crate) const MANIFEST: &str = "MANIFEST";
-const MANIFEST_TMP: &str = "MANIFEST.tmp";
+pub(crate) const MANIFEST_TMP: &str = "MANIFEST.tmp";
 const HEADER: &str = "fold3 manifest v1";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,8 +42,26 @@ pub(crate) struct Manifest {
     pub next_file: u64,
     /// Keyspace id to (key type, merge type), as `std::any::type_name`.
     pub keyspaces: BTreeMap<u64, (String, String)>,
-    /// WAL segments in replay order. Only the last may be active.
+    /// Checkpoints oldest first. Each holds what changed after the previous
+    /// one, through its own epoch; loading them in order rebuilds the state
+    /// as of the last one.
+    pub checkpoints: Vec<Checkpoint>,
+    /// WAL segments in replay order, holding only epochs after the last
+    /// checkpoint. Only the last may be active.
     pub segments: Vec<Segment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Checkpoint {
+    pub number: u64,
+    /// The newest epoch it covers.
+    pub epoch: u64,
+}
+
+impl Checkpoint {
+    pub fn file_name(&self) -> String {
+        format!("{:06}.ckpt", self.number)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,8 +85,20 @@ impl Manifest {
             policy,
             next_file: 1,
             keyspaces: BTreeMap::new(),
+            checkpoints: Vec::new(),
             segments: Vec::new(),
         }
+    }
+
+    /// The newest epoch covered by a checkpoint, 0 if there are none.
+    pub fn checkpointed(&self) -> u64 {
+        self.checkpoints.last().map_or(0, |c| c.epoch)
+    }
+
+    /// Every file the manifest keeps alive.
+    pub fn live_files(&self) -> impl Iterator<Item = String> + '_ {
+        let ckpts = self.checkpoints.iter().map(Checkpoint::file_name);
+        ckpts.chain(self.segments.iter().map(Segment::file_name))
     }
 
     /// The active segment, if the last one is still open for appends.
@@ -87,6 +118,9 @@ impl Manifest {
         s.push_str(&format!("next-file\t{}\n", self.next_file));
         for (id, (key, merge)) in &self.keyspaces {
             s.push_str(&format!("keyspace\t{id}\t{key}\t{merge}\n"));
+        }
+        for c in &self.checkpoints {
+            s.push_str(&format!("checkpoint\t{}\t{}\n", c.number, c.epoch));
         }
         for seg in &self.segments {
             match seg.sealed {
@@ -108,6 +142,7 @@ impl Manifest {
         let mut policy = None;
         let mut next_file = None;
         let mut keyspaces = BTreeMap::new();
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
         let mut segments: Vec<Segment> = Vec::new();
 
         for (n, line) in lines {
@@ -115,8 +150,12 @@ impl Manifest {
             let fields: Vec<&str> = line.split('\t').collect();
             match fields.as_slice() {
                 ["policy", write, fsync] => {
-                    let write = write.strip_prefix("write=").ok_or_else(|| at("bad write".into()))?;
-                    let fsync = fsync.strip_prefix("fsync=").ok_or_else(|| at("bad fsync".into()))?;
+                    let write = write
+                        .strip_prefix("write=")
+                        .ok_or_else(|| at("bad write".into()))?;
+                    let fsync = fsync
+                        .strip_prefix("fsync=")
+                        .ok_or_else(|| at("bad fsync".into()))?;
                     let parsed = DurabilityPolicy {
                         write: parse_cadence(write).map_err(at)?,
                         fsync: parse_cadence(fsync).map_err(at)?,
@@ -138,6 +177,18 @@ impl Manifest {
                     {
                         return Err(at(format!("duplicate keyspace {id}")));
                     }
+                }
+                ["checkpoint", num, epoch] => {
+                    let c = Checkpoint {
+                        number: parse_u64(num).map_err(at)?,
+                        epoch: parse_u64(epoch).map_err(at)?,
+                    };
+                    if let Some(prev) = checkpoints.last()
+                        && (prev.number >= c.number || prev.epoch >= c.epoch)
+                    {
+                        return Err(at("checkpoints out of order".into()));
+                    }
+                    checkpoints.push(c);
                 }
                 ["wal", num, rest @ ..] => {
                     let number = parse_u64(num).map_err(at)?;
@@ -164,14 +215,14 @@ impl Manifest {
             policy: policy.ok_or("manifest has no policy")?,
             next_file: next_file.ok_or("manifest has no next-file")?,
             keyspaces,
+            checkpoints,
             segments,
         };
-        if manifest
-            .segments
-            .last()
-            .is_some_and(|s| s.number >= manifest.next_file)
+        let newest = |n: Option<u64>| n.is_some_and(|n| n >= manifest.next_file);
+        if newest(manifest.segments.last().map(|s| s.number))
+            || newest(manifest.checkpoints.last().map(|c| c.number))
         {
-            return Err("wal segment numbered at or past next-file".into());
+            return Err("file numbered at or past next-file".into());
         }
         Ok(manifest)
     }
@@ -239,8 +290,18 @@ mod tests {
         let mut m = Manifest::new(DurabilityPolicy::periodic_sync(Duration::from_millis(1500)));
         m.next_file = 3;
         m.keyspaces.insert(7, ("u8".into(), "(i64, i64)".into()));
-        m.segments.push(Segment { number: 1, sealed: Some(1234) });
-        m.segments.push(Segment { number: 2, sealed: None });
+        m.checkpoints.push(Checkpoint {
+            number: 0,
+            epoch: 9,
+        });
+        m.segments.push(Segment {
+            number: 1,
+            sealed: Some(1234),
+        });
+        m.segments.push(Segment {
+            number: 2,
+            sealed: None,
+        });
         assert_eq!(Manifest::parse(&m.encode()), Ok(m));
     }
 
@@ -253,5 +314,7 @@ mod tests {
         assert!(Manifest::parse(&format!("{ok}wal\t2\tsealed\t0\nwal\t1\tactive\n")).is_err());
         assert!(Manifest::parse(&format!("{ok}wal\t3\tactive\n")).is_err());
         assert!(Manifest::parse(&format!("{ok}bogus\n")).is_err());
+        assert!(Manifest::parse(&format!("{ok}checkpoint\t1\t5\ncheckpoint\t2\t5\n")).is_err());
+        assert!(Manifest::parse(&format!("{ok}checkpoint\t3\t5\n")).is_err());
     }
 }
