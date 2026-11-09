@@ -51,6 +51,10 @@ pub enum Error {
     /// An earlier failure left what is on disk uncertain, so the store
     /// refuses writes until it is reopened, which recovers from disk.
     Poisoned(Arc<Error>),
+    /// Derived state was computed by a different graph, or a derived
+    /// keyspace was added or dropped, and must be rebuilt, but the store
+    /// was opened without a replay to rebuild it with.
+    RebuildRequired,
     /// The transaction committed as `epoch`, but maintenance that ran
     /// after it failed. The commit stands; the next commit retries.
     AfterCommit { epoch: u64, source: Arc<Error> },
@@ -97,6 +101,10 @@ impl fmt::Display for Error {
             }
             Self::OutOfMemory(oom) => oom.fmt(f),
             Self::Rejected(why) => write!(f, "transaction rejected: {why}"),
+            Self::RebuildRequired => write!(
+                f,
+                "derived state must be rebuilt for a changed graph; open with a replay"
+            ),
             Self::Poisoned(cause) => write!(f, "store refuses writes until reopened: {cause}"),
             Self::AfterCommit { epoch, source } => {
                 write!(

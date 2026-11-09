@@ -20,6 +20,7 @@ use crate::{
     codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
     cursor::{Cursor, Source},
     error::{Error, IoContext, Result},
+    graph::Fingerprint,
     manifest::{self, Checkpoint, InstallError, MANIFEST_TMP, Manifest, Segment},
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
@@ -230,14 +231,34 @@ impl Default for DurabilityPolicy {
 /// `None` as a tombstone. Commit builds these; reads downcast to them.
 pub(crate) type Resident<K, V> = BTreeMap<K, Option<V>>;
 
-/// Everything one epoch committed, keyed by keyspace id. Each value is a
-/// `Resident<K, V>` for that keyspace's types.
+/// A type-erased `Resident<K, V>`. Shared, so folding layers reuses the
+/// trees of keyspaces only one side touched.
+type Tree = Arc<dyn Any + Send + Sync>;
+
+/// One keyspace's tree in a layer, with its estimated resident bytes.
+#[derive(Clone)]
+struct LayerTree {
+    tree: Tree,
+    bytes: usize,
+}
+
+/// What one or more consecutive epochs committed, keyed by keyspace id:
+/// the newest value of every key they wrote. Commits push a layer per
+/// epoch, and [`fold_layers`](Store::fold_layers) merges neighbors so
+/// there are only logarithmically many.
 struct Layer {
+    /// The newest epoch it holds.
     epoch: u64,
-    trees: HashMap<u64, Box<dyn Any + Send + Sync>>,
+    trees: HashMap<u64, LayerTree>,
     /// Estimated resident bytes of `trees`.
     bytes: usize,
 }
+
+/// Fold layers while the older of the last two is no more than this many
+/// times the newer's size. Layer sizes then grow geometrically from newest
+/// to oldest, so there are O(log n) of them, and each entry is copied
+/// O(log n) times over its life in memory.
+const FOLD_RATIO: usize = 2;
 
 /// An immutable view of committed state. Commit builds a new one and swaps
 /// it in; a snapshot holds one for its whole life, so its epoch and its
@@ -253,6 +274,20 @@ struct Version {
     tables: Vec<Arc<Table>>,
     /// Estimated resident bytes of `layers`.
     resident_bytes: usize,
+    /// Keyspace id to the epoch it was truncated at; tables no newer than
+    /// that hold nothing visible for it. Mirrors the manifest's floors.
+    floors: Arc<BTreeMap<u64, u64>>,
+}
+
+impl Version {
+    /// The tables that can hold visible data for `ks`, newest first.
+    fn tables_for(&self, ks: u64) -> impl Iterator<Item = &Arc<Table>> {
+        let floor = self.floors.get(&ks).copied().unwrap_or(0);
+        self.tables
+            .iter()
+            .rev()
+            .take_while(move |t| t.epoch() > floor)
+    }
 }
 
 struct Wal {
@@ -401,6 +436,18 @@ impl StoreWriter {
         Ok(())
     }
 
+    /// Make `next` the manifest: installed on disk, or just kept for an
+    /// in-memory store.
+    fn update_manifest(&mut self, next: Manifest) -> Result<()> {
+        match self.dir.clone() {
+            Some(dir) => self.install_manifest(&dir, next),
+            None => {
+                self.manifest = next;
+                Ok(())
+            }
+        }
+    }
+
     /// Log one transaction, its payload written by `payload` (given `None`
     /// when there is no WAL), then write/fsync as the policy says. Returns
     /// the bytes appended to the WAL.
@@ -479,21 +526,23 @@ impl<'s> Snapshot<'s> {
             .iter()
             .rev()
             .filter_map(|layer| layer.trees.get(&ks))
-            .map(|tree| {
-                tree.downcast_ref::<Resident<K, M::Value>>()
+            .map(|t| {
+                t.tree
+                    .downcast_ref::<Resident<K, M::Value>>()
                     .expect("keyspace id reused with a different type")
             })
             .find_map(|tree| tree.get(key));
         if let Some(slot) = hit {
             return Ok(slot.as_ref().map(Cow::Borrowed));
         }
-        if self.version.tables.is_empty() {
+        let mut tables = self.version.tables_for(ks).peekable();
+        if tables.peek().is_none() {
             return Ok(None);
         }
 
         let mut probe = Vec::with_capacity(key.encode_ordered_size());
         key.encode_ordered(&mut probe);
-        for table in self.version.tables.iter().rev() {
+        for table in tables {
             if let Some((block, range)) = table.get(ks, &probe, &self.store.cache)? {
                 let value = decode_all::<Option<M::Value>>(&block[range])
                     .map_err(|e| Error::corrupt(table.path(), 0, format!("keyspace {ks}: {e}")))?;
@@ -544,14 +593,15 @@ impl<'s> Snapshot<'s> {
             sources.push(Source::overlay(overlay, lower));
         }
         for layer in self.version.layers.iter().rev() {
-            if let Some(tree) = layer.trees.get(&ks) {
-                let tree = tree
+            if let Some(t) = layer.trees.get(&ks) {
+                let tree = t
+                    .tree
                     .downcast_ref::<Resident<K, M::Value>>()
                     .expect("keyspace id reused with a different type");
                 sources.push(Source::layer(tree, lower));
             }
         }
-        for table in self.version.tables.iter().rev() {
+        for table in self.version.tables_for(ks) {
             sources.push(Source::table(table.cursor(ks, Some(&self.store.cache)), ks));
         }
         Cursor::new(sources, lower, upper, tx)
@@ -564,6 +614,9 @@ impl<'s> Snapshot<'s> {
 struct KeyspaceDecl {
     key: &'static str,
     merge: &'static str,
+    /// Whether a graph computes it from other keyspaces, so it can be
+    /// truncated and recomputed when the graph changes.
+    derived: bool,
     /// Decode one WAL section and apply it over the keyspace's replayed
     /// tree, creating the tree on first use.
     replay: fn(&mut Option<Box<dyn Any + Send + Sync>>, &[u8]) -> Result<(), DecodeError>,
@@ -573,6 +626,55 @@ struct KeyspaceDecl {
         fn(&[&(dyn Any + Send + Sync)], &mut dyn FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()>,
     /// Estimated resident bytes of one of this keyspace's trees.
     measure: fn(&(dyn Any + Send + Sync)) -> usize,
+    /// Fold a newer tree over an older one; see [`fold_trees`].
+    fold: fn(Option<&LayerTree>, Option<&LayerTree>, bool) -> LayerTree,
+}
+
+/// One tree holding `older` overwritten by `newer`, either of which may
+/// be missing. With `drop_tombstones`, nothing lies beneath, so deletes
+/// are applied rather than kept.
+fn fold_trees<K, V>(
+    older: Option<&LayerTree>,
+    newer: Option<&LayerTree>,
+    drop_tombstones: bool,
+) -> LayerTree
+where
+    K: Ord + Clone + ResidentSize + Send + Sync + 'static,
+    V: Clone + ResidentSize + Send + Sync + 'static,
+{
+    fn cast<K: 'static, V: 'static>(t: &LayerTree) -> &Resident<K, V> {
+        t.tree
+            .downcast_ref::<Resident<K, V>>()
+            .expect("layer tree has the registered type")
+    }
+    let (mut tree, mut bytes) = match older {
+        Some(t) => (cast::<K, V>(t).clone(), t.bytes),
+        None => (Resident::new(), 0),
+    };
+    if drop_tombstones {
+        tree.retain(|k, v| {
+            if v.is_none() {
+                bytes -= resident_entry_bytes(k, v);
+            }
+            v.is_some()
+        });
+    }
+    for (k, v) in newer.map(cast::<K, V>).into_iter().flatten() {
+        if drop_tombstones && v.is_none() {
+            if let Some(old) = tree.remove(k) {
+                bytes -= resident_entry_bytes(k, &old);
+            }
+            continue;
+        }
+        bytes += resident_entry_bytes(k, v);
+        if let Some(old) = tree.insert(k.clone(), v.clone()) {
+            bytes -= resident_entry_bytes(k, &old);
+        }
+    }
+    LayerTree {
+        tree: Arc::new(tree),
+        bytes,
+    }
 }
 
 fn measure_tree<K, V>(tree: &(dyn Any + Send + Sync)) -> usize
@@ -645,6 +747,7 @@ pub(crate) struct StoreBuilder {
     dir: Option<PathBuf>,
     keyspaces: HashMap<u64, KeyspaceDecl>,
     opts: StoreOptions,
+    graph: u64,
 }
 
 impl StoreBuilder {
@@ -656,6 +759,7 @@ impl StoreBuilder {
             dir: None,
             keyspaces: HashMap::new(),
             opts: StoreOptions::default(),
+            graph: 0,
         }
     }
 
@@ -709,26 +813,62 @@ impl StoreBuilder {
         self
     }
 
-    /// Declare a keyspace. Every keyspace a transaction opens must be
-    /// declared, and every keyspace in the WAL must be declared with the
-    /// types it was written with.
-    pub(crate) fn keyspace<K, M>(mut self, id: KeyspaceId<K, M>) -> Self
+    /// Declare a base keyspace, one the application writes. Every keyspace
+    /// a transaction opens must be declared, and every keyspace in the WAL
+    /// must be declared with the types it was written with.
+    pub(crate) fn keyspace<K, M>(self, id: KeyspaceId<K, M>) -> Self
     where
-        K: OrderedCodec + Send + Sync + 'static,
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Sync,
+    {
+        self.declare(id, false)
+    }
+
+    /// Declare a derived keyspace, one the graph computes from base
+    /// keyspaces. When the store opens under a different
+    /// [`graph`](Self::graph) fingerprint, or with different derived
+    /// keyspaces, than it last recorded, every derived keyspace is
+    /// truncated and rebuilt; see [`build_with`](Self::build_with).
+    ///
+    /// A derived keyspace that is no longer declared is dropped, where an
+    /// undeclared base keyspace is an error.
+    pub(crate) fn derived<K, M>(self, id: KeyspaceId<K, M>) -> Self
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Sync,
+    {
+        self.declare(id, true)
+    }
+
+    /// The fingerprint of the graph that computes the derived keyspaces,
+    /// typically [`OpDag::fingerprint`](crate::graph::OpDag::fingerprint)
+    /// mixed with a schema version.
+    pub(crate) fn graph(mut self, fingerprint: u64) -> Self {
+        self.graph = fingerprint;
+        self
+    }
+
+    fn declare<K, M>(mut self, id: KeyspaceId<K, M>, derived: bool) -> Self
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
         M: Merge,
         M::Value: Codec + Sync,
     {
         let decl = KeyspaceDecl {
             key: type_name::<K>(),
             merge: type_name::<M>(),
+            derived,
             replay: replay_section::<K, M::Value>,
             write_run: write_run::<K, M::Value>,
             measure: measure_tree::<K, M::Value>,
+            fold: fold_trees::<K, M::Value>,
         };
         if let Some(prev) = self.keyspaces.get(&id.raw()) {
             assert!(
-                (prev.key, prev.merge) == (decl.key, decl.merge),
-                "keyspace {} declared twice with different types",
+                (prev.key, prev.merge, prev.derived) == (decl.key, decl.merge, decl.derived),
+                "keyspace {} declared twice differently",
                 id.raw()
             );
         }
@@ -736,21 +876,65 @@ impl StoreBuilder {
         self
     }
 
+    /// Open the store. Fails with [`Error::RebuildRequired`] if derived
+    /// state must be rebuilt; use [`build_with`](Self::build_with) then.
     pub(crate) fn build(self) -> Result<Store> {
+        self.open(None)
+    }
+
+    /// Open the store, rebuilding derived state with `replay` if the graph
+    /// fingerprint or the set of derived keyspaces changed since the last
+    /// open recorded them.
+    ///
+    /// A rebuild truncates every derived keyspace, then commits write
+    /// transactions until `replay` returns `false`. Each call gets a fresh
+    /// tx and should feed the graph a chunk of the base keyspaces, read
+    /// through the tx, as inserts, and run it; chunking keeps each tx
+    /// within the tx memory limit. Chunks commit as they go, but the store
+    /// is not handed out until the last, so nobody sees a partial rebuild.
+    /// Constraints that depend on the order rows arrive in must be met by
+    /// the order `replay` feeds them, or by feeding everything at once.
+    ///
+    /// If `replay` or a commit fails, open fails, and the next open starts
+    /// the rebuild over.
+    pub(crate) fn build_with(
+        self,
+        mut replay: impl FnMut(&mut WriteTx<'_>) -> Result<bool>,
+    ) -> Result<Store> {
+        self.open(Some(&mut replay))
+    }
+
+    fn open(self, rebuild: Option<&mut Replay<'_>>) -> Result<Store> {
         let StoreBuilder {
             durability_policy: dp,
             dir,
             keyspaces,
             opts,
+            graph,
         } = self;
         dp.validate().map_err(Error::Policy)?;
         opts.validate()?;
+
+        // the fingerprint covers which keyspaces are derived, and as what
+        let mut fp = Fingerprint::new();
+        fp.write_u64(graph);
+        let mut derived: Vec<(&u64, &KeyspaceDecl)> =
+            keyspaces.iter().filter(|(_, d)| d.derived).collect();
+        derived.sort_unstable_by_key(|(id, _)| **id);
+        for (id, d) in derived {
+            fp.write_u64(*id);
+            fp.write_str(d.key);
+            fp.write_str(d.merge);
+        }
+        let fp = fp.finish();
 
         let Some(dir) = dir else {
             if !matches!(dp.write, Never) {
                 return Err(Error::Policy("writing a WAL needs a directory"));
             }
-            let writer = StoreWriter::new(None, Manifest::new(dp), None, dp);
+            let mut m = Manifest::new(dp);
+            m.graph = Some(fp);
+            let writer = StoreWriter::new(None, m, None, dp);
             return Ok(Store::new(
                 Replayed::default(),
                 Vec::new(),
@@ -793,9 +977,17 @@ impl StoreBuilder {
                 });
             }
         }
+        // derived keyspaces nobody declares any more; their data is ignored
+        // until the rebuild truncates them
+        let dropped: BTreeSet<u64> = m
+            .derived
+            .iter()
+            .copied()
+            .filter(|id| !keyspaces.contains_key(id))
+            .collect();
         sweep_orphans(&dir, &m)?;
-        let tables = open_tables(&dir, &m, &keyspaces)?;
-        let replayed = replay(&dir, &m, &keyspaces)?;
+        let tables = open_tables(&dir, &m, &keyspaces, &dropped)?;
+        let replayed = replay(&dir, &m, &keyspaces, &dropped)?;
 
         // appending after a torn tail would hide every later frame from
         // replay, so seal the segment at its last good frame instead
@@ -838,9 +1030,19 @@ impl StoreBuilder {
 
         m.policy = dp;
         m.options = opts.named();
-        m.keyspaces = keyspaces
+        // dropped keyspaces stay listed until truncated, so a crash before
+        // then still knows to ignore them
+        m.keyspaces.retain(|id, _| dropped.contains(id));
+        m.keyspaces.extend(
+            keyspaces
+                .iter()
+                .map(|(id, d)| (*id, (d.key.to_string(), d.merge.to_string()))),
+        );
+        m.derived = keyspaces
             .iter()
-            .map(|(id, d)| (*id, (d.key.to_string(), d.merge.to_string())))
+            .filter(|(_, d)| d.derived)
+            .map(|(id, _)| *id)
+            .chain(dropped.iter().copied())
             .collect();
         manifest::stage(&dir, &m).ctx("writing manifest in", &dir)?;
         manifest::install(&dir).map_err(|e| match e {
@@ -867,9 +1069,14 @@ impl StoreBuilder {
             }
         }
         store.compact_while_over()?;
+        store.reconcile_graph(fp, &dropped, rebuild)?;
         Ok(store)
     }
 }
+
+/// Feeds one chunk of base state to the graph; see
+/// [`StoreBuilder::build_with`].
+type Replay<'r> = dyn FnMut(&mut WriteTx<'_>) -> Result<bool> + 'r;
 
 /// Create the next WAL segment and list it in `m` as active. The file is
 /// created before the manifest names it; the manifest write syncs the
@@ -947,6 +1154,7 @@ fn open_tables(
     dir: &Path,
     m: &Manifest,
     decls: &HashMap<u64, KeyspaceDecl>,
+    dropped: &BTreeSet<u64>,
 ) -> Result<Vec<Arc<Table>>> {
     let mut tables = Vec::with_capacity(m.checkpoints.len());
     for ckpt in &m.checkpoints {
@@ -963,7 +1171,10 @@ fn open_tables(
                 ),
             ));
         }
-        if let Some(ks) = table.keyspaces().find(|ks| !decls.contains_key(ks)) {
+        let unknown = |ks: &u64| {
+            !decls.contains_key(ks) && !dropped.contains(ks) && m.floor(*ks) < table.epoch()
+        };
+        if let Some(ks) = table.keyspaces().find(unknown) {
             return Err(Error::UnknownKeyspace(ks));
         }
         tables.push(Arc::new(table));
@@ -975,7 +1186,12 @@ fn open_tables(
 /// keyspace. Nothing can hold a snapshot during open, so one layer is
 /// equivalent to a layer per epoch, and reads stay cheap. The WAL holds
 /// only epochs after the last checkpoint, so replay starts there.
-fn replay(dir: &Path, m: &Manifest, decls: &HashMap<u64, KeyspaceDecl>) -> Result<Replayed> {
+fn replay(
+    dir: &Path,
+    m: &Manifest,
+    decls: &HashMap<u64, KeyspaceDecl>,
+    dropped: &BTreeSet<u64>,
+) -> Result<Replayed> {
     let mut out = Replayed {
         epoch: m.checkpointed(),
         ..Replayed::default()
@@ -1014,7 +1230,9 @@ fn replay(dir: &Path, m: &Manifest, decls: &HashMap<u64, KeyspaceDecl>) -> Resul
                     format!("epoch {epoch} follows epoch {}", out.epoch),
                 ));
             }
-            apply_frame(payload, decls, &mut out.wal).map_err(frame_error(&path, at))?;
+            // truncated or dropped keyspaces' sections are skipped
+            let skip = |ks: u64| dropped.contains(&ks) || m.floor(ks) >= epoch;
+            apply_frame(payload, decls, &skip, &mut out.wal).map_err(frame_error(&path, at))?;
             out.epoch = epoch;
             at += used;
         }
@@ -1051,6 +1269,7 @@ enum FrameError {
 fn apply_frame(
     mut payload: &[u8],
     decls: &HashMap<u64, KeyspaceDecl>,
+    skip: &dyn Fn(u64) -> bool,
     trees: &mut HashMap<u64, Box<dyn Any + Send + Sync>>,
 ) -> Result<(), FrameError> {
     let bad = |why: &str| FrameError::Decode(why.to_string());
@@ -1065,6 +1284,10 @@ fn apply_frame(
             .and_then(|len| 16usize.checked_add(len))
             .filter(|&end| end <= payload.len())
             .ok_or_else(|| bad("truncated section body"))?;
+        if skip(ks) {
+            payload = &payload[end..];
+            continue;
+        }
         let decl = decls.get(&ks).ok_or(FrameError::Unknown(ks))?;
         let mut tree = trees.remove(&ks);
         let res = (decl.replay)(&mut tree, &payload[16..end]);
@@ -1109,10 +1332,15 @@ impl Store {
         lock: Option<File>,
     ) -> Self {
         let Replayed { epoch, wal, .. } = replayed;
-        let bytes = wal
-            .iter()
-            .map(|(ks, tree)| (keyspaces[ks].measure)(&**tree))
-            .sum();
+        let wal: HashMap<u64, LayerTree> = wal
+            .into_iter()
+            .map(|(ks, tree)| {
+                let bytes = (keyspaces[&ks].measure)(&*tree);
+                let tree = Arc::from(tree);
+                (ks, LayerTree { tree, bytes })
+            })
+            .collect();
+        let bytes = wal.values().map(|t| t.bytes).sum();
         let layers = if wal.is_empty() {
             Vec::new()
         } else {
@@ -1128,6 +1356,7 @@ impl Store {
                 layers,
                 tables,
                 resident_bytes: bytes,
+                floors: Arc::new(writer.manifest.floors.clone()),
             }),
             writer: Mutex::new(writer),
             active_snapshots: Mutex::new(BTreeMap::new()),
@@ -1252,7 +1481,13 @@ impl Store {
                     None => underlay.seal(None),
                 };
                 bytes += n;
-                trees.insert(ks, tree);
+                trees.insert(
+                    ks,
+                    LayerTree {
+                        tree: Arc::from(tree),
+                        bytes: n,
+                    },
+                );
             }
         })?;
         self.wal_bytes.fetch_add(logged, Relaxed);
@@ -1265,11 +1500,13 @@ impl Store {
             trees,
             bytes,
         }));
+        self.fold_layers(&mut layers, current.tables.is_empty());
         self.current.store(Arc::new(Version {
             epoch,
+            resident_bytes: layers.iter().map(|l| l.bytes).sum(),
             layers,
             tables: current.tables.clone(),
-            resident_bytes: current.resident_bytes + bytes,
+            floors: current.floors.clone(),
         }));
 
         let checkpointed = if self.over_limits(&writer) {
@@ -1289,6 +1526,161 @@ impl Store {
                 source: Arc::new(e),
             })?;
         Ok(Some(epoch))
+    }
+
+    /// Bring derived state in line with graph fingerprint `fp`, at open.
+    /// If it was recorded under another, truncate the derived and
+    /// `dropped` keyspaces and rebuild the derived ones with `replay`,
+    /// then record `fp`. Until it is recorded, every open rebuilds.
+    fn reconcile_graph(
+        &self,
+        fp: u64,
+        dropped: &BTreeSet<u64>,
+        replay: Option<&mut Replay<'_>>,
+    ) -> Result<()> {
+        let mut w = self.lock_writer();
+        if w.manifest.graph == Some(fp) {
+            debug_assert!(
+                dropped.is_empty(),
+                "dropping a keyspace changes the fingerprint"
+            );
+            return Ok(());
+        }
+        let derived: Vec<u64> = self
+            .keyspaces
+            .iter()
+            .filter(|(_, d)| d.derived)
+            .map(|(id, _)| *id)
+            .collect();
+        // with no commits yet there is nothing to rebuild from
+        let rebuild = self.current.load().epoch > 0 && !derived.is_empty();
+        if rebuild || !dropped.is_empty() {
+            let replay = match replay {
+                Some(replay) => Some(replay),
+                None if rebuild => return Err(Error::RebuildRequired),
+                None => None,
+            };
+            let mut doomed: Vec<u64> = derived;
+            doomed.extend(dropped);
+            self.truncate_locked(&mut w, &doomed, dropped)?;
+            drop(w);
+            if let (true, Some(replay)) = (rebuild, replay) {
+                loop {
+                    let mut tx = self.begin()?;
+                    let more = replay(&mut tx)?;
+                    self.finish(tx)?;
+                    if !more {
+                        break;
+                    }
+                }
+            }
+            w = self.lock_writer();
+        }
+        let mut next = w.manifest.clone();
+        next.graph = Some(fp);
+        w.update_manifest(next)
+    }
+
+    /// Empty keyspaces `ids` as of the current epoch, and forget `dropped`
+    /// ones entirely. Older data stays where it is, hidden by a floor:
+    /// reads skip tables no newer than it, replay skips WAL sections no
+    /// newer than it, and compaction leaves it behind. Clears the recorded
+    /// graph fingerprint, which the caller records again once derived
+    /// state is rebuilt.
+    fn truncate_locked(
+        &self,
+        w: &mut StoreWriter,
+        ids: &[u64],
+        dropped: &BTreeSet<u64>,
+    ) -> Result<()> {
+        w.check()?;
+        let version = self.current.load_full();
+        let mut next = w.manifest.clone();
+        for &id in ids {
+            next.floors.insert(id, version.epoch);
+        }
+        for id in dropped {
+            next.keyspaces.remove(id);
+            next.derived.remove(id);
+        }
+        next.graph = None;
+        next.prune_floors();
+        let floors = Arc::new(next.floors.clone());
+        w.update_manifest(next)?;
+
+        // layers hold nothing newer than the floor, so the trees go
+        let layers: Vec<Arc<Layer>> = version
+            .layers
+            .iter()
+            .filter_map(|l| {
+                let trees: HashMap<u64, LayerTree> = l
+                    .trees
+                    .iter()
+                    .filter(|(ks, _)| !ids.contains(ks))
+                    .map(|(ks, t)| (*ks, t.clone()))
+                    .collect();
+                (!trees.is_empty()).then(|| {
+                    Arc::new(Layer {
+                        epoch: l.epoch,
+                        bytes: trees.values().map(|t| t.bytes).sum(),
+                        trees,
+                    })
+                })
+            })
+            .collect();
+        self.current.store(Arc::new(Version {
+            epoch: version.epoch,
+            resident_bytes: layers.iter().map(|l| l.bytes).sum(),
+            layers,
+            tables: version.tables.clone(),
+            floors,
+        }));
+        Ok(())
+    }
+
+    /// Fold the newest layers together while the older of the last two is
+    /// no more than [`FOLD_RATIO`] times the newer's size, so a run of
+    /// small commits does not leave a layer each for reads to probe.
+    ///
+    /// Snapshots hold the layers they were taken with, so folding never
+    /// changes what one sees; it only stops sharing memory with them.
+    /// With `bottomless`, nothing lies beneath the oldest layer, so a fold
+    /// that reaches it applies deletes instead of keeping tombstones.
+    fn fold_layers(&self, layers: &mut Vec<Arc<Layer>>, bottomless: bool) {
+        while let [.., older, newer] = &layers[..]
+            && older.bytes <= FOLD_RATIO * newer.bytes.max(1)
+        {
+            let drop_tombstones = bottomless && layers.len() == 2;
+            let ids: BTreeSet<u64> = older
+                .trees
+                .keys()
+                .chain(newer.trees.keys())
+                .copied()
+                .collect();
+            let mut trees = HashMap::with_capacity(ids.len());
+            for ks in ids {
+                let (o, n) = (older.trees.get(&ks), newer.trees.get(&ks));
+                let folded = match (o, n) {
+                    // untouched by the other side and nothing to drop: share it
+                    (Some(t), None) | (None, Some(t)) if !drop_tombstones => t.clone(),
+                    _ => (self.keyspaces[&ks].fold)(o, n, drop_tombstones),
+                };
+                // every entry costs at least ENTRY_OVERHEAD, so no bytes
+                // means deletes emptied the tree
+                if folded.bytes > 0 {
+                    trees.insert(ks, folded);
+                }
+            }
+            let epoch = newer.epoch;
+            layers.truncate(layers.len() - 2);
+            if !trees.is_empty() {
+                layers.push(Arc::new(Layer {
+                    epoch,
+                    bytes: trees.values().map(|t| t.bytes).sum(),
+                    trees,
+                }));
+            }
+        }
     }
 
     /// Write everything committed since the last checkpoint to a new table,
@@ -1348,7 +1740,7 @@ impl Store {
                 .layers
                 .iter()
                 .rev()
-                .filter_map(|l| l.trees.get(&ks).map(|t| &**t))
+                .filter_map(|l| l.trees.get(&ks).map(|t| &*t.tree))
                 .collect();
             table.begin_keyspace(ks)?;
             (self.keyspaces[&ks].write_run)(&trees, &mut |k, v| table.push(k, v))?;
@@ -1363,6 +1755,8 @@ impl Store {
             Some(_) => Some(new_segment(dir, &mut next)?),
             None => None,
         };
+        next.prune_floors();
+        let floors = Arc::new(next.floors.clone());
         w.install_manifest(dir, next)?;
 
         // the checkpoint is durable: swap its table in for the layers it
@@ -1374,6 +1768,7 @@ impl Store {
             layers: Vec::new(),
             tables,
             resident_bytes: 0,
+            floors,
         }));
         self.wal_bytes.store(0, Relaxed);
 
@@ -1475,14 +1870,26 @@ impl Store {
         let ckpt = Checkpoint { number, epoch };
         let path = dir.join(ckpt.file_name());
 
+        // floors only rise, and a later one covers every table that exists
+        // when it is set, so reading them once here is safe
+        let floors = self.current.load().floors.clone();
         let mut out = TableBuilder::create(&path, self.opts.block_size)?;
         let ids: BTreeSet<u64> = inputs.iter().flat_map(|t| t.keyspaces()).collect();
         let (mut key, mut value) = (Vec::new(), Vec::new());
         for ks in ids {
+            // newest first, so the first cursor holding a key wins; inputs
+            // at or below the keyspace's floor hold nothing visible for it
+            let floor = floors.get(&ks).copied().unwrap_or(0);
+            let mut cursors: Vec<TableCursor> = inputs
+                .iter()
+                .rev()
+                .take_while(|t| t.epoch() > floor)
+                .map(|t| t.cursor(ks, None))
+                .collect();
+            if cursors.is_empty() {
+                continue;
+            }
             out.begin_keyspace(ks)?;
-            // newest first, so the first cursor holding a key wins
-            let mut cursors: Vec<TableCursor> =
-                inputs.iter().rev().map(|t| t.cursor(ks, None)).collect();
             for c in &mut cursors {
                 c.start()?;
             }
@@ -1532,6 +1939,8 @@ impl Store {
                 "compaction inputs are still adjacent"
             );
             next.checkpoints.splice(at..at + inputs.len(), [ckpt]);
+            next.prune_floors();
+            let floors = Arc::new(next.floors.clone());
             w.install_manifest(&dir, next)?;
 
             // publish under the writer lock, which every publisher holds
@@ -1543,6 +1952,7 @@ impl Store {
                 layers: current.layers.clone(),
                 tables,
                 resident_bytes: current.resident_bytes,
+                floors,
             }));
         }
 
@@ -2365,6 +2775,95 @@ mod tests {
         put(store, &[(2, Some(20)), (3, None), (5, Some(5))]);
         store.checkpoint().unwrap();
         put(store, &[(4, Some(40)), (5, None), (6, Some(6))]);
+    }
+
+    #[test]
+    fn small_commits_fold_into_logarithmically_many_layers() {
+        let store = mem();
+        let mut model = BTreeMap::new();
+        for i in 0..2000u32 {
+            let k = (i % 251) as u8;
+            let v = (i % 7 != 0).then_some(i as i64);
+            put(&store, &[(k, v)]);
+            match v {
+                Some(v) => model.insert(k, v),
+                None => model.remove(&k),
+            };
+            let layers = store.current.load().layers.len();
+            assert!(layers <= 16, "{layers} layers after {i} commits");
+        }
+        for k in 0..=255u8 {
+            assert_eq!(read(&store, k), model.get(&k).copied(), "key {k}");
+        }
+        let live: Vec<(u8, i64)> = model.into_iter().collect();
+        assert_eq!(live_rows(&store), live);
+    }
+
+    #[test]
+    fn folding_without_tables_applies_deletes() {
+        let store = mem();
+        for k in 0..100u8 {
+            put(&store, &[(k, Some(k as i64))]);
+        }
+        for k in 0..100u8 {
+            put(&store, &[(k, None)]);
+        }
+        let v = store.current.load();
+        let tombstones: usize = v
+            .layers
+            .iter()
+            .flat_map(|l| l.trees.values())
+            .map(|t| {
+                t.tree
+                    .downcast_ref::<Resident<u8, i64>>()
+                    .unwrap()
+                    .values()
+                    .filter(|v| v.is_none())
+                    .count()
+            })
+            .sum();
+        // only the newest few layers, not yet folded to the bottom, keep any
+        assert!(tombstones < 20, "{tombstones} tombstones left");
+        assert!(
+            v.resident_bytes < 20 * 64,
+            "{} bytes left",
+            v.resident_bytes
+        );
+        assert_eq!(
+            v.resident_bytes,
+            v.layers.iter().map(|l| l.bytes).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn folding_above_tables_keeps_tombstones() {
+        let dir = tmpdir("fold-over-tables");
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        put(&store, &[(1, Some(1)), (2, Some(2))]);
+        store.checkpoint().unwrap();
+        put(&store, &[(1, None)]);
+        for i in 0..50 {
+            put(&store, &[(3, Some(i))]);
+        }
+        assert_eq!(read(&store, 1), None, "the folded tombstone still shadows");
+        assert_eq!(live_rows(&store), vec![(2, 2), (3, 49)]);
+        drop(store);
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(live_rows(&store), vec![(2, 2), (3, 49)]);
+    }
+
+    #[test]
+    fn snapshots_keep_their_view_across_folds() {
+        let store = mem();
+        put(&store, &[(1, Some(1)), (2, Some(2))]);
+        let before = store.snapshot();
+        for i in 0..100 {
+            put(&store, &[(1, Some(100 + i)), (2, None)]);
+        }
+        assert_eq!(before.get(KS, &1).unwrap().as_deref(), Some(&1));
+        assert_eq!(before.get(KS, &2).unwrap().as_deref(), Some(&2));
+        assert_eq!(read(&store, 1), Some(199));
+        assert_eq!(read(&store, 2), None);
     }
 
     #[test]

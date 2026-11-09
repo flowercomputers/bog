@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::{any::Any, borrow::Cow, marker::PhantomData};
 
 use crate::codec::{Codec, OrderedCodec};
+use crate::graph::Fingerprint;
 use crate::tx::{KeyspaceId, WriteTx};
 pub mod graph;
 pub mod merge;
@@ -248,6 +249,7 @@ where
 
 pub trait Node: Send {
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any);
+    fn fingerprint(&self, fp: &mut Fingerprint);
 }
 
 /// Commutative, variable-arity
@@ -256,12 +258,17 @@ pub trait Nary: Send {
     type Takes: Buffer;
     type Gives: Buffer;
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Self::Takes], out: &mut Self::Gives);
+    /// Add whatever the operator's type does not already say, such as
+    /// the keyspaces it writes, to the graph's fingerprint.
+    fn fingerprint(&self, _fp: &mut Fingerprint) {}
 }
 
 pub trait Unary: Send {
     type Takes: Buffer;
     type Gives: Buffer;
     fn eval(&mut self, tx: &mut WriteTx, batch: &Self::Takes, out: &mut Self::Gives);
+    /// See [`Nary::fingerprint`].
+    fn fingerprint(&self, _fp: &mut Fingerprint) {}
 }
 
 impl<N: Nary> Unary for N {
@@ -271,6 +278,9 @@ impl<N: Nary> Unary for N {
     fn eval(&mut self, tx: &mut WriteTx, batch: &Self::Takes, out: &mut Self::Gives) {
         N::eval(self, tx, &[batch], out);
     }
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        N::fingerprint(self, fp)
+    }
 }
 
 pub trait Binary: Send {
@@ -278,6 +288,8 @@ pub trait Binary: Send {
     type Right: Buffer;
     type Gives: Buffer;
     fn eval(&mut self, tx: &mut WriteTx, l: &Self::Left, r: &Self::Right, out: &mut Self::Gives);
+    /// See [`Nary::fingerprint`].
+    fn fingerprint(&self, _fp: &mut Fingerprint) {}
 }
 
 pub struct Sum<K, V: Merge> {
@@ -303,6 +315,10 @@ where
 {
     type Takes = Bag<(K, V)>;
     type Gives = Register<K, (i64, V)>;
+
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        fp.write_u64(self.ks.raw());
+    }
 
     fn eval(
         &mut self,
@@ -372,6 +388,10 @@ where
 {
     type Takes = Bag<T>;
     type Gives = Bag<T>;
+
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        fp.write_u64(self.counts.raw());
+    }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], out: &mut Bag<T>) {
         self.scratch.clear();
@@ -483,6 +503,10 @@ where
 {
     type Takes = Register<K, M>;
     type Gives = Bag<K2>;
+
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        fp.write_u64(self.index.raw());
+    }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Register<K, M>], out: &mut Bag<K2>) {
         let mut ix = tx.keyspace(self.index);
@@ -700,6 +724,258 @@ mod tests {
         assert_eq!(ks.get(&1).unwrap().as_deref(), None);
         // insert then delete within one tx cancels out entirely
         assert!(ks.inner_is_empty());
+    }
+
+    mod rebuild {
+        use super::super::*;
+        use crate::error::Error;
+        use crate::graph::{NodeRef, OpDag};
+        use crate::store::{DurabilityPolicy, Store, StoreBuilder};
+        use std::{collections::BTreeMap, ops::Bound, path::Path};
+
+        const BASE: KeyspaceId<u8, i64> = KeyspaceId::new(1);
+        const TOTALS: KeyspaceId<u8, (i64, i64)> = KeyspaceId::new(7);
+
+        /// Base rows `k -> v`, summed into TOTALS by `k % modulus`.
+        struct App {
+            g: OpDag,
+            src: NodeRef<Bag<(u8, i64)>>,
+            modulus: u8,
+        }
+
+        impl App {
+            fn new(modulus: u8) -> Self {
+                let mut g = OpDag::new();
+                let src = g.source::<Bag<(u8, i64)>>();
+                let m = modulus;
+                let class = g.nary(
+                    &[src],
+                    FusedLinears(Map(move |&(k, v): &(u8, i64)| (k % m, v)), PhantomData),
+                );
+                g.nary(&[class], Sum::<u8, i64>::new(TOTALS));
+                App { g, src, modulus }
+            }
+
+            fn fingerprint(&self) -> u64 {
+                let mut fp = crate::graph::Fingerprint::new();
+                fp.write_u64(self.g.fingerprint());
+                fp.write_u64(self.modulus as u64);
+                fp.finish()
+            }
+
+            fn builder(&self, dir: &Path) -> StoreBuilder {
+                StoreBuilder::new(DurabilityPolicy::RELAXED)
+                    .dir(dir)
+                    .keyspace(BASE)
+                    .derived(TOTALS)
+                    .graph(self.fingerprint())
+            }
+
+            /// Set base rows, feeding their changes to the graph.
+            fn write(&mut self, store: &Store, rows: &[(u8, Option<i64>)]) {
+                let mut tx = store.begin().unwrap();
+                let mut feed = Bag::new();
+                {
+                    let mut ks = tx.keyspace(BASE);
+                    for &(k, v) in rows {
+                        let old = ks.get(&k).unwrap().map(|v| *v);
+                        if let Some(o) = old {
+                            feed.push((k, o), -1);
+                        }
+                        if let Some(n) = v {
+                            feed.push((k, n), 1);
+                        }
+                        let change = match (old, v) {
+                            (None, None) => continue,
+                            (None, Some(n)) => Change::Insert(n),
+                            (Some(o), None) => Change::Delete(o),
+                            (Some(o), Some(n)) => Change::Replace(o, n),
+                        };
+                        ks.absorb(k, change).unwrap();
+                    }
+                }
+                self.g.give(self.src, &mut feed);
+                self.g.run(&mut tx);
+                store.finish(tx).unwrap();
+            }
+
+            /// Feed base rows to the graph `chunk` at a time.
+            fn replay(
+                &mut self,
+                chunk: usize,
+                fail_after: Option<usize>,
+            ) -> impl FnMut(&mut WriteTx<'_>) -> crate::error::Result<bool> + '_ {
+                let mut after: Option<u8> = None;
+                let mut calls = 0;
+                move |tx| {
+                    calls += 1;
+                    let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+                    let rows: Vec<(u8, i64)> = tx
+                        .keyspace(BASE)
+                        .range((lower, Bound::Unbounded))
+                        .take(chunk)
+                        .map(|r| r.map(|(k, v)| (*k, *v)))
+                        .collect::<crate::error::Result<_>>()?;
+                    let mut feed = Bag::new();
+                    for &(k, v) in &rows {
+                        feed.push((k, v), 1);
+                    }
+                    after = rows.last().map(|r| r.0).or(after);
+                    self.g.give(self.src, &mut feed);
+                    self.g.run(tx);
+                    if fail_after == Some(calls) {
+                        return Err(Error::InvalidOption("replay failed on purpose"));
+                    }
+                    Ok(rows.len() == chunk)
+                }
+            }
+        }
+
+        fn totals(store: &Store) -> Vec<(u8, (i64, i64))> {
+            store
+                .snapshot()
+                .range(TOTALS, ..)
+                .map(|r| r.map(|(k, v)| (*k, *v)))
+                .collect::<crate::error::Result<_>>()
+                .unwrap()
+        }
+
+        fn expected(model: &BTreeMap<u8, i64>, modulus: u8) -> Vec<(u8, (i64, i64))> {
+            let mut t: BTreeMap<u8, (i64, i64)> = BTreeMap::new();
+            for (&k, &v) in model {
+                let e = t.entry(k % modulus).or_default();
+                e.0 += 1;
+                e.1 += v;
+            }
+            t.into_iter().collect()
+        }
+
+        fn tmpdir(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("fold3-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+
+        /// Base rows spread over checkpoints, the WAL, and deletes.
+        fn populate(app: &mut App, store: &Store, model: &mut BTreeMap<u8, i64>) {
+            for round in 0..4i64 {
+                let rows: Vec<(u8, Option<i64>)> = (0..20u8)
+                    .map(|k| {
+                        let v = (k as i64 * 7 + round) % 5 != 0;
+                        (k, v.then_some(k as i64 * 10 + round))
+                    })
+                    .collect();
+                for &(k, v) in &rows {
+                    match v {
+                        Some(v) => model.insert(k, v),
+                        None => model.remove(&k),
+                    };
+                }
+                app.write(store, &rows);
+                if round % 2 == 0 {
+                    store.checkpoint().unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn a_changed_graph_truncates_and_replays_derived_state() {
+            let dir = tmpdir("rebuild");
+            let mut model = BTreeMap::new();
+            let mut v1 = App::new(2);
+            let store = v1.builder(&dir).build().unwrap();
+            populate(&mut v1, &store, &mut model);
+            assert_eq!(totals(&store), expected(&model, 2));
+            drop(store);
+
+            // the same graph reopens without a rebuild
+            let store = v1.builder(&dir).build().unwrap();
+            assert_eq!(totals(&store), expected(&model, 2));
+            drop(store);
+
+            // a different graph cannot open without a replay
+            let mut v2 = App::new(3);
+            assert!(matches!(
+                v2.builder(&dir).build(),
+                Err(Error::RebuildRequired)
+            ));
+
+            // a failed replay leaves the rebuild to the next open
+            let b = v2.builder(&dir);
+            assert!(b.build_with(v2.replay(4, Some(2))).is_err());
+            let mut v2 = App::new(3);
+            assert!(matches!(
+                v2.builder(&dir).build(),
+                Err(Error::RebuildRequired)
+            ));
+
+            let b = v2.builder(&dir);
+            let store = b.build_with(v2.replay(3, None)).unwrap();
+            assert_eq!(totals(&store), expected(&model, 3));
+
+            // the new graph keeps running incrementally over rebuilt state
+            v2.write(&store, &[(5, None), (40, Some(1))]);
+            model.remove(&5);
+            model.insert(40, 1);
+            assert_eq!(totals(&store), expected(&model, 3));
+            drop(store);
+
+            let store = v2.builder(&dir).build().unwrap();
+            assert_eq!(totals(&store), expected(&model, 3));
+
+            // compaction leaves truncated data behind, and once every table
+            // is newer than the floor, the floor goes too
+            store.checkpoint().unwrap();
+            store.compact().unwrap();
+            assert_eq!(totals(&store), expected(&model, 3));
+            drop(store);
+            let m = std::fs::read_to_string(dir.join("MANIFEST")).unwrap();
+            assert!(!m.contains("floor\t"), "floor outlived its data:\n{m}");
+            let store = v2.builder(&dir).build().unwrap();
+            assert_eq!(totals(&store), expected(&model, 3));
+        }
+
+        #[test]
+        fn an_undeclared_derived_keyspace_is_dropped() {
+            let dir = tmpdir("drop-derived");
+            let mut model = BTreeMap::new();
+            let mut app = App::new(2);
+            let store = app.builder(&dir).build().unwrap();
+            populate(&mut app, &store, &mut model);
+            drop(store);
+
+            let base_only = || {
+                StoreBuilder::new(DurabilityPolicy::RELAXED)
+                    .dir(&dir)
+                    .keyspace(BASE)
+            };
+            // no derived keyspace remains, so there is nothing to replay
+            let store = base_only().build().unwrap();
+            assert_eq!(store.snapshot().range(BASE, ..).count(), model.len());
+            drop(store);
+            let m = std::fs::read_to_string(dir.join("MANIFEST")).unwrap();
+            assert!(!m.contains("derived"), "{m}");
+            assert!(base_only().build().is_ok());
+
+            // bringing it back rebuilds it from scratch
+            let mut app = App::new(2);
+            let b = app.builder(&dir);
+            let store = b.build_with(app.replay(64, None)).unwrap();
+            assert_eq!(totals(&store), expected(&model, 2));
+        }
+
+        #[test]
+        fn graph_fingerprints_see_shape_and_keyspaces() {
+            assert_eq!(App::new(2).g.fingerprint(), App::new(2).g.fingerprint());
+            let mut g = OpDag::new();
+            let src = g.source::<Bag<(u8, i64)>>();
+            g.nary(&[src], Sum::<u8, i64>::new(TOTALS));
+            let mut h = OpDag::new();
+            let src = h.source::<Bag<(u8, i64)>>();
+            h.nary(&[src], Sum::<u8, i64>::new(KeyspaceId::new(8)));
+            assert_ne!(g.fingerprint(), h.fingerprint());
+            assert_ne!(g.fingerprint(), App::new(2).g.fingerprint());
+        }
     }
 
     #[test]

@@ -15,13 +15,16 @@
 //! next-file	3
 //! option	wal-limit	67108864
 //! keyspace	7	u8	(i64, i64)
+//! keyspace	9	u8	()	derived
+//! graph	9f3c6a1e2b4d5c70
+//! floor	9	31
 //! checkpoint	1	40
 //! wal	2	sealed	1234
 //! wal	4	active
 //! ```
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Write},
     path::Path,
@@ -46,6 +49,17 @@ pub(crate) struct Manifest {
     pub options: BTreeMap<String, u64>,
     /// Keyspace id to (key type, merge type), as `std::any::type_name`.
     pub keyspaces: BTreeMap<u64, (String, String)>,
+    /// The keyspaces among `keyspaces` that hold derived state, which a
+    /// graph computes from the rest and can recompute.
+    pub derived: BTreeSet<u64>,
+    /// The fingerprint of the graph the derived keyspaces were computed
+    /// by. `None` on a new store, and while derived state is being
+    /// rebuilt, so that a crash mid-rebuild rebuilds again.
+    pub graph: Option<u64>,
+    /// Keyspace id to the epoch it was truncated at: data for it at or
+    /// below that epoch, in tables or the WAL, is ignored. A floor is
+    /// dropped once no table or WAL frame that old remains.
+    pub floors: BTreeMap<u64, u64>,
     /// Checkpoints oldest first. Each holds what changed after the previous
     /// one, through its own epoch; loading them in order rebuilds the state
     /// as of the last one.
@@ -90,9 +104,27 @@ impl Manifest {
             next_file: 1,
             options: BTreeMap::new(),
             keyspaces: BTreeMap::new(),
+            derived: BTreeSet::new(),
+            graph: None,
+            floors: BTreeMap::new(),
             checkpoints: Vec::new(),
             segments: Vec::new(),
         }
+    }
+
+    /// The epoch `ks` was truncated at, 0 if it never was.
+    pub fn floor(&self, ks: u64) -> u64 {
+        self.floors.get(&ks).copied().unwrap_or(0)
+    }
+
+    /// Drop floors nothing on disk is old enough to need: no table holds
+    /// an epoch at or below them, and the WAL holds only epochs after the
+    /// last checkpoint.
+    pub fn prune_floors(&mut self) {
+        let oldest = self.checkpoints.iter().map(|c| c.epoch).min();
+        let checkpointed = self.checkpointed();
+        self.floors
+            .retain(|_, floor| checkpointed < *floor || oldest.is_some_and(|e| e <= *floor));
     }
 
     /// The newest epoch covered by a checkpoint, 0 if there are none.
@@ -125,7 +157,18 @@ impl Manifest {
             s.push_str(&format!("option\t{name}\t{value}\n"));
         }
         for (id, (key, merge)) in &self.keyspaces {
-            s.push_str(&format!("keyspace\t{id}\t{key}\t{merge}\n"));
+            let role = if self.derived.contains(id) {
+                "\tderived"
+            } else {
+                ""
+            };
+            s.push_str(&format!("keyspace\t{id}\t{key}\t{merge}{role}\n"));
+        }
+        if let Some(fp) = self.graph {
+            s.push_str(&format!("graph\t{fp:016x}\n"));
+        }
+        for (id, epoch) in &self.floors {
+            s.push_str(&format!("floor\t{id}\t{epoch}\n"));
         }
         for c in &self.checkpoints {
             s.push_str(&format!("checkpoint\t{}\t{}\n", c.number, c.epoch));
@@ -150,6 +193,9 @@ impl Manifest {
         let mut policy = None;
         let mut next_file = None;
         let mut keyspaces = BTreeMap::new();
+        let mut derived = BTreeSet::new();
+        let mut graph = None;
+        let mut floors = BTreeMap::new();
         let mut options = BTreeMap::new();
         let mut checkpoints: Vec<Checkpoint> = Vec::new();
         let mut segments: Vec<Segment> = Vec::new();
@@ -184,13 +230,33 @@ impl Manifest {
                         return Err(at(format!("duplicate option {name}")));
                     }
                 }
-                ["keyspace", id, key, merge] => {
+                ["keyspace", id, key, merge, role @ ..] => {
                     let id = parse_u64(id).map_err(at)?;
+                    match role {
+                        [] => {}
+                        ["derived"] => {
+                            derived.insert(id);
+                        }
+                        _ => return Err(at(format!("bad keyspace role {role:?}"))),
+                    }
                     if keyspaces
                         .insert(id, (key.to_string(), merge.to_string()))
                         .is_some()
                     {
                         return Err(at(format!("duplicate keyspace {id}")));
+                    }
+                }
+                ["graph", fp] => {
+                    let fp = u64::from_str_radix(fp, 16)
+                        .map_err(|_| at(format!("bad fingerprint {fp:?}")))?;
+                    if graph.replace(fp).is_some() {
+                        return Err(at("duplicate graph".into()));
+                    }
+                }
+                ["floor", id, epoch] => {
+                    let id = parse_u64(id).map_err(at)?;
+                    if floors.insert(id, parse_u64(epoch).map_err(at)?).is_some() {
+                        return Err(at(format!("duplicate floor for keyspace {id}")));
                     }
                 }
                 ["checkpoint", num, epoch] => {
@@ -237,6 +303,9 @@ impl Manifest {
             next_file: next_file.ok_or("manifest has no next-file")?,
             options,
             keyspaces,
+            derived,
+            graph,
+            floors,
             checkpoints,
             segments,
         };
@@ -328,6 +397,11 @@ mod tests {
         m.next_file = 3;
         m.options.insert("wal-limit".into(), 1 << 26);
         m.keyspaces.insert(7, ("u8".into(), "(i64, i64)".into()));
+        m.keyspaces.insert(9, ("u8".into(), "()".into()));
+        m.derived.insert(9);
+        m.graph = Some(0x9f3c_6a1e_2b4d_5c70);
+        m.floors.insert(9, 4);
+        m.floors.insert(12, 2);
         m.checkpoints.push(Checkpoint {
             number: 0,
             epoch: 9,

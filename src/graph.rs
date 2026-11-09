@@ -1,6 +1,45 @@
 use crate::{Binary, Buffer, Nary, Node, Unary, WriteTx};
 use smallvec::SmallVec;
-use std::{any::Any, collections::BTreeSet, marker::PhantomData};
+use std::{
+    any::{Any, type_name},
+    collections::BTreeSet,
+    marker::PhantomData,
+};
+
+/// A stable 64-bit hash (FNV-1a) for fingerprinting what derived state
+/// was computed by. Unlike `std`'s hashers, its output is fixed across
+/// builds and Rust releases, so it can be recorded on disk.
+#[derive(Clone, Copy, Debug)]
+pub struct Fingerprint(u64);
+
+impl Default for Fingerprint {
+    fn default() -> Self {
+        Fingerprint(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fingerprint {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    pub fn write_u64(&mut self, n: u64) {
+        self.write(&n.to_le_bytes());
+    }
+    /// Length-prefixed, so consecutive strings cannot run together.
+    pub fn write_str(&mut self, s: &str) {
+        self.write_u64(s.len() as u64);
+        self.write(s.as_bytes());
+    }
+    pub fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 type OpDagNodeId = usize;
 
@@ -27,6 +66,8 @@ enum Kind {
 
 struct OpDagNode {
     kind: Kind,
+    /// The source's buffer type, or the operator's type.
+    name: &'static str,
     parents: SmallVec<[OpDagNodeId; 2]>,
     children: SmallVec<[OpDagNodeId; 4]>,
     /// This node's delta for the current epoch. Always allocated; cleared
@@ -55,6 +96,7 @@ impl OpDag {
             Kind::Source {
                 staging: Box::new(B::empty()),
             },
+            type_name::<B>(),
             &[],
             Box::new(B::empty()),
         )
@@ -67,6 +109,7 @@ impl OpDag {
     ) -> NodeRef<U::Gives> {
         self.push(
             Kind::Op(Box::new(UnaryNode(op))),
+            type_name::<U>(),
             &[input.0],
             Box::new(U::Gives::empty()),
         )
@@ -80,6 +123,7 @@ impl OpDag {
     ) -> NodeRef<B::Gives> {
         self.push(
             Kind::Op(Box::new(BinaryNode(op))),
+            type_name::<B>(),
             &[l.0, r.0],
             Box::new(B::Gives::empty()),
         )
@@ -96,12 +140,19 @@ impl OpDag {
         let ids: SmallVec<[OpDagNodeId; 4]> = inputs.iter().map(|r| r.0).collect();
         self.push(
             Kind::Op(Box::new(NaryNode(op))),
+            type_name::<N>(),
             &ids,
             Box::new(N::Gives::empty()),
         )
     }
 
-    fn push<B>(&mut self, kind: Kind, parents: &[OpDagNodeId], out: Box<dyn Buffer>) -> NodeRef<B> {
+    fn push<B>(
+        &mut self,
+        kind: Kind,
+        name: &'static str,
+        parents: &[OpDagNodeId],
+        out: Box<dyn Buffer>,
+    ) -> NodeRef<B> {
         let id = self.nodes.len();
         for &p in parents {
             debug_assert!(p < id, "parent ids always precede the child: {p} < {id}");
@@ -109,11 +160,36 @@ impl OpDag {
         }
         self.nodes.push(OpDagNode {
             kind,
+            name,
             parents: parents.into(),
             children: Default::default(),
             out,
         });
         NodeRef(id, PhantomData)
+    }
+
+    /// A fingerprint of the graph's shape: every node's type, its inputs in
+    /// order, and whatever its operator adds, such as the keyspaces it
+    /// writes. Derived state recorded under one fingerprint is rebuilt
+    /// when the graph opens under another.
+    ///
+    /// Closures appear only by type name, which names where they are
+    /// defined but not their bodies. Mix a version into the fingerprint
+    /// to force a rebuild when only a closure's body changed.
+    pub fn fingerprint(&self) -> u64 {
+        let mut fp = Fingerprint::new();
+        fp.write_u64(self.nodes.len() as u64);
+        for node in &self.nodes {
+            fp.write_str(node.name);
+            fp.write_u64(node.parents.len() as u64);
+            for &p in &node.parents {
+                fp.write_u64(p as u64);
+            }
+            if let Kind::Op(op) = &node.kind {
+                op.fingerprint(&mut fp);
+            }
+        }
+        fp.finish()
     }
 
     /// Stage input at a source. Drains `input` so the caller keeps its
@@ -197,6 +273,9 @@ struct BinaryNode<B>(B);
 struct NaryNode<N>(N);
 
 impl<U: Unary> Node for UnaryNode<U> {
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        self.0.fingerprint(fp)
+    }
     #[inline(always)]
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any) {
         debug_assert_eq!(inputs.len(), 1);
@@ -209,6 +288,9 @@ impl<U: Unary> Node for UnaryNode<U> {
 }
 
 impl<B: Binary> Node for BinaryNode<B> {
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        self.0.fingerprint(fp)
+    }
     #[inline(always)]
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any) {
         debug_assert_eq!(inputs.len(), 2);
@@ -222,6 +304,9 @@ impl<B: Binary> Node for BinaryNode<B> {
 }
 
 impl<N: Nary> Node for NaryNode<N> {
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        self.0.fingerprint(fp)
+    }
     #[inline(always)]
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any) {
         let typed_inputs: SmallVec<[&N::Takes; 8]> =
