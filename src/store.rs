@@ -6,19 +6,22 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     time::Instant,
 };
 
 use arc_swap::ArcSwap;
 
 use crate::{
-    codec::{Codec, DecodeError, OrderedCodec, decode_all},
+    codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
     manifest::{self, Checkpoint, MANIFEST_TMP, Manifest, Segment},
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
-    table::{BlockCache, Table, TableBuilder, TableError},
-    tx::{KeyspaceId, WriteTx},
+    table::{BlockCache, DEFAULT_BLOCK_SIZE, Table, TableBuilder, TableError},
+    tx::{KeyspaceId, OutOfMemory, WriteTx},
 };
 
 /// Why a store could not be opened.
@@ -27,6 +30,8 @@ pub enum OpenError {
     Io(io::Error),
     /// The durability policy is invalid, or needs a directory.
     Policy(&'static str),
+    /// A size option is out of range.
+    InvalidOption(&'static str),
     /// Another `Store` holds this directory.
     Locked,
     Manifest(String),
@@ -51,6 +56,7 @@ impl fmt::Display for OpenError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Policy(why) => write!(f, "durability policy: {why}"),
+            Self::InvalidOption(why) => write!(f, "invalid option: {why}"),
             Self::Locked => f.write_str("store directory is locked by another open store"),
             Self::Manifest(why) => write!(f, "bad manifest: {why}"),
             Self::KeyspaceType {
@@ -77,6 +83,118 @@ impl From<io::Error> for OpenError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
     }
+}
+
+/// Why [`Store::finish`] did not cleanly commit a transaction.
+#[derive(Debug)]
+pub enum CommitError {
+    /// The tx was killed for outgrowing its memory limit. Nothing was
+    /// committed or logged.
+    OutOfMemory(OutOfMemory),
+    /// The tx committed as `epoch` and is durable per the policy, but the
+    /// automatic checkpoint after it failed. The next commit retries it;
+    /// until one succeeds, memory and the WAL stay over their limits.
+    Checkpoint { epoch: u64, error: io::Error },
+}
+
+impl fmt::Display for CommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutOfMemory(oom) => oom.fmt(f),
+            Self::Checkpoint { epoch, error } => write!(
+                f,
+                "committed epoch {epoch}, but the checkpoint after it failed: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+/// Size limits. Memory use is estimated with [`ResidentSize`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StoreOptions {
+    /// Checkpoint once the WAL that open would replay reaches this many
+    /// bytes.
+    pub wal_limit: u64,
+    /// Checkpoint once committed data held in memory reaches this many
+    /// bytes. In-memory stores have nowhere to checkpoint to, so for them
+    /// this does nothing.
+    pub memtable_limit: usize,
+    /// Kill a write tx once its writes hold this many bytes.
+    pub tx_memory_limit: usize,
+    /// Target size of a checkpoint table's data blocks: the unit read from
+    /// disk and cached.
+    pub block_size: usize,
+    /// Bytes of table blocks to keep cached.
+    pub cache_size: usize,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        StoreOptions {
+            wal_limit: 64 << 20,
+            memtable_limit: 64 << 20,
+            tx_memory_limit: 64 << 20,
+            block_size: DEFAULT_BLOCK_SIZE,
+            cache_size: 32 << 20,
+        }
+    }
+}
+
+impl StoreOptions {
+    fn validate(&self) -> Result<(), OpenError> {
+        if self.block_size == 0 {
+            return Err(OpenError::InvalidOption(
+                "block size must be at least one byte",
+            ));
+        }
+        if self.block_size > u32::MAX as usize / 2 {
+            return Err(OpenError::InvalidOption("block size must fit a u32 block"));
+        }
+        Ok(())
+    }
+
+    /// As recorded in the manifest.
+    fn named(&self) -> BTreeMap<String, u64> {
+        [
+            ("wal-limit", self.wal_limit),
+            ("memtable-limit", self.memtable_limit as u64),
+            ("tx-memory-limit", self.tx_memory_limit as u64),
+            ("block-size", self.block_size as u64),
+            ("cache-size", self.cache_size as u64),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+}
+
+/// Where the store's memory goes, and how much WAL the next open replays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MemoryStats {
+    /// Committed data held in memory, not yet checkpointed. Layers pinned
+    /// only by old snapshots are not counted.
+    pub memtable_bytes: usize,
+    /// WAL bytes the next open would replay.
+    pub wal_bytes: u64,
+    /// Table blocks in the cache.
+    pub cache_bytes: usize,
+    /// Table indexes, which stay in memory while the table is open.
+    pub index_bytes: usize,
+    pub tables: usize,
+}
+
+/// Estimated bookkeeping a `BTreeMap` spends per entry beyond the key and
+/// value themselves.
+pub(crate) const ENTRY_OVERHEAD: usize = 16;
+
+/// Estimated resident bytes of one committed entry.
+pub(crate) fn resident_entry_bytes<K: ResidentSize, V: ResidentSize>(
+    key: &K,
+    value: &Option<V>,
+) -> usize {
+    key.resident_size() + value.resident_size() + ENTRY_OVERHEAD
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -185,6 +303,8 @@ pub(crate) type Resident<K, V> = BTreeMap<K, Option<V>>;
 struct Layer {
     epoch: u64,
     trees: HashMap<u64, Box<dyn Any + Send + Sync>>,
+    /// Estimated resident bytes of `trees`.
+    bytes: usize,
 }
 
 /// An immutable view of committed state. Commit builds a new one and swaps
@@ -199,6 +319,8 @@ struct Version {
     layers: Vec<Arc<Layer>>,
     /// Checkpoints on disk, oldest first, read through the block cache.
     tables: Vec<Arc<Table>>,
+    /// Estimated resident bytes of `layers`.
+    resident_bytes: usize,
 }
 
 struct Wal {
@@ -209,12 +331,20 @@ struct Wal {
 impl Wal {
     // todo: make this fallible!
     /// Buffer one frame holding a whole transaction, so replay sees either
-    /// all of a tx or none of it. See [`encode_frame`].
-    fn append(&mut self, epoch: u64, payload: &[u8]) {
-        let before = self.buffer.len();
-        encode_frame(epoch, payload, &mut self.buffer);
-        // todo: check if wal + this frame would exceed max wal size
-        self.size += self.buffer.len() - before;
+    /// all of a tx or none of it: `crc32 | epoch u64 | len u64 | payload`,
+    /// little endian, with the crc covering everything after it. `payload`
+    /// writes straight into the buffer, so the tx is never copied whole.
+    fn append_with(&mut self, epoch: u64, payload: impl FnOnce(&mut Vec<u8>)) {
+        const HEAD: usize = 4 + 8 + 8;
+        let start = self.buffer.len();
+        self.buffer.extend([0u8; HEAD]);
+        payload(&mut self.buffer);
+        let len = (self.buffer.len() - start - HEAD) as u64;
+        self.buffer[start + 4..start + 12].copy_from_slice(&epoch.to_le_bytes());
+        self.buffer[start + 12..start + 20].copy_from_slice(&len.to_le_bytes());
+        let crc = crc32fast::hash(&self.buffer[start + 4..]);
+        self.buffer[start..start + 4].copy_from_slice(&crc.to_le_bytes());
+        self.size += self.buffer.len() - start;
     }
 
     fn flush(&mut self, write: bool, sync: bool) {
@@ -235,22 +365,6 @@ impl Wal {
         self.size
     }
 }
-/// `crc32 | epoch u64 | len u64 | payload`, little endian, with the crc
-/// covering everything after it. WAL segments are a run of these, and a
-/// checkpoint is a magic number followed by exactly one.
-fn encode_frame(epoch: u64, payload: &[u8], out: &mut Vec<u8>) {
-    let epoch = epoch.to_le_bytes();
-    let len = (payload.len() as u64).to_le_bytes();
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&epoch);
-    hasher.update(&len);
-    hasher.update(payload);
-    out.extend(hasher.finalize().to_le_bytes());
-    out.extend(epoch);
-    out.extend(len);
-    out.extend(payload);
-}
-
 /// Append one payload section, `keyspace u64 | len u64 | body`, with the
 /// body written by `body`.
 fn encode_section<R>(ks: u64, out: &mut Vec<u8>, body: impl FnOnce(&mut Vec<u8>) -> R) -> R {
@@ -301,12 +415,19 @@ impl StoreWriter {
         }
     }
 
-    /// Log one transaction and write/fsync as the policy says.
+    /// Log one transaction, its payload written by `payload` (given `None`
+    /// when there is no WAL), then write/fsync as the policy says. Returns
+    /// the bytes appended to the WAL.
     // todo: windowed policies only flush when the next tx commits; a quiet
     // store needs a clock source to flush on its own.
-    fn log(&mut self, epoch: u64, payload: &[u8]) {
-        let Some(wal) = self.wal.as_mut() else { return };
-        wal.append(epoch, payload);
+    fn log_with(&mut self, epoch: u64, payload: impl FnOnce(Option<&mut Vec<u8>>)) -> u64 {
+        let Some(wal) = self.wal.as_mut() else {
+            payload(None);
+            return 0;
+        };
+        let before = wal.size;
+        wal.append_with(epoch, |buf| payload(Some(buf)));
+        let appended = (wal.size - before) as u64;
         let now = Instant::now();
         let (write, sync) = self.dp.should(now, self.last_write, self.last_fsync);
         wal.flush(write, sync);
@@ -317,6 +438,7 @@ impl StoreWriter {
             // to accurately reflect the time it actually took to fsync
             self.last_fsync = Some(Instant::now());
         }
+        appended
     }
 }
 
@@ -406,6 +528,20 @@ struct KeyspaceDecl {
         &[&(dyn Any + Send + Sync)],
         &mut dyn FnMut(&[u8], &[u8]) -> io::Result<()>,
     ) -> io::Result<()>,
+    /// Estimated resident bytes of one of this keyspace's trees.
+    measure: fn(&(dyn Any + Send + Sync)) -> usize,
+}
+
+fn measure_tree<K, V>(tree: &(dyn Any + Send + Sync)) -> usize
+where
+    K: ResidentSize + 'static,
+    V: ResidentSize + 'static,
+{
+    tree.downcast_ref::<Resident<K, V>>()
+        .expect("tree has the registered type")
+        .iter()
+        .map(|(k, v)| resident_entry_bytes(k, v))
+        .sum()
 }
 
 fn replay_section<K, V>(
@@ -465,7 +601,7 @@ pub(crate) struct StoreBuilder {
     durability_policy: DurabilityPolicy,
     dir: Option<PathBuf>,
     keyspaces: HashMap<u64, KeyspaceDecl>,
-    cache_bytes: usize,
+    opts: StoreOptions,
 }
 
 impl StoreBuilder {
@@ -476,13 +612,45 @@ impl StoreBuilder {
             durability_policy,
             dir: None,
             keyspaces: HashMap::new(),
-            cache_bytes: 32 << 20,
+            opts: StoreOptions::default(),
         }
     }
 
+    /// Replace every size limit at once.
+    pub(crate) fn options(mut self, opts: StoreOptions) -> Self {
+        self.opts = opts;
+        self
+    }
+
+    /// Checkpoint once the WAL reaches this many bytes. Defaults to 64 MiB.
+    pub(crate) fn wal_limit(mut self, bytes: u64) -> Self {
+        self.opts.wal_limit = bytes;
+        self
+    }
+
+    /// Checkpoint once committed data in memory reaches this many bytes.
+    /// Defaults to 64 MiB.
+    pub(crate) fn memtable_limit(mut self, bytes: usize) -> Self {
+        self.opts.memtable_limit = bytes;
+        self
+    }
+
+    /// Kill a write tx once its writes hold this many bytes. Defaults to
+    /// 64 MiB.
+    pub(crate) fn tx_memory_limit(mut self, bytes: usize) -> Self {
+        self.opts.tx_memory_limit = bytes;
+        self
+    }
+
+    /// Target size of a checkpoint table's blocks. Defaults to 4 KiB.
+    pub(crate) fn block_size(mut self, bytes: usize) -> Self {
+        self.opts.block_size = bytes;
+        self
+    }
+
     /// Bytes of checkpoint blocks to keep in memory. Defaults to 32 MiB.
-    pub(crate) fn cache_bytes(mut self, bytes: usize) -> Self {
-        self.cache_bytes = bytes;
+    pub(crate) fn cache_size(mut self, bytes: usize) -> Self {
+        self.opts.cache_size = bytes;
         self
     }
 
@@ -506,6 +674,7 @@ impl StoreBuilder {
             merge: type_name::<M>(),
             replay: replay_section::<K, M::Value>,
             write_run: write_run::<K, M::Value>,
+            measure: measure_tree::<K, M::Value>,
         };
         if let Some(prev) = self.keyspaces.get(&id.raw()) {
             assert!(
@@ -523,10 +692,10 @@ impl StoreBuilder {
             durability_policy: dp,
             dir,
             keyspaces,
-            cache_bytes,
+            opts,
         } = self;
-        let cache = BlockCache::new(cache_bytes);
         dp.validate().map_err(OpenError::Policy)?;
+        opts.validate()?;
 
         let Some(dir) = dir else {
             if !matches!(dp.write, Never) {
@@ -538,7 +707,8 @@ impl StoreBuilder {
                 Vec::new(),
                 writer,
                 keyspaces,
-                cache,
+                opts,
+                0,
                 None,
             ));
         };
@@ -600,7 +770,17 @@ impl StoreBuilder {
             })
         };
 
+        // what the next open would replay, which drives auto-checkpoints
+        let mut wal_bytes = 0;
+        for seg in &m.segments {
+            wal_bytes += match seg.sealed {
+                Some(len) => len,
+                None => fs::metadata(dir.join(seg.file_name()))?.len(),
+            };
+        }
+
         m.policy = dp;
+        m.options = opts.named();
         m.keyspaces = keyspaces
             .iter()
             .map(|(id, d)| (*id, (d.key.to_string(), d.merge.to_string())))
@@ -608,14 +788,23 @@ impl StoreBuilder {
         manifest::write(&dir, &m)?;
 
         let writer = StoreWriter::new(Some(dir), m, wal, dp);
-        Ok(Store::new(
+        let store = Store::new(
             replayed,
             tables,
             writer,
             keyspaces,
-            cache,
+            opts,
+            wal_bytes,
             Some(lock),
-        ))
+        );
+        // the previous run may have left more than these limits allow
+        {
+            let mut writer = store.writer.lock().unwrap();
+            if store.over_limits(&writer) {
+                store.checkpoint_locked(&mut writer)?;
+            }
+        }
+        Ok(store)
     }
 }
 
@@ -846,6 +1035,10 @@ pub struct Store {
     keyspaces: HashMap<u64, KeyspaceDecl>,
     /// Checkpoint blocks, shared by every table and snapshot.
     cache: BlockCache,
+    opts: StoreOptions,
+    /// WAL bytes the next open would replay. Written under the writer
+    /// lock; atomic so stats can read it while a tx is open.
+    wal_bytes: AtomicU64,
     /// Held for the store's life; released when the file is dropped.
     _lock: Option<File>,
 }
@@ -856,27 +1049,60 @@ impl Store {
         tables: Vec<Arc<Table>>,
         writer: StoreWriter,
         keyspaces: HashMap<u64, KeyspaceDecl>,
-        cache: BlockCache,
+        opts: StoreOptions,
+        wal_bytes: u64,
         lock: Option<File>,
     ) -> Self {
         let Replayed { epoch, wal, .. } = replayed;
+        let bytes = wal
+            .iter()
+            .map(|(ks, tree)| (keyspaces[ks].measure)(&**tree))
+            .sum();
         let layers = if wal.is_empty() {
             Vec::new()
         } else {
-            vec![Arc::new(Layer { epoch, trees: wal })]
+            vec![Arc::new(Layer {
+                epoch,
+                trees: wal,
+                bytes,
+            })]
         };
         Store {
             current: ArcSwap::from_pointee(Version {
                 epoch,
                 layers,
                 tables,
+                resident_bytes: bytes,
             }),
             writer: Mutex::new(writer),
             active_snapshots: Mutex::new(BTreeMap::new()),
             keyspaces,
-            cache,
+            cache: BlockCache::new(opts.cache_size),
+            opts,
+            wal_bytes: AtomicU64::new(wal_bytes),
             _lock: lock,
         }
+    }
+
+    pub(crate) fn stats(&self) -> MemoryStats {
+        let version = self.current.load();
+        MemoryStats {
+            memtable_bytes: version.resident_bytes,
+            wal_bytes: self.wal_bytes.load(Relaxed),
+            cache_bytes: self.cache.used(),
+            index_bytes: version.tables.iter().map(|t| t.index_bytes()).sum(),
+            tables: version.tables.len(),
+        }
+    }
+
+    /// Whether a checkpoint is due: the WAL or the memtable is over its
+    /// limit, and there is somewhere to checkpoint to.
+    fn over_limits(&self, w: &StoreWriter) -> bool {
+        let version = self.current.load();
+        w.dir.is_some()
+            && !version.layers.is_empty()
+            && (self.wal_bytes.load(Relaxed) >= self.opts.wal_limit
+                || version.resident_bytes >= self.opts.memtable_limit)
     }
 
     /// Panics unless `id` was declared on the builder with these types.
@@ -911,7 +1137,7 @@ impl Store {
     pub(crate) fn begin(&self) -> WriteTx<'_> {
         // lock first: the snapshot must not be older than the last commit
         let writer = self.writer.lock().unwrap();
-        WriteTx::new(self.snapshot(), writer)
+        WriteTx::new(self.snapshot(), writer, self.opts.tx_memory_limit)
     }
 
     /// Commit `tx`: log it, then publish it to readers. Returns the epoch
@@ -920,51 +1146,69 @@ impl Store {
     ///
     /// The WAL write and fsync happen before readers can see the tx, so
     /// under a strict policy nothing visible can be lost to a crash.
-    pub(crate) fn finish(&self, tx: WriteTx<'_>) -> Option<u64> {
+    ///
+    /// If the commit takes the WAL or the memtable over its limit, a
+    /// checkpoint runs before this returns.
+    pub(crate) fn finish(&self, tx: WriteTx<'_>) -> Result<Option<u64>, CommitError> {
         let (epoch, overlay, snapshot, mut writer) = tx.into_parts();
         debug_assert!(
             std::ptr::eq(snapshot.store(), self),
             "tx from another store"
         );
+        let overlay = overlay.map_err(CommitError::OutOfMemory)?;
 
         // opening a keyspace only to read it leaves an empty handle behind
         let mut sections: Vec<_> = overlay.into_iter().filter(|(_, u)| !u.is_empty()).collect();
         if sections.is_empty() {
-            return None;
+            return Ok(None);
         }
         // deterministic WAL bytes for the same tx
         sections.sort_unstable_by_key(|(ks, _)| *ks);
 
         // payload: repeated `keyspace u64 | len u64 | (ordered key, Option<value>)*`
-        let mut payload = writer.wal.is_some().then(Vec::new);
         let mut trees = HashMap::with_capacity(sections.len());
-        for (ks, underlay) in sections {
-            let tree = match payload.as_mut() {
-                Some(p) => encode_section(ks, p, |out| underlay.seal(Some(out))),
-                None => underlay.seal(None),
-            };
-            trees.insert(ks, tree);
-        }
-
-        if let Some(p) = payload {
-            writer.log(epoch, &p);
-        }
+        let mut bytes = 0;
+        let logged = writer.log_with(epoch, |mut wal| {
+            for (ks, underlay) in sections {
+                let (tree, n) = match wal.as_deref_mut() {
+                    Some(out) => encode_section(ks, out, |out| underlay.seal(Some(out))),
+                    None => underlay.seal(None),
+                };
+                bytes += n;
+                trees.insert(ks, tree);
+            }
+        });
+        self.wal_bytes.fetch_add(logged, Relaxed);
 
         let current = self.current.load();
         debug_assert_eq!(current.epoch + 1, epoch, "commit out of order");
         let mut layers = current.layers.clone();
-        layers.push(Arc::new(Layer { epoch, trees }));
+        layers.push(Arc::new(Layer {
+            epoch,
+            trees,
+            bytes,
+        }));
         self.current.store(Arc::new(Version {
             epoch,
             layers,
             tables: current.tables.clone(),
+            resident_bytes: current.resident_bytes + bytes,
         }));
+
+        let result = if self.over_limits(&writer) {
+            match self.checkpoint_locked(&mut writer) {
+                Ok(_) => Ok(Some(epoch)),
+                Err(error) => Err(CommitError::Checkpoint { epoch, error }),
+            }
+        } else {
+            Ok(Some(epoch))
+        };
 
         // release the writer only after publishing, so the next tx's
         // snapshot includes this one
         drop(writer);
         drop(snapshot);
-        Some(epoch)
+        result
     }
 
     /// Write everything committed since the last checkpoint to a new table,
@@ -980,7 +1224,10 @@ impl Store {
     /// Holds the writer lock throughout, so commits wait for it.
     pub(crate) fn checkpoint(&self) -> io::Result<Option<u64>> {
         let mut writer = self.writer.lock().unwrap();
-        let w = &mut *writer;
+        self.checkpoint_locked(&mut writer)
+    }
+
+    fn checkpoint_locked(&self, w: &mut StoreWriter) -> io::Result<Option<u64>> {
         let Some(dir) = w.dir.as_deref() else {
             return Ok(None);
         };
@@ -1007,7 +1254,7 @@ impl Store {
         };
         next.next_file += 1;
         let path = dir.join(ckpt.file_name());
-        let mut table = TableBuilder::create(&path)?;
+        let mut table = TableBuilder::create(&path, self.opts.block_size)?;
         let ids: BTreeSet<u64> = version
             .layers
             .iter()
@@ -1046,7 +1293,9 @@ impl Store {
             epoch: version.epoch,
             layers: Vec::new(),
             tables,
+            resident_bytes: 0,
         }));
+        self.wal_bytes.store(0, Relaxed);
 
         // the old segment's buffered frames, if any, are covered too; its
         // drop flushes them into a file that is about to be deleted
@@ -1094,10 +1343,10 @@ mod tests {
                 None => Change::Delete(0),
             };
             if let Some(r) = ks.resolve(&k, change) {
-                ks.absorb(k, r);
+                ks.absorb(k, r).unwrap();
             }
         }
-        store.finish(tx)
+        store.finish(tx).unwrap()
     }
 
     fn read(store: &Store, k: u8) -> Option<i64> {
@@ -1138,11 +1387,11 @@ mod tests {
         // read-only: the keyspace is opened but nothing is written
         let mut tx = store.begin();
         assert_eq!(tx.keyspace(KS).get(&1), None);
-        assert_eq!(store.finish(tx), None);
+        assert_eq!(store.finish(tx).unwrap(), None);
         // aborted: dropped without finish
         {
             let mut tx = store.begin();
-            tx.keyspace(KS).absorb(1, Change::Insert(5));
+            tx.keyspace(KS).absorb(1, Change::Insert(5)).unwrap();
         }
         assert_eq!(read(&store, 1), None);
         assert_eq!(put(&store, &[(1, Some(10))]), Some(1));
@@ -1551,7 +1800,7 @@ mod tests {
         let mut ks = tx.keyspace(KS);
         let r = ks.resolve(&1, Change::Modify(5)).unwrap();
         assert!(matches!(r, Change::Replace(10, 15)));
-        ks.absorb(1, r);
+        ks.absorb(1, r).unwrap();
         store.finish(tx).unwrap();
         assert_eq!(read(&store, 1), Some(15), "memory layer shadows the table");
         drop((store, v));
@@ -1589,7 +1838,7 @@ mod tests {
                 .dir(&dir)
                 .keyspace(KS)
                 .keyspace(BIG)
-                .cache_bytes(16 << 10)
+                .cache_size(16 << 10)
                 .build()
                 .unwrap()
         };
@@ -1599,7 +1848,7 @@ mod tests {
                 let mut tx = store.begin();
                 let mut ks = tx.keyspace(BIG);
                 for &i in chunk {
-                    ks.absorb(i, Change::Insert(i as i64 * 3));
+                    ks.absorb(i, Change::Insert(i as i64 * 3)).unwrap();
                 }
                 store.finish(tx).unwrap();
             }
@@ -1618,6 +1867,218 @@ mod tests {
         assert!(loads > 4, "blocks were paged in and evicted: {loads}");
         drop(snap);
         drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn open_with(
+        dir: &Path,
+        dp: DurabilityPolicy,
+        f: impl FnOnce(StoreBuilder) -> StoreBuilder,
+    ) -> Result<Store, OpenError> {
+        f(StoreBuilder::new(dp).dir(dir).keyspace(KS)).build()
+    }
+
+    #[test]
+    fn a_tx_that_outgrows_its_limit_is_killed_and_commits_nothing() {
+        let store = StoreBuilder::new(DurabilityPolicy::NONE)
+            .keyspace(KS)
+            .tx_memory_limit(1024)
+            .build()
+            .unwrap();
+        put(&store, &[(0, Some(1))]);
+
+        let mut tx = store.begin();
+        let mut ks = tx.keyspace(KS);
+        let mut killed = None;
+        for k in 1..=255u8 {
+            if let Err(oom) = ks.absorb(k, Change::Insert(k as i64)) {
+                killed = Some((k, oom));
+                break;
+            }
+        }
+        let (at, oom) = killed.expect("1 KiB cannot hold 255 entries");
+        assert!(at > 1, "a few entries fit");
+        assert!(oom.used > 1024 && oom.limit == 1024, "{oom}");
+        assert_eq!(ks.absorb(250, Change::Insert(1)), Err(oom), "stays dead");
+        assert_eq!(ks.get(&1).as_deref(), None, "its writes were released");
+        assert_eq!(tx.killed(), Some(oom));
+        assert_eq!(tx.memory_used(), 0);
+        assert!(matches!(store.finish(tx), Err(CommitError::OutOfMemory(e)) if e == oom));
+
+        assert_eq!(store.snapshot().epoch(), 1, "no epoch spent");
+        assert_eq!(read(&store, 1), None);
+        assert_eq!(
+            put(&store, &[(1, Some(1))]),
+            Some(2),
+            "the writer is free again"
+        );
+    }
+
+    #[test]
+    fn tx_memory_tracks_entries_that_change_and_cancel() {
+        let store = mem();
+        let mut tx = store.begin();
+        let mut ks = tx.keyspace(KS);
+        ks.absorb(1, Change::Insert(10)).unwrap();
+        ks.absorb(2, Change::Insert(20)).unwrap();
+        drop(ks);
+        let two = tx.memory_used();
+        assert!(two > 0);
+        let mut ks = tx.keyspace(KS);
+        // insert then delete cancels: the entry is gone, and so are its bytes
+        ks.absorb(2, Change::Delete(20)).unwrap();
+        drop(ks);
+        assert_eq!(tx.memory_used(), two / 2);
+        let mut ks = tx.keyspace(KS);
+        ks.absorb(1, Change::Delete(10)).unwrap();
+        drop(ks);
+        assert_eq!(tx.memory_used(), 0);
+    }
+
+    #[test]
+    fn crossing_the_wal_limit_checkpoints_automatically() {
+        let dir = tmpdir("auto-wal");
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.wal_limit(200)).unwrap();
+        let mut epochs = Vec::new();
+        for i in 0..20u8 {
+            epochs.push(put(&store, &[(i, Some(i as i64))]).unwrap());
+            let stats = store.stats();
+            assert!(
+                stats.wal_bytes < 200,
+                "checkpointed by the time finish returns"
+            );
+            if stats.tables > 0 {
+                break;
+            }
+        }
+        let stats = store.stats();
+        assert_eq!(stats.tables, 1, "the limit was crossed");
+        assert_eq!((stats.wal_bytes, stats.memtable_bytes), (0, 0));
+        let n = epochs.len() as u8;
+        assert_eq!(manifest_of(&dir).checkpointed(), n as u64);
+        for i in 0..n {
+            assert_eq!(read(&store, i), Some(i as i64));
+        }
+        drop(store);
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(read(&store, n - 1), Some(n as i64 - 1));
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn crossing_the_memtable_limit_checkpoints_even_without_a_wal() {
+        let dir = tmpdir("auto-mem");
+        let store = open_with(&dir, DurabilityPolicy::NONE, |b| b.memtable_limit(512)).unwrap();
+        for i in 0..50u8 {
+            put(&store, &[(i, Some(i as i64))]);
+            assert!(store.stats().memtable_bytes < 512);
+        }
+        assert!(store.stats().tables > 1, "{:?}", store.stats());
+        drop(store);
+        let store = open(&dir, DurabilityPolicy::NONE).unwrap();
+        let unlogged = (0..50u8).filter(|&i| read(&store, i).is_none()).count();
+        assert!(
+            unlogged < 50 && unlogged > 0,
+            "checkpointed data survives, the tail does not"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_checkpoints_when_the_last_run_left_too_much() {
+        let dir = tmpdir("auto-open");
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            put(&store, &[(1, Some(10))]);
+            put(&store, &[(2, Some(20))]);
+            assert_eq!(store.stats().tables, 0);
+        }
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.wal_limit(10)).unwrap();
+        let stats = store.stats();
+        assert_eq!(
+            (stats.tables, stats.wal_bytes, stats.memtable_bytes),
+            (1, 0, 0)
+        );
+        assert_eq!(read(&store, 2), Some(20));
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wal_bytes_match_the_files_and_survive_reopen() {
+        let dir = tmpdir("wal-bytes");
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        put(&store, &[(1, Some(10)), (2, Some(20))]);
+        put(&store, &[(3, Some(30))]);
+        let len = fs::metadata(dir.join("000001.wal")).unwrap().len();
+        assert_eq!(store.stats().wal_bytes, len);
+        drop(store);
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(store.stats().wal_bytes, len);
+        assert!(
+            store.stats().memtable_bytes > 0,
+            "replayed data is accounted"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_auto_checkpoint_reports_the_commit_and_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("auto-fail");
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.wal_limit(100)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(dir.join("probe"), b"").is_ok() {
+            // permissions do not bind (running as root): nothing to test
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            drop(store);
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let mut failed = None;
+        for i in 0..20u8 {
+            let mut tx = store.begin();
+            tx.keyspace(KS).absorb(i, Change::Insert(i as i64)).unwrap();
+            match store.finish(tx) {
+                Ok(_) => {}
+                Err(CommitError::Checkpoint { epoch, .. }) => {
+                    failed = Some((i, epoch));
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let (i, epoch) = failed.expect("the limit was crossed");
+        assert_eq!(read(&store, i), Some(i as i64), "the commit still happened");
+        assert_eq!(store.snapshot().epoch(), epoch);
+        assert_eq!(store.stats().tables, 0);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        put(&store, &[(99, Some(99))]);
+        assert_eq!(store.stats().tables, 1, "the next commit retried it");
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn options_are_validated_and_recorded() {
+        let dir = tmpdir("options");
+        let bad = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.block_size(0));
+        assert!(matches!(bad, Err(OpenError::InvalidOption(_))));
+        drop(
+            open_with(&dir, DurabilityPolicy::RELAXED, |b| {
+                b.block_size(512).cache_size(1 << 20)
+            })
+            .unwrap(),
+        );
+        let m = manifest_of(&dir);
+        assert_eq!(m.options["block-size"], 512);
+        assert_eq!(m.options["cache-size"], 1 << 20);
+        assert_eq!(m.options["wal-limit"], 64 << 20);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

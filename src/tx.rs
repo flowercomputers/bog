@@ -1,11 +1,72 @@
-use std::{any::Any, borrow::Cow, collections::HashMap, marker::PhantomData, sync::MutexGuard};
+use std::{
+    any::Any, borrow::Cow, collections::HashMap, fmt, marker::PhantomData, sync::MutexGuard,
+};
 
 use crate::{
     Change, Register,
-    codec::{Codec, OrderedCodec},
+    codec::{Codec, OrderedCodec, ResidentSize, heap_size},
     merge::Merge,
-    store::{Resident, Snapshot, StoreWriter},
+    store::{ENTRY_OVERHEAD, Resident, Snapshot, StoreWriter, resident_entry_bytes},
 };
+
+/// A write tx outgrew its memory limit and was killed. Its writes were
+/// released, and committing it fails with this error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfMemory {
+    /// Bytes the tx's writes held when it was killed.
+    pub used: usize,
+    pub limit: usize,
+}
+
+impl fmt::Display for OutOfMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "write transaction killed: its writes reached {} bytes, over its {} byte limit",
+            self.used, self.limit
+        )
+    }
+}
+
+impl std::error::Error for OutOfMemory {}
+
+/// A write tx's memory accounting: the estimated resident bytes of every
+/// change in its overlay.
+struct Budget {
+    used: usize,
+    limit: usize,
+    killed: Option<OutOfMemory>,
+}
+
+impl Budget {
+    /// Apply an entry's growth; returns true when that kills the tx.
+    fn grow(&mut self, delta: isize) -> bool {
+        self.used = self.used.saturating_add_signed(delta);
+        if self.used > self.limit && self.killed.is_none() {
+            self.killed = Some(OutOfMemory {
+                used: self.used,
+                limit: self.limit,
+            });
+            self.used = 0;
+            return true;
+        }
+        false
+    }
+}
+
+/// Estimated resident bytes of one overlay entry.
+fn change_bytes<K: ResidentSize, M: Merge>(key: &K, change: &Change<M>) -> usize
+where
+    M::Value: ResidentSize,
+{
+    let values = match change {
+        Change::Insert(v) | Change::Delete(v) => heap_size(v),
+        Change::Replace(old, new) => heap_size(old) + heap_size(new),
+        // never stored in an overlay: resolve materializes it first
+        Change::Modify(_) => 0,
+    };
+    key.resident_size() + size_of::<Change<M>>() + values + ENTRY_OVERHEAD
+}
 
 /// Typed, copyable name of a keyspace. The key and merge types travel
 /// with the id, so opening it as the wrong type is a compile error and
@@ -36,8 +97,9 @@ pub trait ErasedUnderlay: Any {
     fn is_empty(&self) -> bool;
     /// Turn this tx's changes into the committed form, a
     /// [`Resident`] of new values and tombstones, encoding each entry
-    /// into `wal` on the way when there is one.
-    fn seal(self: Box<Self>, wal: Option<&mut Vec<u8>>) -> Box<dyn Any + Send + Sync>;
+    /// into `wal` on the way when there is one. Also returns the tree's
+    /// estimated resident bytes.
+    fn seal(self: Box<Self>, wal: Option<&mut Vec<u8>>) -> (Box<dyn Any + Send + Sync>, usize);
 }
 
 /// A write transaction: this tx's materialized changes layered over a
@@ -49,37 +111,67 @@ pub trait ErasedUnderlay: Any {
 /// The tx holds the store's writer lock until it is finished or dropped.
 /// Dropping it without [`Store::finish`](crate::store::Store::finish)
 /// aborts: the overlay is discarded and nothing is logged.
+///
+/// Its writes count against a memory limit. A write that takes them over
+/// it kills the tx: every write so far is released, later writes fail with
+/// [`OutOfMemory`], and so does committing. Reads still work but no longer
+/// see the tx's own writes.
 pub struct WriteTx<'tx> {
     /// The epoch this tx will commit as: one past the snapshot's.
     epoch: u64,
     overlay: HashMap<u64, Box<dyn ErasedUnderlay>>,
+    budget: Budget,
     snapshot: Snapshot<'tx>,
     writer: MutexGuard<'tx, StoreWriter>,
 }
 
 impl<'tx> WriteTx<'tx> {
-    pub(crate) fn new(snapshot: Snapshot<'tx>, writer: MutexGuard<'tx, StoreWriter>) -> Self {
+    pub(crate) fn new(
+        snapshot: Snapshot<'tx>,
+        writer: MutexGuard<'tx, StoreWriter>,
+        memory_limit: usize,
+    ) -> Self {
         WriteTx {
             epoch: snapshot.epoch() + 1,
             overlay: HashMap::new(),
+            budget: Budget {
+                used: 0,
+                limit: memory_limit,
+                killed: None,
+            },
             snapshot,
             writer,
         }
+    }
+
+    /// Estimated bytes held by this tx's writes.
+    pub fn memory_used(&self) -> usize {
+        self.budget.used
+    }
+
+    /// Why this tx was killed, if it was.
+    pub fn killed(&self) -> Option<OutOfMemory> {
+        self.budget.killed
     }
     pub(crate) fn into_parts(
         self,
     ) -> (
         u64,
-        HashMap<u64, Box<dyn ErasedUnderlay>>,
+        Result<HashMap<u64, Box<dyn ErasedUnderlay>>, OutOfMemory>,
         Snapshot<'tx>,
         MutexGuard<'tx, StoreWriter>,
     ) {
         let WriteTx {
             epoch,
             overlay,
+            budget,
             snapshot,
             writer,
         } = self;
+        let overlay = match budget.killed {
+            Some(oom) => Err(oom),
+            None => Ok(overlay),
+        };
         (epoch, overlay, snapshot, writer)
     }
     pub fn epoch(&self) -> u64 {
@@ -99,6 +191,7 @@ pub struct KeyspaceHandle<K, M: Merge> {
 pub struct Keyspace<'a, 'tx, K, M: Merge> {
     id: KeyspaceId<K, M>,
     writes: &'a mut Register<K, M>,
+    budget: &'a mut Budget,
     snap: &'a Snapshot<'tx>,
 }
 
@@ -137,7 +230,8 @@ where
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
-    fn seal(self: Box<Self>, mut wal: Option<&mut Vec<u8>>) -> Box<dyn Any + Send + Sync> {
+    fn seal(self: Box<Self>, mut wal: Option<&mut Vec<u8>>) -> (Box<dyn Any + Send + Sync>, usize) {
+        let mut bytes = 0;
         // the register is sorted, so collect bulk-builds the tree
         let tree: Resident<K, M::Value> = self
             .inner
@@ -153,10 +247,11 @@ where
                     k.encode_ordered(out);
                     v.encode(out);
                 }
+                bytes += resident_entry_bytes(&k, &v);
                 (k, v)
             })
             .collect();
-        Box::new(tree)
+        (Box::new(tree), bytes)
     }
 }
 
@@ -178,12 +273,26 @@ where
         self.writes.is_empty()
     }
 
-    pub fn absorb(&mut self, key: K, change: Change<M>) {
+    /// Record a materialized change. Fails if the tx has been killed for
+    /// running out of memory, including by this write.
+    pub fn absorb(&mut self, key: K, change: Change<M>) -> Result<(), OutOfMemory> {
         debug_assert!(
             !matches!(change, Change::Modify(_)),
             "resolve before absorbing"
         );
-        self.writes.absorb_one(key, change);
+        if let Some(oom) = self.budget.killed {
+            return Err(oom);
+        }
+        let delta = self
+            .writes
+            .absorb_one_measured(key, change, change_bytes::<K, M>);
+        if self.budget.grow(delta) {
+            // release this keyspace's writes now; the tx drops the rest
+            // the next time it opens a keyspace, or when it ends
+            *self.writes = Register::new();
+            return Err(self.budget.killed.expect("just killed"));
+        }
+        Ok(())
     }
 
     /// Current value of `key` as seen by this transaction: the overlay
@@ -268,6 +377,10 @@ impl<'tx> WriteTx<'tx> {
         M: Merge,
         M::Value: Codec + Sync,
     {
+        if self.budget.killed.is_some() {
+            // a killed tx holds no writes
+            self.overlay.clear();
+        }
         let store = self.snapshot.store();
         let handle: &mut KeyspaceHandle<K, M> = self
             .overlay
@@ -282,6 +395,7 @@ impl<'tx> WriteTx<'tx> {
         Keyspace {
             id,
             writes: &mut handle.inner,
+            budget: &mut self.budget,
             snap: &self.snapshot,
         }
     }
@@ -302,11 +416,11 @@ mod tests {
             .unwrap();
         let mut tx = store.begin();
         let mut ks = tx.keyspace(KS);
-        ks.absorb(1, Change::Insert(10));
-        ks.absorb(2, Change::Insert(20));
+        ks.absorb(1, Change::Insert(10)).unwrap();
+        ks.absorb(2, Change::Insert(20)).unwrap();
         store.finish(tx).unwrap();
         let mut tx = store.begin();
-        tx.keyspace(KS).absorb(2, Change::Delete(20));
+        tx.keyspace(KS).absorb(2, Change::Delete(20)).unwrap();
         store.finish(tx).unwrap();
 
         let mut tx = store.begin();
@@ -318,13 +432,13 @@ mod tests {
         // a Modify resolves against the snapshot value
         let r = ks.resolve(&1, Change::Modify(5)).unwrap();
         assert!(matches!(r, Change::Replace(10, 15)));
-        ks.absorb(1, r);
+        ks.absorb(1, r).unwrap();
         assert_eq!(ks.get(&1).as_deref(), Some(&15), "overlay wins");
 
         // a Delete in the overlay shadows the snapshot
         let r = ks.resolve(&1, Change::Delete(0)).unwrap();
         assert!(matches!(r, Change::Delete(15)));
-        ks.absorb(1, r);
+        ks.absorb(1, r).unwrap();
         assert_eq!(ks.get(&1).as_deref(), None);
 
         // resolve_sorted mixes overlay hits and snapshot misses

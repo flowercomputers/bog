@@ -53,25 +53,43 @@ impl<K: Ord, M: Merge> Register<K, M> {
     /// Compose `change` onto whatever is already at `key`. Cancelling pairs
     /// (Insert then Delete) and no-op modifies drop the key entirely.
     pub fn absorb_one(&mut self, key: K, change: Change<M>) {
+        self.absorb_one_measured(key, change, |_, _| 0);
+    }
+
+    /// [`absorb_one`](Self::absorb_one), returning how much the key's entry
+    /// grew (or, negative, shrank) as measured by `size`. A key that is
+    /// added or removed counts its whole entry.
+    pub fn absorb_one_measured(
+        &mut self,
+        key: K,
+        change: Change<M>,
+        size: impl Fn(&K, &Change<M>) -> usize,
+    ) -> isize {
         if let Change::Modify(d) = &change {
             if M::noop(d) {
-                return;
+                return 0;
             }
         }
         match self.inner.entry(key) {
             Entry::Vacant(vac) => {
+                let after = size(vac.key(), &change);
                 vac.insert(change);
+                after as isize
             }
             Entry::Occupied(occ) => {
+                let before = size(occ.key(), occ.get()) as isize;
                 let (key, prev) = occ.remove_entry();
-                if let Some(c) = prev.compose(change) {
-                    if let Change::Modify(d) = &c {
-                        if M::noop(d) {
-                            return;
-                        }
+                let Some(c) = prev.compose(change) else {
+                    return -before;
+                };
+                if let Change::Modify(d) = &c {
+                    if M::noop(d) {
+                        return -before;
                     }
-                    self.inner.insert(key, c);
                 }
+                let after = size(&key, &c) as isize;
+                self.inner.insert(key, c);
+                after - before
             }
         }
     }
@@ -306,7 +324,11 @@ where
                 Change::Replace(o, n) if n.0 == 0 => Change::Delete(o),
                 r => r,
             };
-            ks.absorb(k.clone(), resolved.clone());
+            if ks.absorb(k.clone(), resolved.clone()).is_err() {
+                // the tx was killed for running out of memory; the graph
+                // stops at this node and the commit will be refused
+                return;
+            }
             out.absorb_one(k, resolved);
         }
     }
@@ -496,5 +518,38 @@ mod tests {
         assert_eq!(ks.get(&1).as_deref(), None);
         // insert then delete within one tx cancels out entirely
         assert!(ks.inner_is_empty());
+    }
+
+    #[test]
+    fn a_killed_tx_stops_the_graph_and_commits_nothing() {
+        let mut g = OpDag::new();
+        let src = g.source::<Bag<(u8, i64)>>();
+        const TOTALS: KeyspaceId<u8, (i64, i64)> = KeyspaceId::new(7);
+        let _sum = g.nary(&[src], Sum::<u8, i64>::new(TOTALS));
+        let store = StoreBuilder::new(DurabilityPolicy::NONE)
+            .keyspace(TOTALS)
+            .tx_memory_limit(2048)
+            .build()
+            .unwrap();
+
+        let mut b = Bag::new();
+        for k in 0..=255u8 {
+            b.push((k, 1), 1);
+        }
+        g.give(src, &mut b);
+        let mut tx = store.begin();
+        g.run(&mut tx);
+        assert!(tx.killed().is_some());
+        assert!(store.finish(tx).is_err());
+        assert_eq!(store.snapshot().get(TOTALS, &0), None);
+
+        // the graph is clean for the next epoch
+        let mut b = Bag::new();
+        b.push((3, 5), 1);
+        g.give(src, &mut b);
+        let mut tx = store.begin();
+        g.run(&mut tx);
+        assert_eq!(store.finish(tx).unwrap(), Some(1));
+        assert_eq!(store.snapshot().get(TOTALS, &3).as_deref(), Some(&(1, 5)));
     }
 }

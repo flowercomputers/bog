@@ -172,6 +172,13 @@ impl OpDag {
                 }
             }
 
+            // a tx killed for running out of memory will not commit, so
+            // nothing downstream needs to run
+            if tx.killed().is_some() {
+                self.pending.clear();
+                break;
+            }
+
             if !node.out.is_empty() {
                 self.pending.extend(node.children.iter());
             }

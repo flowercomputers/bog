@@ -33,8 +33,8 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"fold3sst";
 const FOOTER: usize = 8 + 8 + 8 + 4 + 8;
-/// A block is cut once its entries reach this many bytes.
-const BLOCK_TARGET: usize = 4096;
+/// The default block size: a block is cut once its entries reach this.
+pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4096;
 
 #[derive(Debug)]
 pub(crate) enum TableError {
@@ -75,6 +75,7 @@ struct BlockHandle {
 /// pushed in ascending encoded order within each.
 pub(crate) struct TableBuilder {
     out: BufWriter<File>,
+    block_size: usize,
     offset: u64,
     index: Vec<(u64, Vec<BlockHandle>)>,
     block: Vec<u8>,
@@ -82,16 +83,18 @@ pub(crate) struct TableBuilder {
 }
 
 impl TableBuilder {
-    /// Create a new table file; fails if it already exists.
-    pub fn create(path: &Path) -> io::Result<Self> {
+    /// Create a new table file; fails if it already exists. Blocks are cut
+    /// once their entries reach `block_size` bytes.
+    pub fn create(path: &Path, block_size: usize) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut out = BufWriter::new(file);
         out.write_all(MAGIC)?;
         Ok(TableBuilder {
             out,
+            block_size,
             offset: MAGIC.len() as u64,
             index: Vec::new(),
-            block: Vec::with_capacity(BLOCK_TARGET * 2),
+            block: Vec::with_capacity(block_size * 2),
             block_first: None,
         })
     }
@@ -114,7 +117,7 @@ impl TableBuilder {
         self.block.extend(key);
         self.block.extend((value.len() as u32).to_le_bytes());
         self.block.extend(value);
-        if self.block.len() >= BLOCK_TARGET {
+        if self.block.len() >= self.block_size {
             self.cut_block()?;
         }
         Ok(())
@@ -292,6 +295,15 @@ impl Table {
         &self.path
     }
 
+    /// Estimated bytes the in-memory index holds.
+    pub fn index_bytes(&self) -> usize {
+        self.index
+            .values()
+            .flatten()
+            .map(|b| size_of::<BlockHandle>() + b.first_key.len())
+            .sum()
+    }
+
     pub fn keyspaces(&self) -> impl Iterator<Item = u64> + '_ {
         self.index.keys().copied()
     }
@@ -464,6 +476,11 @@ impl BlockCache {
         Ok(block)
     }
 
+    /// Bytes of blocks currently cached.
+    pub fn used(&self) -> usize {
+        self.inner.lock().unwrap().used
+    }
+
     /// (bytes cached, blocks read from disk so far)
     #[cfg(test)]
     pub fn stats(&self) -> (usize, u64) {
@@ -488,7 +505,7 @@ mod tests {
 
     /// Keyspace 1 holds even keys 0..2000 over many blocks; keyspace 5 one key.
     fn build(path: &Path) {
-        let mut b = TableBuilder::create(path).unwrap();
+        let mut b = TableBuilder::create(path, DEFAULT_BLOCK_SIZE).unwrap();
         b.begin_keyspace(1).unwrap();
         for i in (0..2000).step_by(2) {
             b.push(&key(i), &[1, i as u8]).unwrap();
@@ -535,10 +552,10 @@ mod tests {
         t.get(1, &key(2), &cache).unwrap();
         assert_eq!(cache.stats().1, 1, "same block: one disk read");
 
-        let small = BlockCache::new(BLOCK_TARGET * 2);
+        let small = BlockCache::new(DEFAULT_BLOCK_SIZE * 2);
         for i in (0..2000).step_by(2) {
             assert!(t.get(1, &key(i), &small).unwrap().is_some());
-            assert!(small.stats().0 <= BLOCK_TARGET * 2);
+            assert!(small.stats().0 <= DEFAULT_BLOCK_SIZE * 2);
         }
         std::fs::remove_file(&path).unwrap();
     }

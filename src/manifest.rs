@@ -13,6 +13,7 @@
 //! fold3 manifest v1
 //! policy	write=always	fsync=every:1000000000ns
 //! next-file	3
+//! option	wal-limit	67108864
 //! keyspace	7	u8	(i64, i64)
 //! checkpoint	1	40
 //! wal	2	sealed	1234
@@ -40,6 +41,9 @@ pub(crate) struct Manifest {
     pub policy: DurabilityPolicy,
     /// Number for the next file created in the directory.
     pub next_file: u64,
+    /// The size limits the store was last opened with, by name.
+    /// Informational, like the policy.
+    pub options: BTreeMap<String, u64>,
     /// Keyspace id to (key type, merge type), as `std::any::type_name`.
     pub keyspaces: BTreeMap<u64, (String, String)>,
     /// Checkpoints oldest first. Each holds what changed after the previous
@@ -84,6 +88,7 @@ impl Manifest {
         Manifest {
             policy,
             next_file: 1,
+            options: BTreeMap::new(),
             keyspaces: BTreeMap::new(),
             checkpoints: Vec::new(),
             segments: Vec::new(),
@@ -116,6 +121,9 @@ impl Manifest {
             encode_cadence(&self.policy.fsync)
         ));
         s.push_str(&format!("next-file\t{}\n", self.next_file));
+        for (name, value) in &self.options {
+            s.push_str(&format!("option\t{name}\t{value}\n"));
+        }
         for (id, (key, merge)) in &self.keyspaces {
             s.push_str(&format!("keyspace\t{id}\t{key}\t{merge}\n"));
         }
@@ -142,6 +150,7 @@ impl Manifest {
         let mut policy = None;
         let mut next_file = None;
         let mut keyspaces = BTreeMap::new();
+        let mut options = BTreeMap::new();
         let mut checkpoints: Vec<Checkpoint> = Vec::new();
         let mut segments: Vec<Segment> = Vec::new();
 
@@ -167,6 +176,12 @@ impl Manifest {
                 ["next-file", num] => {
                     if next_file.replace(parse_u64(num).map_err(at)?).is_some() {
                         return Err(at("duplicate next-file".into()));
+                    }
+                }
+                ["option", name, value] => {
+                    let value = parse_u64(value).map_err(at)?;
+                    if options.insert(name.to_string(), value).is_some() {
+                        return Err(at(format!("duplicate option {name}")));
                     }
                 }
                 ["keyspace", id, key, merge] => {
@@ -214,6 +229,7 @@ impl Manifest {
         let manifest = Manifest {
             policy: policy.ok_or("manifest has no policy")?,
             next_file: next_file.ok_or("manifest has no next-file")?,
+            options,
             keyspaces,
             checkpoints,
             segments,
@@ -289,6 +305,7 @@ mod tests {
     fn round_trips() {
         let mut m = Manifest::new(DurabilityPolicy::periodic_sync(Duration::from_millis(1500)));
         m.next_file = 3;
+        m.options.insert("wal-limit".into(), 1 << 26);
         m.keyspaces.insert(7, ("u8".into(), "(i64, i64)".into()));
         m.checkpoints.push(Checkpoint {
             number: 0,

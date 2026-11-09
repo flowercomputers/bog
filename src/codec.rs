@@ -4,7 +4,6 @@ use std::fmt;
 
 pub use bytes::BufMut;
 
-
 // TODO: derive Codec, OrderedCodec needed
 
 /// Why a byte slice could not be decoded.
@@ -47,12 +46,101 @@ impl std::error::Error for DecodeError {}
 
 pub type Result<T, E = DecodeError> = std::result::Result<T, E>;
 
-pub trait Codec: Sized {
+/// How much memory a value occupies: its own `size_of` plus every heap
+/// allocation it owns. The store uses it to account for memory, so it is
+/// an estimate: allocator overhead is not counted, and shared allocations
+/// (`Rc`, `Arc`) are counted in full by every holder.
+pub trait ResidentSize {
+    fn resident_size(&self) -> usize;
+}
+
+/// The heap part of [`ResidentSize`]: what a value owns beyond its inline
+/// bytes. Containers sum this over their elements, since the elements'
+/// inline bytes are already in the container's own size.
+pub fn heap_size<T: ResidentSize>(x: &T) -> usize {
+    x.resident_size().saturating_sub(size_of::<T>())
+}
+
+macro_rules! impl_inline_resident {
+    ($($t:ty),* $(,)?) => {$(
+        impl ResidentSize for $t {
+            #[inline]
+            fn resident_size(&self) -> usize {
+                size_of::<Self>()
+            }
+        }
+    )*};
+}
+impl_inline_resident!(
+    (),
+    bool,
+    char,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize
+);
+
+impl<T: ResidentSize> ResidentSize for Option<T> {
+    fn resident_size(&self) -> usize {
+        size_of::<Self>() + self.as_ref().map_or(0, heap_size)
+    }
+}
+
+impl<T: ResidentSize, const N: usize> ResidentSize for [T; N] {
+    fn resident_size(&self) -> usize {
+        size_of::<Self>() + self.iter().map(heap_size).sum::<usize>()
+    }
+}
+
+impl<T: ResidentSize> ResidentSize for Vec<T> {
+    fn resident_size(&self) -> usize {
+        // the whole buffer is allocated, used or not
+        size_of::<Self>()
+            + self.capacity() * size_of::<T>()
+            + self.iter().map(heap_size).sum::<usize>()
+    }
+}
+
+impl ResidentSize for String {
+    fn resident_size(&self) -> usize {
+        size_of::<Self>() + self.capacity()
+    }
+}
+
+impl ResidentSize for Box<str> {
+    fn resident_size(&self) -> usize {
+        size_of::<Self>() + self.len()
+    }
+}
+
+impl ResidentSize for std::rc::Rc<str> {
+    fn resident_size(&self) -> usize {
+        // the allocation also holds the strong and weak counts
+        size_of::<Self>() + 2 * size_of::<usize>() + self.len()
+    }
+}
+
+impl ResidentSize for std::sync::Arc<str> {
+    fn resident_size(&self) -> usize {
+        size_of::<Self>() + 2 * size_of::<usize>() + self.len()
+    }
+}
+
+pub trait Codec: Sized + ResidentSize {
     fn encode(&self, out: &mut impl BufMut);
     fn decode(b: &mut &[u8]) -> Result<Self>;
     fn encode_size(&self) -> usize;
 }
-pub trait OrderedCodec: Ord + Sized {
+pub trait OrderedCodec: Ord + Sized + ResidentSize {
     fn encode_ordered(&self, out: &mut impl BufMut);
     fn decode_ordered(b: &mut &[u8]) -> Result<Self>;
     fn encode_ordered_size(&self) -> usize;
@@ -499,6 +587,11 @@ impl_str_codec!(String, Box<str>, std::rc::Rc<str>, std::sync::Arc<str>);
 
 macro_rules! impl_tuple_codec {
     ($($name:ident $idx:tt),+) => {
+        impl<$($name: ResidentSize),+> ResidentSize for ($($name,)+) {
+            fn resident_size(&self) -> usize {
+                size_of::<Self>() $( + heap_size(&self.$idx) )+
+            }
+        }
         impl<$($name: Codec),+> Codec for ($($name,)+) {
             fn encode(&self, out: &mut impl BufMut) { $( self.$idx.encode(out); )+ }
             fn decode(b: &mut &[u8]) -> Result<Self> {
@@ -532,3 +625,31 @@ impl_tuple_codec!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
 impl_tuple_codec!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
 // std only implements Ord to arity 12
 impl_tuple_codec!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
+
+#[cfg(test)]
+mod resident_size_tests {
+    use super::*;
+
+    #[test]
+    fn counts_inline_bytes_once_and_heap_bytes_in_full() {
+        assert_eq!(7u64.resident_size(), 8);
+        assert_eq!(().resident_size(), 0);
+        // padding is in the tuple's own size, not double counted
+        assert_eq!((1u8, 2u64).resident_size(), size_of::<(u8, u64)>());
+
+        let s = String::with_capacity(100);
+        assert_eq!(s.resident_size(), size_of::<String>() + 100);
+        let some = Some("x".repeat(10));
+        let cap = some.as_ref().unwrap().capacity();
+        assert_eq!(some.resident_size(), size_of::<Option<String>>() + cap);
+
+        let v: Vec<String> = vec!["abc".into(), "de".into()];
+        let want = size_of::<Vec<String>>()
+            + v.capacity() * size_of::<String>()
+            + v.iter().map(String::capacity).sum::<usize>();
+        assert_eq!(v.resident_size(), want);
+
+        let pair = (Box::<str>::from("hello"), 3i32);
+        assert_eq!(pair.resident_size(), size_of::<(Box<str>, i32)>() + 5);
+    }
+}
