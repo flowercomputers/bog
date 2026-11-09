@@ -128,7 +128,7 @@ pub trait ErasedUnderlay: Any {
     fn absorb_erased(&mut self, other: Box<dyn ErasedUnderlay>);
     fn is_empty(&self) -> bool;
     /// Turn this tx's changes into the committed form, a
-    /// [`Resident`] of new values and tombstones, encoding each entry
+    /// `Resident` of new values and tombstones, encoding each entry
     /// into `wal` on the way when there is one. Also returns the tree's
     /// estimated resident bytes.
     fn seal(self: Box<Self>, wal: Option<&mut Vec<u8>>) -> (Box<dyn Any + Send + Sync>, usize);
@@ -330,13 +330,6 @@ where
     }
 }
 
-impl<K: Ord + 'static, M: Merge> KeyspaceHandle<K, M> {
-    #[cfg(test)]
-    pub(crate) fn inner_is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
-
 impl<'a, 'tx, K, M> Keyspace<'a, 'tx, K, M>
 where
     K: OrderedCodec + Send + Sync + 'static,
@@ -434,7 +427,7 @@ where
         K: Clone,
         M::Value: PartialEq,
     {
-        let mut cursor = self.cursor(Bound::Unbounded, Bound::Unbounded);
+        let mut cursor = self.cursor(Bound::Unbounded, Bound::Unbounded, false);
         for (key, change) in changes {
             let old = cursor.seek_get(&key)?;
             if let Some(resolved) = materialize(old.as_deref(), change) {
@@ -450,7 +443,23 @@ where
     where
         K: Clone,
     {
-        self.cursor(range.start_bound(), range.end_bound().cloned())
+        self.cursor(
+            range.start_bound().cloned(),
+            range.end_bound().cloned(),
+            false,
+        )
+    }
+
+    /// [`range`](Self::range), in reverse key order.
+    pub fn range_rev(&self, range: impl RangeBounds<K>) -> Cursor<'_, K, M>
+    where
+        K: Clone,
+    {
+        self.cursor(
+            range.start_bound().cloned(),
+            range.end_bound().cloned(),
+            true,
+        )
     }
 
     /// The value of `key` as of the start of this graph run: what
@@ -474,13 +483,28 @@ where
     where
         K: Clone,
     {
-        let (lower, upper) = (range.start_bound(), range.end_bound().cloned());
+        self.cursor_old(range, false)
+    }
+
+    /// [`range_old`](Self::range_old), in reverse key order.
+    pub fn range_old_rev(&self, range: impl RangeBounds<K>) -> Cursor<'_, K, M>
+    where
+        K: Clone,
+    {
+        self.cursor_old(range, true)
+    }
+
+    fn cursor_old(&self, range: impl RangeBounds<K>, rev: bool) -> Cursor<'_, K, M>
+    where
+        K: Clone,
+    {
         self.snap.cursor_as_of(
             self.id,
             self.writes.map(),
             &*self.touched,
-            lower,
-            upper,
+            range.start_bound().cloned(),
+            range.end_bound().cloned(),
+            rev,
             Some(self.state),
         )
     }
@@ -524,7 +548,7 @@ where
         }
     }
 
-    fn cursor(&self, lower: Bound<&K>, upper: Bound<K>) -> Cursor<'_, K, M>
+    fn cursor(&self, lower: Bound<K>, upper: Bound<K>, rev: bool) -> Cursor<'_, K, M>
     where
         K: Clone,
     {
@@ -533,6 +557,7 @@ where
             Some(self.writes.map()),
             lower,
             upper,
+            rev,
             Some(self.state),
         )
     }

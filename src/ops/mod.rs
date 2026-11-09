@@ -24,7 +24,7 @@ use crate::{
     Bag, Binary, Buffer, Change, Delta, Merge, Nary, Register, Unary,
     codec::OrderedCodec,
     error::Result,
-    state::{Arranged, Arrangement, Declare, State, When},
+    state::{Arranged, Arrangement, Declare, Edge, State, When},
     tx::{KeyspaceId, WriteTx},
 };
 
@@ -44,7 +44,7 @@ pub trait Key: OrderedCodec + Clone + Send + Sync + 'static {}
 impl<T: OrderedCodec + Clone + Send + Sync + 'static> Key for T {}
 
 /// Scratch for resolving changes to an [`Arrangement`].
-pub(crate) type Resolved<K, V> = Vec<((K, Option<V>), Change<Delta>)>;
+pub(crate) type Resolved<K, V> = Vec<((K, Edge<V>), Change<Delta>)>;
 
 /// Read `key`'s rows from state `s` into `out`, ascending by value, as
 /// `take` says.
@@ -57,16 +57,20 @@ pub(crate) fn read_group<S: State>(
     out: &mut Vec<(S::Value, Delta)>,
 ) -> Result<()> {
     out.clear();
-    s.group(tx, key, when, &mut |v, d| {
-        out.push((v.clone(), d));
-        !matches!(take, Take::First(n) if out.len() >= n)
-    })?;
-    // todo: a reverse cursor would read only the last n
-    if let Take::Last(n) = take {
-        let extra = out.len().saturating_sub(n);
-        out.drain(..extra);
+    match take {
+        Take::Whole | Take::First(_) => s.group(tx, key, when, &mut |v, d| {
+            out.push((v.clone(), d));
+            !matches!(take, Take::First(n) if out.len() >= n)
+        }),
+        Take::Last(n) => {
+            s.group_rev(tx, key, when, &mut |v, d| {
+                out.push((v.clone(), d));
+                out.len() < n
+            })?;
+            out.reverse();
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// The distinct keys of `delta`'s rows, in order.
@@ -120,19 +124,25 @@ pub(crate) fn multiply(a: Delta, b: Delta) -> Delta {
 }
 
 /// Keeps rows `(K, V)` grouped by key, at their multiplicity, in
-/// `arrangement`, and passes them on. Its [`Arranged`] state is what
-/// joins, semijoins and reductions over rows read, and several of them
-/// can share one.
+/// `arrangement`, and each key's total multiplicity in `totals`, and
+/// passes the rows on. Its [`Arranged`] state is what joins, semijoins,
+/// foreign keys and reductions over rows read, and several of them can
+/// share one. The totals make "is this key present" one lookup, and are
+/// a count per key.
 pub struct Arrange<K, V> {
     id: Arrangement<K, V>,
+    totals: KeyspaceId<K, Delta>,
     resolved: Resolved<K, V>,
+    resolved_totals: Vec<(K, Change<Delta>)>,
 }
 
 impl<K, V> Arrange<K, V> {
-    pub fn new(arrangement: Arrangement<K, V>) -> Self {
+    pub fn new(arrangement: Arrangement<K, V>, totals: KeyspaceId<K, Delta>) -> Self {
         Arrange {
             id: arrangement,
+            totals,
             resolved: Vec::new(),
+            resolved_totals: Vec::new(),
         }
     }
 }
@@ -143,22 +153,25 @@ impl<K: Key, V: Key + Ord> Nary for Arrange<K, V> {
     type State = Arranged<K, V>;
 
     fn state(&self) -> Arranged<K, V> {
-        Arranged::new(self.id)
+        Arranged::new(self.id, Some(self.totals))
     }
 
     fn keyspaces(&self) -> Vec<Declare> {
-        vec![Declare::derived(self.id)]
+        vec![Declare::derived(self.id), Declare::derived(self.totals)]
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<(K, V)>], out: &mut Bag<(K, V)>) {
-        let mut rows = Bag::new();
+        let (mut rows, mut totals) = (Bag::new(), Bag::new());
         for b in batches {
             for ((k, v), d) in b.diffs() {
-                rows.push((k.clone(), Some(v.clone())), d);
+                rows.push((k.clone(), Edge::Val(v.clone())), d);
+                totals.push(k.clone(), d);
                 out.push((k.clone(), v.clone()), d);
             }
         }
-        if update_counts(tx, self.id, rows, &mut self.resolved).is_err() {
+        let done = update_counts(tx, self.id, rows, &mut self.resolved)
+            .and_then(|()| update_counts(tx, self.totals, totals, &mut self.resolved_totals));
+        if done.is_err() {
             // the tx failed; the graph stops here
             out.clear();
         }

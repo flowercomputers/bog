@@ -31,7 +31,7 @@ use std::{
 
 use crate::{
     codec::{Codec, DecodeError, OrderedCodec, decode_all, decode_all_ordered},
-    cursor::{Cursor, Source},
+    cursor::{Cursor, Source, empty_bounds},
     error::{Error, Result},
     merge::Merge,
     store::Resident,
@@ -328,13 +328,26 @@ where
     /// without the keys it deleted. Newer runs may overwrite or delete
     /// any of them.
     pub fn range(&self, range: impl RangeBounds<K>) -> Cursor<'a, K, M> {
-        let lower = range.start_bound();
-        let upper = range.end_bound().cloned();
-        let source = match &self.run {
-            Run::Layer { tree, .. } => Source::layer(tree, lower),
-            Run::Table { table, ks, cache } => Source::table(table.cursor(*ks, Some(cache)), *ks),
-        };
-        Cursor::new(vec![source], lower, upper, None)
+        self.cursor(range, false)
+    }
+
+    /// [`range`](Self::range), in reverse key order.
+    pub fn range_rev(&self, range: impl RangeBounds<K>) -> Cursor<'a, K, M> {
+        self.cursor(range, true)
+    }
+
+    fn cursor(&self, range: impl RangeBounds<K>, rev: bool) -> Cursor<'a, K, M> {
+        let (lower, upper) = (range.start_bound().cloned(), range.end_bound().cloned());
+        let mut sources = Vec::new();
+        if !empty_bounds(lower.as_ref(), upper.as_ref()) {
+            sources.push(match &self.run {
+                Run::Layer { tree, .. } => Source::layer(tree, lower.as_ref(), upper.as_ref(), rev),
+                Run::Table { table, ks, cache } => {
+                    Source::table(table.cursor(*ks, Some(cache)), *ks, rev)
+                }
+            });
+        }
+        Cursor::new(sources, lower, upper, rev, None)
     }
 }
 

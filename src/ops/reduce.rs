@@ -9,7 +9,7 @@ use crate::{
     Bag, Change, Delta, Mergeless, Nary, Register,
     codec::Codec,
     error::Result,
-    state::{Arranged, Arrangement, Declare, State, Stored, When},
+    state::{Arranged, Arrangement, Declare, Edge, State, Stored, When},
     tx::{KeyspaceId, WriteTx},
 };
 
@@ -198,7 +198,7 @@ where
             dirty.sort();
             dirty.dedup();
         }
-        let output = Arranged::new(self.output);
+        let output = Arranged::new(self.output, None);
         let mut corrections = Bag::new();
         for k in dirty {
             read_group(&self.parent, tx, &k, When::New, self.take, &mut self.vals)?;
@@ -206,16 +206,19 @@ where
                 self.fresh.clear();
                 (self.logic)(&k, &self.vals, &mut self.fresh);
                 for (o, d) in self.fresh.drain(..) {
-                    corrections.push((k.clone(), Some(o)), d);
+                    corrections.push((k.clone(), Edge::Val(o)), d);
                 }
             }
             read_group(&output, tx, &k, When::New, Take::Whole, &mut self.old)?;
             for (o, d) in self.old.drain(..) {
-                corrections.push((k.clone(), Some(o)), -d);
+                corrections.push((k.clone(), Edge::Val(o)), -d);
             }
         }
         for ((k, o), d) in corrections.diffs() {
-            out.push((k.clone(), o.clone().expect("outputs are values")), d);
+            let Edge::Val(o) = o else {
+                unreachable!("corrections are values")
+            };
+            out.push((k.clone(), o.clone()), d);
         }
         update_counts(tx, self.output, corrections, &mut self.resolved)
     }
@@ -233,7 +236,7 @@ where
     type State = Arranged<S::Key, O>;
 
     fn state(&self) -> Self::State {
-        Arranged::new(self.output)
+        Arranged::new(self.output, None)
     }
 
     fn keyspaces(&self) -> Vec<Declare> {

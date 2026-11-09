@@ -7,7 +7,7 @@ use crate::{
     tx::WriteTx,
 };
 
-use super::{Take, multiply, read_group, rows_by_key};
+use super::{multiply, rows_by_key};
 
 /// Pairs each left row `(k, a)` with every right row `(k, b)` and emits
 /// `logic(&k, &a, &b)` at the product of their multiplicities: SQL's
@@ -47,24 +47,31 @@ where
         r: &R::Delta,
         out: &mut Bag<O>,
     ) -> Result<()> {
-        let mut group_b = Vec::new();
-        for (k, rows) in rows_by_key::<L>(l) {
-            read_group(&self.right, tx, &k, When::Old, Take::Whole, &mut group_b)?;
-            for (a, da) in &rows {
-                for (b, db) in &group_b {
-                    out.push((self.logic)(&k, a, b), multiply(*da, *db));
+        // ΔA ⋈ B_old: every dirty left key's rows against the right group
+        let left = rows_by_key::<L>(l);
+        let keys: Vec<L::Key> = left.iter().map(|(k, _)| k.clone()).collect();
+        let mut rows = left.iter().peekable();
+        let logic = &mut self.logic;
+        self.right.groups(tx, &keys, When::Old, &mut |k, b, db| {
+            while rows.next_if(|(lk, _)| lk < k).is_some() {}
+            if let Some((_, group)) = rows.peek() {
+                for (a, da) in group {
+                    out.push(logic(k, a, b), multiply(*da, db));
                 }
             }
-        }
-        let mut group_a = Vec::new();
-        for (k, rows) in rows_by_key::<R>(r) {
-            read_group(&self.left, tx, &k, When::New, Take::Whole, &mut group_a)?;
-            for (b, db) in &rows {
-                for (a, da) in &group_a {
-                    out.push((self.logic)(&k, a, b), multiply(*da, *db));
+        })?;
+        // A_new ⋈ ΔB
+        let right = rows_by_key::<R>(r);
+        let keys: Vec<L::Key> = right.iter().map(|(k, _)| k.clone()).collect();
+        let mut rows = right.iter().peekable();
+        self.left.groups(tx, &keys, When::New, &mut |k, a, da| {
+            while rows.next_if(|(rk, _)| rk < k).is_some() {}
+            if let Some((_, group)) = rows.peek() {
+                for (b, db) in group {
+                    out.push(logic(k, a, b), multiply(da, *db));
                 }
             }
-        }
+        })?;
         Ok(())
     }
 }

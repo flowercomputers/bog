@@ -10,11 +10,7 @@
 //! entries are compared as encoded bytes when seeking and decoded only when
 //! they become a source's head.
 
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, btree_map},
-    ops::Bound,
-};
+use std::{borrow::Cow, collections::BTreeMap, ops::Bound};
 
 use crate::{
     Change,
@@ -28,12 +24,42 @@ use crate::{
 
 type Entry<'a, K, V> = (Cow<'a, K>, Option<Cow<'a, V>>);
 
+type Pairs<'a, K, V> = std::iter::Peekable<Box<dyn Iterator<Item = (&'a K, &'a V)> + 'a>>;
+
+/// `map`'s entries within the bounds, walked forward or, with `rev`,
+/// backward.
+fn pairs<'a, K: Ord, V>(
+    map: &'a BTreeMap<K, V>,
+    lower: Bound<&K>,
+    upper: Bound<&K>,
+    rev: bool,
+) -> Pairs<'a, K, V> {
+    let range = map.range::<K, _>((lower, upper));
+    let it: Box<dyn Iterator<Item = (&'a K, &'a V)> + 'a> = if rev {
+        Box::new(range.rev())
+    } else {
+        Box::new(range)
+    };
+    it.peekable()
+}
+
+/// Whether no key can lie within the bounds.
+pub(crate) fn empty_bounds<K: Ord>(lower: Bound<&K>, upper: Bound<&K>) -> bool {
+    match (lower, upper) {
+        (Bound::Included(l), Bound::Included(u)) => l > u,
+        (Bound::Included(l) | Bound::Excluded(l), Bound::Excluded(u))
+        | (Bound::Excluded(l), Bound::Included(u)) => l >= u,
+        _ => false,
+    }
+}
+
 pub(crate) enum Source<'a, K, M: Merge> {
     /// A write tx's own changes; a Delete is a tombstone.
     Overlay {
         map: &'a BTreeMap<K, Change<M>>,
-        it: btree_map::Range<'a, K, Change<M>>,
+        it: Pairs<'a, K, Change<M>>,
         head: Option<(&'a K, &'a Change<M>)>,
+        rev: bool,
     },
     /// A write tx's changes as of the start of a graph run: `map`, with
     /// each key in `prior` as it was before the run. A key the overlay
@@ -41,21 +67,24 @@ pub(crate) enum Source<'a, K, M: Merge> {
     OverlayAsOf {
         map: &'a BTreeMap<K, Change<M>>,
         prior: &'a BTreeMap<K, Option<Change<M>>>,
-        it: std::iter::Peekable<btree_map::Range<'a, K, Change<M>>>,
-        pit: std::iter::Peekable<btree_map::Range<'a, K, Option<Change<M>>>>,
+        it: Pairs<'a, K, Change<M>>,
+        pit: Pairs<'a, K, Option<Change<M>>>,
         head: Option<(&'a K, &'a Change<M>)>,
+        rev: bool,
     },
     /// A committed layer in memory.
     Layer {
         map: &'a Resident<K, M::Value>,
-        it: btree_map::Range<'a, K, Option<M::Value>>,
+        it: Pairs<'a, K, Option<M::Value>>,
         head: Option<(&'a K, &'a Option<M::Value>)>,
+        rev: bool,
     },
     /// A checkpoint table, started lazily since reading it can fail.
     Table {
         cursor: TableCursor<'a>,
         ks: u64,
         head: Option<(K, Option<M::Value>)>,
+        rev: bool,
     },
 }
 
@@ -65,23 +94,31 @@ where
     M: Merge,
     M::Value: Codec,
 {
-    pub fn overlay(map: &'a BTreeMap<K, Change<M>>, lower: Bound<&K>) -> Self {
-        let mut it = map.range::<K, _>((lower, Bound::Unbounded));
+    pub fn overlay(
+        map: &'a BTreeMap<K, Change<M>>,
+        lower: Bound<&K>,
+        upper: Bound<&K>,
+        rev: bool,
+    ) -> Self {
+        let mut it = pairs(map, lower, upper, rev);
         let head = it.next();
-        Source::Overlay { map, it, head }
+        Source::Overlay { map, it, head, rev }
     }
 
     pub fn overlay_as_of(
         map: &'a BTreeMap<K, Change<M>>,
         prior: &'a BTreeMap<K, Option<Change<M>>>,
         lower: Bound<&K>,
+        upper: Bound<&K>,
+        rev: bool,
     ) -> Self {
         let mut s = Source::OverlayAsOf {
             map,
             prior,
-            it: map.range::<K, _>((lower, Bound::Unbounded)).peekable(),
-            pit: prior.range::<K, _>((lower, Bound::Unbounded)).peekable(),
+            it: pairs(map, lower, upper, rev),
+            pit: pairs(prior, lower, upper, rev),
             head: None,
+            rev,
         };
         s.next_as_of();
         s
@@ -89,14 +126,18 @@ where
 
     /// Move an [`OverlayAsOf`](Source::OverlayAsOf) to its next entry.
     fn next_as_of(&mut self) {
-        let Source::OverlayAsOf { it, pit, head, .. } = self else {
+        let Source::OverlayAsOf {
+            it, pit, head, rev, ..
+        } = self
+        else {
             unreachable!("only for overlays as of a run")
         };
+        let rev = *rev;
         *head = loop {
             match (it.peek(), pit.peek()) {
                 (None, None) => break None,
                 (Some(_), None) => break it.next(),
-                (Some((k, _)), Some((p, _))) if k < p => break it.next(),
+                (Some((k, _)), Some((p, _))) if (k < p) != rev && k != p => break it.next(),
                 (a, Some((p, prior))) => {
                     let (p, prior) = (*p, *prior);
                     if a.is_some_and(|(k, _)| *k == p) {
@@ -112,17 +153,23 @@ where
         };
     }
 
-    pub fn layer(map: &'a Resident<K, M::Value>, lower: Bound<&K>) -> Self {
-        let mut it = map.range::<K, _>((lower, Bound::Unbounded));
+    pub fn layer(
+        map: &'a Resident<K, M::Value>,
+        lower: Bound<&K>,
+        upper: Bound<&K>,
+        rev: bool,
+    ) -> Self {
+        let mut it = pairs(map, lower, upper, rev);
         let head = it.next();
-        Source::Layer { map, it, head }
+        Source::Layer { map, it, head, rev }
     }
 
-    pub fn table(cursor: TableCursor<'a>, ks: u64) -> Self {
+    pub fn table(cursor: TableCursor<'a>, ks: u64, rev: bool) -> Self {
         Source::Table {
             cursor,
             ks,
             head: None,
+            rev,
         }
     }
 
@@ -162,17 +209,30 @@ where
         }
     }
 
-    /// Position a table source at the lower bound. Memory sources start
-    /// positioned.
-    fn start(&mut self, lower: &Bound<Vec<u8>>) -> Result<()> {
-        if let Source::Table { cursor, .. } = self {
-            match lower {
-                Bound::Unbounded => cursor.start()?,
-                Bound::Included(probe) => cursor.seek(probe)?,
-                Bound::Excluded(probe) => {
-                    cursor.seek(probe)?;
-                    if cursor.current().is_some_and(|(k, _)| k == &probe[..]) {
-                        cursor.advance()?;
+    /// Position a table source at its first entry within the bounds,
+    /// given encoded. Memory sources start positioned.
+    fn start(&mut self, lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>) -> Result<()> {
+        if let Source::Table { cursor, rev, .. } = self {
+            if *rev {
+                match upper {
+                    Bound::Unbounded => cursor.start_back()?,
+                    Bound::Included(probe) => cursor.seek_back(probe)?,
+                    Bound::Excluded(probe) => {
+                        cursor.seek_back(probe)?;
+                        if cursor.current().is_some_and(|(k, _)| k == &probe[..]) {
+                            cursor.retreat()?;
+                        }
+                    }
+                }
+            } else {
+                match lower {
+                    Bound::Unbounded => cursor.start()?,
+                    Bound::Included(probe) => cursor.seek(probe)?,
+                    Bound::Excluded(probe) => {
+                        cursor.seek(probe)?;
+                        if cursor.current().is_some_and(|(k, _)| k == &probe[..]) {
+                            cursor.advance()?;
+                        }
                     }
                 }
             }
@@ -186,23 +246,41 @@ where
             Source::Overlay { it, head, .. } => *head = it.next(),
             Source::OverlayAsOf { .. } => self.next_as_of(),
             Source::Layer { it, head, .. } => *head = it.next(),
-            Source::Table { cursor, .. } => {
-                cursor.advance()?;
+            Source::Table { cursor, rev, .. } => {
+                if *rev {
+                    cursor.retreat()?;
+                } else {
+                    cursor.advance()?;
+                }
                 self.decode_head()?;
             }
         }
         Ok(())
     }
 
-    /// Move forward to the first key at or past `key` (`probe` is its
-    /// encoding). Never moves backward.
+    /// Move to the first key at or past `key` (`probe` is its encoding),
+    /// in the source's direction. Never moves back.
     fn seek(&mut self, key: &K, probe: &[u8]) -> Result<()> {
-        if self.head_key().is_none_or(|k| k >= key) {
+        let rev = match self {
+            Source::Overlay { rev, .. }
+            | Source::OverlayAsOf { rev, .. }
+            | Source::Layer { rev, .. }
+            | Source::Table { rev, .. } => *rev,
+        };
+        if self
+            .head_key()
+            .is_none_or(|k| if rev { k <= key } else { k >= key })
+        {
             return Ok(());
         }
+        let (lower, upper) = if rev {
+            (Bound::Unbounded, Bound::Included(key))
+        } else {
+            (Bound::Included(key), Bound::Unbounded)
+        };
         match self {
-            Source::Overlay { map, it, head } => {
-                *it = map.range::<K, _>((Bound::Included(key), Bound::Unbounded));
+            Source::Overlay { map, it, head, .. } => {
+                *it = pairs(map, lower, upper, rev);
                 *head = it.next();
             }
             Source::OverlayAsOf {
@@ -212,20 +290,20 @@ where
                 pit,
                 ..
             } => {
-                *it = map
-                    .range::<K, _>((Bound::Included(key), Bound::Unbounded))
-                    .peekable();
-                *pit = prior
-                    .range::<K, _>((Bound::Included(key), Bound::Unbounded))
-                    .peekable();
+                *it = pairs(map, lower, upper, rev);
+                *pit = pairs(prior, lower, upper, rev);
                 self.next_as_of();
             }
-            Source::Layer { map, it, head } => {
-                *it = map.range::<K, _>((Bound::Included(key), Bound::Unbounded));
+            Source::Layer { map, it, head, .. } => {
+                *it = pairs(map, lower, upper, rev);
                 *head = it.next();
             }
             Source::Table { cursor, .. } => {
-                cursor.seek(probe)?;
+                if rev {
+                    cursor.seek_back(probe)?;
+                } else {
+                    cursor.seek(probe)?;
+                }
                 self.decode_head()?;
             }
         }
@@ -233,7 +311,10 @@ where
     }
 
     fn decode_head(&mut self) -> Result<()> {
-        let Source::Table { cursor, ks, head } = self else {
+        let Source::Table {
+            cursor, ks, head, ..
+        } = self
+        else {
             return Ok(());
         };
         *head = match cursor.current() {
@@ -250,20 +331,34 @@ where
     }
 }
 
-/// Merged iteration over one keyspace, in key order, skipping tombstones.
-/// Yields `(key, value)`; values from memory are borrowed, values from disk
-/// are owned.
+/// Merged iteration over one keyspace, in key order or, made with `rev`,
+/// in reverse, skipping tombstones. Yields `(key, value)`; values from
+/// memory are borrowed, values from disk are owned.
 ///
 /// Iterating a write tx's keyspace sees the tx's own writes. An error from
 /// a tx's cursor fails the tx, as any read error does.
 pub struct Cursor<'a, K, M: Merge> {
     sources: Vec<Source<'a, K, M>>,
-    lower: Bound<Vec<u8>>,
+    lower: Bound<K>,
     upper: Bound<K>,
+    rev: bool,
     started: bool,
     done: bool,
     probe: Vec<u8>,
     tx: Option<&'a TxState>,
+}
+
+fn encode_bound<K: OrderedCodec>(b: &Bound<K>) -> Bound<Vec<u8>> {
+    let encode = |k: &K| {
+        let mut b = Vec::with_capacity(k.encode_ordered_size());
+        k.encode_ordered(&mut b);
+        b
+    };
+    match b {
+        Bound::Included(k) => Bound::Included(encode(k)),
+        Bound::Excluded(k) => Bound::Excluded(encode(k)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
 }
 
 impl<'a, K, M> Cursor<'a, K, M>
@@ -272,27 +367,20 @@ where
     M: Merge,
     M::Value: Codec,
 {
-    /// `sources` newest first, memory sources already at `lower`.
+    /// `sources` newest first, memory sources already positioned within
+    /// the bounds in the cursor's direction.
     pub(crate) fn new(
         sources: Vec<Source<'a, K, M>>,
-        lower: Bound<&K>,
+        lower: Bound<K>,
         upper: Bound<K>,
+        rev: bool,
         tx: Option<&'a TxState>,
     ) -> Self {
-        let encode = |k: &K| {
-            let mut b = Vec::with_capacity(k.encode_ordered_size());
-            k.encode_ordered(&mut b);
-            b
-        };
-        let lower = match lower {
-            Bound::Included(k) => Bound::Included(encode(k)),
-            Bound::Excluded(k) => Bound::Excluded(encode(k)),
-            Bound::Unbounded => Bound::Unbounded,
-        };
         Cursor {
             sources,
             lower,
             upper,
+            rev,
             started: false,
             done: false,
             probe: Vec::new(),
@@ -312,8 +400,9 @@ where
         }
         if !self.started {
             self.started = true;
+            let (lower, upper) = (encode_bound(&self.lower), encode_bound(&self.upper));
             for s in &mut self.sources {
-                s.start(&self.lower)?;
+                s.start(&lower, &upper)?;
             }
         }
         Ok(())
@@ -328,13 +417,17 @@ where
         e
     }
 
-    /// The next entry in key order, tombstones included.
+    /// The next entry in the cursor's order, tombstones included.
     fn next_entry(&mut self) -> Result<Option<Entry<'a, K, M::Value>>> {
         self.start()?;
+        let rev = self.rev;
         let mut win: Option<usize> = None;
         for (i, s) in self.sources.iter().enumerate() {
             if let Some(k) = s.head_key()
-                && win.is_none_or(|w| k < self.sources[w].head_key().unwrap())
+                && win.is_none_or(|w| {
+                    let best = self.sources[w].head_key().unwrap();
+                    if rev { k > best } else { k < best }
+                })
             {
                 win = Some(i);
             }
@@ -344,10 +437,18 @@ where
         };
         let past_end = {
             let k = self.sources[w].head_key().unwrap();
-            match &self.upper {
-                Bound::Included(u) => k > u,
-                Bound::Excluded(u) => k >= u,
-                Bound::Unbounded => false,
+            if rev {
+                match &self.lower {
+                    Bound::Included(l) => k < l,
+                    Bound::Excluded(l) => k <= l,
+                    Bound::Unbounded => false,
+                }
+            } else {
+                match &self.upper {
+                    Bound::Included(u) => k > u,
+                    Bound::Excluded(u) => k >= u,
+                    Bound::Unbounded => false,
+                }
             }
         };
         if past_end {
@@ -367,21 +468,28 @@ where
         Ok(entry)
     }
 
-    /// The value of `key`, moving the cursor forward to it. Lookups must
-    /// come in ascending key order; that is what makes a batch of them one
-    /// sequential pass.
-    pub fn seek_get(&mut self, key: &K) -> Result<Option<Cow<'a, M::Value>>> {
-        let res = self.seek_get_inner(key);
+    /// Move to `key`, or past it in the cursor's direction if it is absent,
+    /// so iteration resumes there. Seeks must follow the cursor's
+    /// direction; that is what makes a batch of them one sequential pass.
+    pub(crate) fn seek(&mut self, key: &K) -> Result<()> {
+        let res = self.seek_inner(key);
         res.map_err(|e| self.fail(e))
     }
 
-    fn seek_get_inner(&mut self, key: &K) -> Result<Option<Cow<'a, M::Value>>> {
+    fn seek_inner(&mut self, key: &K) -> Result<()> {
         self.start()?;
         self.probe.clear();
         key.encode_ordered(&mut self.probe);
         for s in &mut self.sources {
             s.seek(key, &self.probe)?;
         }
+        Ok(())
+    }
+
+    /// The value of `key`, moving the cursor to it. Lookups must come in
+    /// the cursor's order.
+    pub fn seek_get(&mut self, key: &K) -> Result<Option<Cow<'a, M::Value>>> {
+        self.seek(key)?;
         Ok(self
             .sources
             .iter()

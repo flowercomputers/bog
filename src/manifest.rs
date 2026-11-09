@@ -1,3 +1,4 @@
+#![allow(clippy::tabs_in_doc_comments)]
 //! The manifest: a small text file naming the store's config, its declared
 //! keyspaces, and its live files. It is the root of recovery. Open reads it
 //! to learn which WAL segments to replay and what types to decode them as,

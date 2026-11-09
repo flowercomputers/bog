@@ -21,7 +21,7 @@ use arc_swap::ArcSwap;
 use crate::{
     Change,
     codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
-    cursor::{Cursor, Source},
+    cursor::{Cursor, Source, empty_bounds},
     error::{Error, IoContext, Result},
     graph::Fingerprint,
     index::{Aux, EncodedBuilder, IndexKind, IndexedRun, LayerIndexes, Run, RunIndex, table_index},
@@ -34,7 +34,7 @@ use crate::{
 
 /// Size limits. Memory use is estimated with [`ResidentSize`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct StoreOptions {
+pub struct StoreOptions {
     /// Checkpoint once the WAL that open would replay reaches this many
     /// bytes.
     pub wal_limit: u64,
@@ -118,7 +118,7 @@ impl StoreOptions {
 
 /// Where the store's memory goes, and how much WAL the next open replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MemoryStats {
+pub struct MemoryStats {
     /// Committed data held in memory, not yet checkpointed. Layers pinned
     /// only by old snapshots are not counted.
     pub memtable_bytes: usize,
@@ -154,7 +154,7 @@ pub(crate) enum DurabilityPolicyCadence {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct DurabilityPolicy {
+pub struct DurabilityPolicy {
     // Write(), i.e. the os has the data, durable to process crash
     pub(crate) write: DurabilityPolicyCadence,
     // Fsync/Fullsync; data is on the disk/durable to power loss
@@ -446,11 +446,10 @@ impl StoreWriter {
         if let Some(wal) = self.wal.as_mut() {
             wal.buffer.clear();
         }
-        let e = self
-            .poisoned
+
+        self.poisoned
             .get_or_insert(Error::Poisoned(Arc::new(cause)))
-            .clone();
-        e
+            .clone()
     }
 
     /// Make `next` the live manifest. A failure that leaves the old one
@@ -548,7 +547,7 @@ impl<'s> Snapshot<'s> {
     /// The newest committed value of `key`: the first layer, newest first,
     /// that mentions the key decides, then the first table, newest first.
     /// A tombstone there means absent.
-    pub(crate) fn get<K, M>(
+    pub fn get<K, M>(
         &self,
         keyspace: KeyspaceId<K, M>,
         key: &K,
@@ -592,7 +591,7 @@ impl<'s> Snapshot<'s> {
     }
 
     /// The live entries of `keyspace` with keys in `range`, in key order.
-    pub(crate) fn range<K, M>(
+    pub fn range<K, M>(
         &self,
         keyspace: KeyspaceId<K, M>,
         range: impl RangeBounds<K>,
@@ -602,19 +601,29 @@ impl<'s> Snapshot<'s> {
         M: Merge,
         M::Value: Codec,
     {
-        self.cursor(
-            keyspace,
-            None,
-            range.start_bound(),
-            range.end_bound().cloned(),
-            None,
-        )
+        let (lower, upper) = (range.start_bound().cloned(), range.end_bound().cloned());
+        self.cursor(keyspace, None, lower, upper, false, None)
+    }
+
+    /// [`range`](Self::range), in reverse key order.
+    pub fn range_rev<K, M>(
+        &self,
+        keyspace: KeyspaceId<K, M>,
+        range: impl RangeBounds<K>,
+    ) -> Cursor<'_, K, M>
+    where
+        K: OrderedCodec + Clone + 'static,
+        M: Merge,
+        M::Value: Codec,
+    {
+        let (lower, upper) = (range.start_bound().cloned(), range.end_bound().cloned());
+        self.cursor(keyspace, None, lower, upper, true, None)
     }
 
     /// Every run of `keyspace`, newest first, each with its index of type
     /// `I`, which must be registered on the keyspace. Indexes not built yet
     /// are built, or loaded from their table, now.
-    pub(crate) fn runs_indexed<K, M, I>(
+    pub fn runs_indexed<K, M, I>(
         &self,
         keyspace: KeyspaceId<K, M>,
     ) -> Result<Vec<IndexedRun<'_, K, M, I>>>
@@ -672,13 +681,15 @@ impl<'s> Snapshot<'s> {
 
     /// A merged cursor over `keyspace` with a write tx's changes as of the
     /// start of a graph run on top; see [`Source::overlay_as_of`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn cursor_as_of<'a, K, M>(
         &'a self,
         keyspace: KeyspaceId<K, M>,
         overlay: &'a BTreeMap<K, Change<M>>,
         prior: &'a BTreeMap<K, Option<Change<M>>>,
-        lower: Bound<&K>,
+        lower: Bound<K>,
         upper: Bound<K>,
+        rev: bool,
         tx: Option<&'a TxState>,
     ) -> Cursor<'a, K, M>
     where
@@ -686,19 +697,30 @@ impl<'s> Snapshot<'s> {
         M: Merge,
         M::Value: Codec,
     {
-        let mut cursor = self.cursor(keyspace, None, lower, upper, tx);
-        cursor.push_newest(Source::overlay_as_of(overlay, prior, lower));
+        let empty = empty_bounds(lower.as_ref(), upper.as_ref());
+        let mut cursor = self.cursor(keyspace, None, lower.clone(), upper.clone(), rev, tx);
+        if !empty {
+            cursor.push_newest(Source::overlay_as_of(
+                overlay,
+                prior,
+                lower.as_ref(),
+                upper.as_ref(),
+                rev,
+            ));
+        }
         cursor
     }
 
-    /// A merged cursor over `keyspace`, with `overlay`, a write tx's own
-    /// changes, on top when given.
+    /// A merged cursor over `keyspace` within the bounds, forward or, with
+    /// `rev`, backward, with `overlay`, a write tx's own changes, on top
+    /// when given.
     pub(crate) fn cursor<'a, K, M>(
         &'a self,
         keyspace: KeyspaceId<K, M>,
         overlay: Option<&'a BTreeMap<K, Change<M>>>,
-        lower: Bound<&K>,
+        lower: Bound<K>,
         upper: Bound<K>,
+        rev: bool,
         tx: Option<&'a TxState>,
     ) -> Cursor<'a, K, M>
     where
@@ -708,22 +730,29 @@ impl<'s> Snapshot<'s> {
     {
         let ks = keyspace.raw();
         let mut sources = Vec::new();
-        if let Some(overlay) = overlay {
-            sources.push(Source::overlay(overlay, lower));
-        }
-        for layer in self.version.layers.iter().rev() {
-            if let Some(t) = layer.trees.get(&ks) {
-                let tree = t
-                    .tree
-                    .downcast_ref::<Resident<K, M::Value>>()
-                    .expect("keyspace id reused with a different type");
-                sources.push(Source::layer(tree, lower));
+        if !empty_bounds(lower.as_ref(), upper.as_ref()) {
+            let (lo, up) = (lower.as_ref(), upper.as_ref());
+            if let Some(overlay) = overlay {
+                sources.push(Source::overlay(overlay, lo, up, rev));
+            }
+            for layer in self.version.layers.iter().rev() {
+                if let Some(t) = layer.trees.get(&ks) {
+                    let tree = t
+                        .tree
+                        .downcast_ref::<Resident<K, M::Value>>()
+                        .expect("keyspace id reused with a different type");
+                    sources.push(Source::layer(tree, lo, up, rev));
+                }
+            }
+            for table in self.version.tables_for(ks) {
+                sources.push(Source::table(
+                    table.cursor(ks, Some(&self.store.cache)),
+                    ks,
+                    rev,
+                ));
             }
         }
-        for table in self.version.tables_for(ks) {
-            sources.push(Source::table(table.cursor(ks, Some(&self.store.cache)), ks));
-        }
-        Cursor::new(sources, lower, upper, tx)
+        Cursor::new(sources, lower, upper, rev, tx)
     }
 }
 
@@ -860,7 +889,7 @@ where
     Ok(())
 }
 
-pub(crate) struct StoreBuilder {
+pub struct StoreBuilder {
     durability_policy: DurabilityPolicy,
     dir: Option<PathBuf>,
     keyspaces: HashMap<u64, KeyspaceDecl>,
@@ -871,7 +900,7 @@ pub(crate) struct StoreBuilder {
 impl StoreBuilder {
     /// An in-memory store unless [`dir`](Self::dir) is set. Policies that
     /// write need a directory.
-    pub(crate) fn new(durability_policy: DurabilityPolicy) -> Self {
+    pub fn new(durability_policy: DurabilityPolicy) -> Self {
         StoreBuilder {
             durability_policy,
             dir: None,
@@ -882,51 +911,51 @@ impl StoreBuilder {
     }
 
     /// Replace every size limit at once.
-    pub(crate) fn options(mut self, opts: StoreOptions) -> Self {
+    pub fn options(mut self, opts: StoreOptions) -> Self {
         self.opts = opts;
         self
     }
 
     /// Adjust the size limits in place.
-    pub(crate) fn options_with(mut self, f: impl FnOnce(&mut StoreOptions)) -> Self {
+    pub fn options_with(mut self, f: impl FnOnce(&mut StoreOptions)) -> Self {
         f(&mut self.opts);
         self
     }
 
     /// Checkpoint once the WAL reaches this many bytes. Defaults to 64 MiB.
-    pub(crate) fn wal_limit(mut self, bytes: u64) -> Self {
+    pub fn wal_limit(mut self, bytes: u64) -> Self {
         self.opts.wal_limit = bytes;
         self
     }
 
     /// Checkpoint once committed data in memory reaches this many bytes.
     /// Defaults to 64 MiB.
-    pub(crate) fn memtable_limit(mut self, bytes: usize) -> Self {
+    pub fn memtable_limit(mut self, bytes: usize) -> Self {
         self.opts.memtable_limit = bytes;
         self
     }
 
     /// Kill a write tx once its writes hold this many bytes. Defaults to
     /// 64 MiB.
-    pub(crate) fn tx_memory_limit(mut self, bytes: usize) -> Self {
+    pub fn tx_memory_limit(mut self, bytes: usize) -> Self {
         self.opts.tx_memory_limit = bytes;
         self
     }
 
     /// Target size of a checkpoint table's blocks. Defaults to 4 KiB.
-    pub(crate) fn block_size(mut self, bytes: usize) -> Self {
+    pub fn block_size(mut self, bytes: usize) -> Self {
         self.opts.block_size = bytes;
         self
     }
 
     /// Bytes of checkpoint blocks to keep in memory. Defaults to 32 MiB.
-    pub(crate) fn cache_size(mut self, bytes: usize) -> Self {
+    pub fn cache_size(mut self, bytes: usize) -> Self {
         self.opts.cache_size = bytes;
         self
     }
 
     /// Keep the store in `dir`, creating it if needed.
-    pub(crate) fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
+    pub fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.dir = Some(dir.into());
         self
     }
@@ -934,7 +963,7 @@ impl StoreBuilder {
     /// Declare a base keyspace, one the application writes. Every keyspace
     /// a transaction opens must be declared, and every keyspace in the WAL
     /// must be declared with the types it was written with.
-    pub(crate) fn keyspace<K, M>(self, id: KeyspaceId<K, M>) -> Self
+    pub fn keyspace<K, M>(self, id: KeyspaceId<K, M>) -> Self
     where
         K: OrderedCodec + Clone + Send + Sync + 'static,
         M: Merge,
@@ -951,7 +980,7 @@ impl StoreBuilder {
     ///
     /// A derived keyspace that is no longer declared is dropped, where an
     /// undeclared base keyspace is an error.
-    pub(crate) fn derived<K, M>(self, id: KeyspaceId<K, M>) -> Self
+    pub fn derived<K, M>(self, id: KeyspaceId<K, M>) -> Self
     where
         K: OrderedCodec + Clone + Send + Sync + 'static,
         M: Merge,
@@ -963,7 +992,7 @@ impl StoreBuilder {
     /// The fingerprint of the graph that computes the derived keyspaces,
     /// typically [`OpDag::fingerprint`](crate::graph::OpDag::fingerprint)
     /// mixed with a schema version.
-    pub(crate) fn graph(mut self, fingerprint: u64) -> Self {
+    pub fn graph(mut self, fingerprint: u64) -> Self {
         self.graph = fingerprint;
         self
     }
@@ -998,7 +1027,7 @@ impl StoreBuilder {
 
     /// Keep a run index of type `I` on every run of keyspace `id`, which
     /// must already be declared. See [`RunIndex`].
-    pub(crate) fn indexed<K, M, I>(mut self, id: KeyspaceId<K, M>) -> Self
+    pub fn indexed<K, M, I>(mut self, id: KeyspaceId<K, M>) -> Self
     where
         K: OrderedCodec + Clone + Send + Sync + 'static,
         M: Merge,
@@ -1030,7 +1059,7 @@ impl StoreBuilder {
 
     /// Open the store. Fails with [`Error::RebuildRequired`] if derived
     /// state must be rebuilt; use [`build_with`](Self::build_with) then.
-    pub(crate) fn build(self) -> Result<Store> {
+    pub fn build(self) -> Result<Store> {
         self.open(None)
     }
 
@@ -1052,7 +1081,7 @@ impl StoreBuilder {
     ///
     /// If `replay` or a commit fails, open fails, and the next open starts
     /// the rebuild over.
-    pub(crate) fn build_with(
+    pub fn build_with(
         self,
         mut replay: impl FnMut(&mut WriteTx<'_>) -> Result<bool>,
     ) -> Result<Store> {
@@ -1673,7 +1702,7 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn stats(&self) -> MemoryStats {
+    pub fn stats(&self) -> MemoryStats {
         let version = self.current.load();
         MemoryStats {
             memtable_bytes: version.resident_bytes,
@@ -1740,7 +1769,7 @@ impl Shared {
 }
 
 impl Store {
-    pub(crate) fn snapshot(&self) -> Snapshot<'_> {
+    pub fn snapshot(&self) -> Snapshot<'_> {
         let mut map = self.snapshots();
         let version = self.current.load_full();
         *map.entry(version.epoch).or_default() += 1;
@@ -1754,7 +1783,7 @@ impl Store {
     /// Open a write transaction over the latest committed state. Blocks
     /// while another write transaction is open. Dropping the tx without
     /// [`finish`](Self::finish) aborts it. Fails if the store is poisoned.
-    pub(crate) fn begin(&self) -> Result<WriteTx<'_>> {
+    pub fn begin(&self) -> Result<WriteTx<'_>> {
         self.assert_no_tx_here("begin");
         // lock first: the snapshot must not be older than the last commit
         let guard = self.lock_writer();
@@ -1781,10 +1810,10 @@ impl Store {
     ///
     /// Checkpointing, folding layers and compacting tables are left to the
     /// maintenance thread. If it falls far enough behind (see
-    /// [`throttle`](Shared::throttle)), this waits for it, and if the pass
+    /// `throttle`), this waits for it, and if the pass
     /// it waited on failed, returns that as [`Error::AfterCommit`]: the
     /// commit stands.
-    pub(crate) fn finish(&self, tx: WriteTx<'_>) -> Result<Option<u64>> {
+    pub fn finish(&self, tx: WriteTx<'_>) -> Result<Option<u64>> {
         let (epoch, overlay, snapshot, mut writer) = tx.into_parts();
         debug_assert!(
             std::ptr::eq(snapshot.store(), self),
@@ -1911,7 +1940,7 @@ impl Store {
     /// Wait until the maintenance thread has finished a full pass begun
     /// after this call: layers are folded and tables compacted as far as
     /// the policy wants. Returns how that pass failed, if it did.
-    pub(crate) fn quiesce(&self) -> Result<()> {
+    pub fn quiesce(&self) -> Result<()> {
         self.assert_no_tx_here("quiesce");
         let m = &self.maintenance;
         let mut st = m.lock();
@@ -2114,7 +2143,9 @@ impl Shared {
         } else {
             Ok(())
         };
-        while !self.shutdown.load(Relaxed) && self.fold_once() {}
+        while !self.shutdown.load(Relaxed) && self.fold_once() {
+            std::hint::spin_loop()
+        }
         let compacted = self.compact_while_over().map(|_| ());
         checkpointed.and(compacted)
     }
@@ -2223,7 +2254,7 @@ impl Shared {
     /// # Panics
     ///
     /// If this thread holds a write tx, which it would wait on forever.
-    pub(crate) fn checkpoint(&self) -> Result<Option<u64>> {
+    pub fn checkpoint(&self) -> Result<Option<u64>> {
         self.assert_no_tx_here("checkpoint");
         let done = self.checkpoint_now();
         if self.maintenance_due() {
@@ -2394,7 +2425,7 @@ impl Shared {
     /// # Panics
     ///
     /// If this thread holds a write tx, which it would wait on forever.
-    pub(crate) fn compact(&self) -> Result<bool> {
+    pub fn compact(&self) -> Result<bool> {
         self.assert_no_tx_here("compact");
         let _running = self
             .compaction
@@ -2604,6 +2635,7 @@ fn cheapest_window(tables: &[Arc<Table>], width: usize) -> Range<usize> {
     start..start + width
 }
 #[cfg(test)]
+#[allow(clippy::drop_non_drop)] // drops mark where a borrow's use ends
 mod tests {
     use super::*;
     use crate::{Change, Register};
@@ -3921,6 +3953,88 @@ mod tests {
     fn an_unregistered_index_is_a_mistake() {
         let store = mem();
         let _ = store.snapshot().runs_indexed::<_, _, Zone>(KS);
+    }
+
+    #[test]
+    fn reverse_ranges_mirror_forward_ones_across_every_source() {
+        let dir = tmpdir("reverse");
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| {
+            b.block_size(64).options_with(|o| o.max_tables = 100)
+        })
+        .unwrap();
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rng = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let bound = |r: u64, k: u8| match r {
+            0 => Bound::Unbounded,
+            1 => Bound::Included(k),
+            _ => Bound::Excluded(k),
+        };
+        let collect = |c: Cursor<'_, u8, i64>| -> Vec<(u8, i64)> {
+            c.map(|r| r.map(|(k, v)| (*k, *v)).unwrap()).collect()
+        };
+        for round in 0..40 {
+            let rows: Vec<(u8, Option<i64>)> = (0..1 + rng(12))
+                .map(|_| (rng(60) as u8, (rng(4) != 0).then(|| rng(1000) as i64)))
+                .collect();
+            put(&store, &rows);
+            if round % 7 == 3 {
+                store.checkpoint().unwrap();
+            }
+            let snap = store.snapshot();
+            let mut tx = store.begin().unwrap();
+            let mut ks = tx.keyspace(KS);
+            for _ in 0..rng(6) {
+                let k = rng(60) as u8;
+                let v = (rng(3) != 0).then(|| rng(1000) as i64);
+                ks.set(k, v).unwrap();
+            }
+            tx.end_run();
+            let mut ks = tx.keyspace(KS);
+            for _ in 0..rng(6) {
+                let k = rng(60) as u8;
+                let v = (rng(3) != 0).then(|| rng(1000) as i64);
+                ks.set(k, v).unwrap();
+            }
+            for _ in 0..10 {
+                let (a, b) = (rng(64) as u8, rng(64) as u8);
+                let range = (bound(rng(3), a.min(b)), bound(rng(3), a.max(b)));
+                let mut fwd = collect(snap.range(KS, range));
+                fwd.reverse();
+                assert_eq!(
+                    collect(snap.range_rev(KS, range)),
+                    fwd,
+                    "snapshot {range:?}"
+                );
+                let mut fwd = collect(ks.range(range));
+                fwd.reverse();
+                assert_eq!(collect(ks.range_rev(range)), fwd, "tx {range:?}");
+                let mut fwd = collect(ks.range_old(range));
+                fwd.reverse();
+                assert_eq!(collect(ks.range_old_rev(range)), fwd, "old {range:?}");
+            }
+            // seeks follow the cursor's direction
+            let mut down = ks.range_rev(..);
+            let mut up = ks.range(..);
+            for k in (0..64u8).rev() {
+                let want = ks.get(&k).unwrap().map(|v| *v);
+                assert_eq!(down.seek_get(&k).unwrap().map(|v| *v), want, "rev seek {k}");
+            }
+            for k in 0..64u8 {
+                let want = ks.get(&k).unwrap().map(|v| *v);
+                assert_eq!(up.seek_get(&k).unwrap().map(|v| *v), want, "seek {k}");
+            }
+            drop((down, up));
+            drop(ks);
+            drop(tx);
+        }
+        assert!(store.stats().tables > 3);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

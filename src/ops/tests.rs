@@ -186,6 +186,8 @@ fn drive<O: Ord + Clone + Debug + Send + 'static>(
 
 const AL: Arrangement<u8, u8> = KeyspaceId::new(10);
 const AR: Arrangement<u8, u8> = KeyspaceId::new(11);
+const TL: KeyspaceId<u8, Delta> = KeyspaceId::new(16);
+const TR: KeyspaceId<u8, Delta> = KeyspaceId::new(17);
 
 fn arrange(
     g: &mut OpDag,
@@ -196,8 +198,8 @@ fn arrange(
     NodeRef<Bag<(u8, u8)>, Arranged<u8, u8>>,
 ) {
     (
-        g.nary(&[l], Arrange::new(AL)),
-        g.nary(&[r], Arrange::new(AR)),
+        g.nary(&[l], Arrange::new(AL, TL)),
+        g.nary(&[r], Arrange::new(AR, TR)),
     )
 }
 
@@ -293,7 +295,7 @@ fn drive_reduce<O, F>(
     drive(
         name,
         |g, l, _| {
-            let l = g.nary(&[l], Arrange::new(AL));
+            let l = g.nary(&[l], Arrange::new(AL, TL));
             build(g, l)
         },
         |l, _| {
@@ -411,6 +413,7 @@ fn linear_operators_fuse_and_reshape_rows() {
 const L: KeyspaceId<u8, Mergeless<u8>> = KeyspaceId::new(1);
 const R: KeyspaceId<u8, Mergeless<u8>> = KeyspaceId::new(2);
 const BY_VALUE: Arrangement<u8, u8> = KeyspaceId::new(20);
+const BY_VALUE_TOTALS: KeyspaceId<u8, Delta> = KeyspaceId::new(23);
 const MAX_KEY: KeyspaceId<u8, Mergeless<u8>> = KeyspaceId::new(21);
 const TOP: Arrangement<u8, u8> = KeyspaceId::new(22);
 
@@ -537,7 +540,7 @@ fn table_graph(version: u64, sinks: &Sinks) -> OpDag {
     // one arrangement by value, shared by three readers
     let rows = g.unary(l, Flatten::default());
     let swapped = g.nary(&[rows], FusedLinears::new(Map(|&(k, v): &(u8, u8)| (v, k))));
-    let by_value = g.nary(&[swapped], Arrange::new(BY_VALUE));
+    let by_value = g.nary(&[swapped], Arrange::new(BY_VALUE, BY_VALUE_TOTALS));
     let max = g.nary_with(&[by_value], |s| reduce::max(s[0].clone(), MAX_KEY));
     let max = g.unary(max, Flatten::default());
     g.nary(&[max], sinks.max_key.clone());
@@ -628,8 +631,8 @@ fn a_keyspace_has_one_writer() {
     let mut g = OpDag::new();
     let l = g.table(L);
     let rows = g.unary(l, Flatten::default());
-    g.nary(&[rows], Arrange::new(BY_VALUE));
-    g.nary(&[rows], Arrange::new(BY_VALUE));
+    g.nary(&[rows], Arrange::new(BY_VALUE, BY_VALUE_TOTALS));
+    g.nary(&[rows], Arrange::new(BY_VALUE, BY_VALUE_TOTALS));
 }
 
 #[test]
@@ -651,7 +654,7 @@ fn foreign_keys_report_dangling_references_and_reject() {
     let parents = g.table(PARENTS);
     let rows = g.unary(children, Flatten::default());
     let swapped = g.nary(&[rows], FusedLinears::new(Map(|&(c, p): &(u8, u8)| (p, c))));
-    let by_parent = g.nary(&[swapped], Arrange::new(BY_PARENT));
+    let by_parent = g.nary(&[swapped], Arrange::new(BY_PARENT, KeyspaceId::new(33)));
     let dangling = g.binary_with(by_parent, parents, ForeignKey::new);
     let sink = Sink::new();
     g.nary(&[dangling], sink.clone());
@@ -702,7 +705,7 @@ fn unstored_sources_need_the_application_to_replay_them() {
         let mut g = OpDag::new();
         g.version(version);
         let src = g.source::<Bag<(u8, u8)>>();
-        g.nary(&[src], Arrange::new(EVENTS));
+        g.nary(&[src], Arrange::new(EVENTS, KeyspaceId::new(41)));
         (g, src)
     };
     let rows = [(1u8, 2u8), (1, 3), (4, 5)];
@@ -741,9 +744,65 @@ fn unstored_sources_need_the_application_to_replay_them() {
     let arranged: Vec<(u8, u8)> = db
         .snapshot()
         .range(EVENTS, ..)
-        .map(|r| r.map(|(k, _)| (k.0, k.1.unwrap())).unwrap())
+        .map(|r| {
+            r.map(|(k, _)| match &k.1 {
+                crate::state::Edge::Val(v) => (k.0, *v),
+                _ => unreachable!(),
+            })
+            .unwrap()
+        })
         .collect();
     assert_eq!(arranged, rows);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn matching_reads_a_distincts_state() {
+    const SEEN: KeyspaceId<u8, Delta> = KeyspaceId::new(18);
+    drive(
+        "distinct-state",
+        |g, l, r| {
+            let l = g.nary(&[l], Arrange::new(AL, TL));
+            let keys = g.nary(&[r], FusedLinears::new(Keys));
+            let seen = g.nary(&[keys], crate::Distinct::new(SEEN));
+            g.binary_with(l, seen, Semijoin::matching)
+        },
+        |l, r| semijoin_expected(l, r, false),
+    );
+}
+
+#[test]
+fn a_key_is_present_while_its_rows_total_positive() {
+    let dir = tmpdir("totals");
+    let mut g = OpDag::new();
+    let (ls, rs) = (g.source::<Bag<(u8, u8)>>(), g.source::<Bag<(u8, u8)>>());
+    let l = g.nary(&[ls], Arrange::new(AL, TL));
+    let r = g.nary(&[rs], Arrange::new(AR, TR));
+    let m = g.binary_with(l, r, Semijoin::matching);
+    let sink = Sink::new();
+    g.nary(&[m], sink.clone());
+    let mut db = Db::open(builder(&dir), g).unwrap();
+    let mut step = |left: &[((u8, u8), Delta)], right: &[((u8, u8), Delta)]| {
+        db.write(|tx| {
+            let (mut bl, mut br) = (Bag::new(), Bag::new());
+            for &(row, d) in left {
+                bl.push(row, d);
+            }
+            for &(row, d) in right {
+                br.push(row, d);
+            }
+            tx.give(ls, &mut bl);
+            tx.give(rs, &mut br);
+            Ok(())
+        })
+        .unwrap();
+        sink.commit();
+        sink.rows()
+    };
+    // key 1's right rows net to zero, so it is absent despite a positive row
+    assert!(step(&[((1, 7), 1)], &[((1, 0), 1), ((1, 1), -1)]).is_empty());
+    assert_eq!(step(&[], &[((1, 2), 1)]), ones(vec![(1, 7)]));
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -489,6 +489,8 @@ impl Table {
             block: None,
             cur: None,
             started: false,
+            entries: Vec::new(),
+            ei: 0,
         }
     }
 }
@@ -505,6 +507,10 @@ pub(crate) struct TableCursor<'a> {
     /// The current entry: key range, value range, next entry's offset.
     cur: Option<(Range<usize>, Range<usize>, usize)>,
     started: bool,
+    /// Walking backward: every entry of the loaded block, and the
+    /// current one's index.
+    entries: Vec<(Range<usize>, Range<usize>, usize)>,
+    ei: usize,
 }
 
 impl<'a> TableCursor<'a> {
@@ -556,6 +562,82 @@ impl<'a> TableCursor<'a> {
         }
         while self.current().is_some_and(|(k, _)| k < probe) {
             self.advance()?;
+        }
+        Ok(())
+    }
+
+    /// Move to the last entry, if not yet started, to walk backward.
+    pub fn start_back(&mut self) -> Result<()> {
+        if !self.started {
+            self.started = true;
+            self.load_back(self.blocks.len().checked_sub(1))?;
+        }
+        Ok(())
+    }
+
+    /// Move to the previous entry.
+    pub fn retreat(&mut self) -> Result<()> {
+        self.start_back()?;
+        if self.cur.is_none() {
+            return Ok(());
+        }
+        if self.ei > 0 {
+            self.ei -= 1;
+            self.cur = Some(self.entries[self.ei].clone());
+            Ok(())
+        } else {
+            self.load_back(self.bi.checked_sub(1))
+        }
+    }
+
+    /// Move backward to the last entry whose key is at or before `probe`.
+    /// Never moves forward.
+    pub fn seek_back(&mut self, probe: &[u8]) -> Result<()> {
+        self.start_back()?;
+        if self.current().is_none_or(|(k, _)| k <= probe) {
+            return Ok(());
+        }
+        // the last block starting at or before the probe holds the entry,
+        // or, if all of it is past the probe, the block before does
+        let Some(target) = self
+            .blocks
+            .partition_point(|b| &*b.first_key <= probe)
+            .checked_sub(1)
+        else {
+            self.cur = None;
+            return Ok(());
+        };
+        if target < self.bi {
+            self.load_back(Some(target))?;
+        }
+        while self.current().is_some_and(|(k, _)| k > probe) {
+            self.retreat()?;
+        }
+        Ok(())
+    }
+
+    /// Load block `bi` and position at its last entry, moving to earlier
+    /// blocks if it is empty; with `None`, there is nothing before.
+    fn load_back(&mut self, mut bi: Option<usize>) -> Result<()> {
+        self.cur = None;
+        self.block = None;
+        while let Some(i) = bi {
+            self.bi = i;
+            let handle = &self.blocks[i];
+            let block = self.table.block(handle, self.cache)?;
+            self.entries.clear();
+            let mut at = 0;
+            while let Some(e) = entry_at(&block, at).map_err(|o| self.table.bad_entry(handle, o))? {
+                at = e.2;
+                self.entries.push(e);
+            }
+            self.block = Some(block);
+            if let Some(last) = self.entries.len().checked_sub(1) {
+                self.ei = last;
+                self.cur = Some(self.entries[last].clone());
+                return Ok(());
+            }
+            bi = i.checked_sub(1);
         }
         Ok(())
     }

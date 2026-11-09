@@ -53,14 +53,58 @@ pub trait State: Clone + Send + 'static {
         f: &mut dyn FnMut(&Self::Value, Delta) -> bool,
     ) -> Result<()>;
 
-    /// Whether `key` has a value at a positive multiplicity.
-    fn exists(&self, tx: &mut WriteTx, key: &Self::Key, when: When) -> Result<bool> {
-        let mut found = false;
-        self.group(tx, key, when, &mut |_, d| {
-            found = d > 0;
-            !found
+    /// [`group`](Self::group), descending.
+    fn group_rev(
+        &self,
+        tx: &mut WriteTx,
+        key: &Self::Key,
+        when: When,
+        f: &mut dyn FnMut(&Self::Value, Delta) -> bool,
+    ) -> Result<()> {
+        let mut all = Vec::new();
+        self.group(tx, key, when, &mut |v, d| {
+            all.push((v.clone(), d));
+            true
         })?;
-        Ok(found)
+        for (v, d) in all.iter().rev() {
+            if !f(v, *d) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every value of each of `keys`, which ascend, as
+    /// `f(key, value, multiplicity)`. One pass where the state allows.
+    fn groups(
+        &self,
+        tx: &mut WriteTx,
+        keys: &[Self::Key],
+        when: When,
+        f: &mut dyn FnMut(&Self::Key, &Self::Value, Delta),
+    ) -> Result<()> {
+        for k in keys {
+            self.group(tx, k, when, &mut |v, d| {
+                f(k, v, d);
+                true
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The total multiplicity of `key`'s values.
+    fn total(&self, tx: &mut WriteTx, key: &Self::Key, when: When) -> Result<Delta> {
+        let mut total: Delta = 0;
+        self.group(tx, key, when, &mut |_, d| {
+            total = total.checked_add(d).expect("multiplicity overflowed");
+            true
+        })?;
+        Ok(total)
+    }
+
+    /// Whether `key` is present: its total multiplicity is positive.
+    fn exists(&self, tx: &mut WriteTx, key: &Self::Key, when: When) -> Result<bool> {
+        Ok(self.total(tx, key, when)? > 0)
     }
 }
 
@@ -226,27 +270,49 @@ where
     }
 }
 
+/// A bound or a value, for keys that group: `Lo < Val(v) < Hi` for every
+/// `v`, so `(k, Lo)..=(k, Hi)` spans exactly the keys `(k, Val(_))`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Edge<V> {
+    Lo,
+    Val(V),
+    Hi,
+}
+
 /// Rows `(K, V)` at their multiplicity, grouped by `K`, as an
 /// [`Arrange`](crate::ops::Arrange) node keeps them: stored as
-/// `(k, Some(v)) -> count`, so that `(k, None)` sorts before every row
-/// of `k` and a group is one range scan. A count that reaches zero
-/// removes the row.
-pub type Arrangement<K, V> = KeyspaceId<(K, Option<V>), Delta>;
+/// `(k, Val(v)) -> count`, so a key's group is the range
+/// `(k, Lo)..=(k, Hi)`, read in either direction. A count that reaches
+/// zero removes the row.
+pub type Arrangement<K, V> = KeyspaceId<(K, Edge<V>), Delta>;
 
-/// The state of a node that keeps an [`Arrangement`].
+/// The state of a node that keeps an [`Arrangement`], and maybe each
+/// key's total multiplicity beside it, which makes
+/// [`total`](State::total) and [`exists`](State::exists) one lookup.
 pub struct Arranged<K, V> {
     id: Arrangement<K, V>,
+    totals: Option<KeyspaceId<K, Delta>>,
 }
 
 impl<K, V> Clone for Arranged<K, V> {
     fn clone(&self) -> Self {
-        Arranged { id: self.id }
+        Arranged {
+            id: self.id,
+            totals: self.totals,
+        }
     }
 }
 
 impl<K, V> Arranged<K, V> {
-    pub(crate) fn new(id: Arrangement<K, V>) -> Self {
-        Arranged { id }
+    pub(crate) fn new(id: Arrangement<K, V>, totals: Option<KeyspaceId<K, Delta>>) -> Self {
+        Arranged { id, totals }
+    }
+}
+
+fn val<V>(edge: &Edge<V>) -> &V {
+    match edge {
+        Edge::Val(v) => v,
+        _ => unreachable!("arrangements store values"),
     }
 }
 
@@ -272,18 +338,157 @@ where
         when: When,
         f: &mut dyn FnMut(&V, Delta) -> bool,
     ) -> Result<()> {
+        self.scan(tx, key, when, false, f)
+    }
+
+    fn group_rev(
+        &self,
+        tx: &mut WriteTx,
+        key: &K,
+        when: When,
+        f: &mut dyn FnMut(&V, Delta) -> bool,
+    ) -> Result<()> {
+        self.scan(tx, key, when, true, f)
+    }
+
+    fn groups(
+        &self,
+        tx: &mut WriteTx,
+        keys: &[K],
+        when: When,
+        f: &mut dyn FnMut(&K, &V, Delta),
+    ) -> Result<()> {
+        let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
+            return Ok(());
+        };
         let ks = tx.keyspace(self.id);
-        let from = (key.clone(), None)..;
-        let rows = match when {
-            When::New => ks.range(from),
-            When::Old => ks.range_old(from),
+        let span = (first.clone(), Edge::Lo)..=(last.clone(), Edge::Hi);
+        let mut rows = match when {
+            When::New => ks.range(span),
+            When::Old => ks.range_old(span),
+        };
+        // the row read past the last group, which may open the next
+        let mut ahead: Option<(K, V, Delta)> = None;
+        for key in keys {
+            match &ahead {
+                Some((k, _, _)) if k > key => continue,
+                Some((k, _, _)) if k < key => ahead = None,
+                _ => {}
+            }
+            if ahead.is_none() {
+                rows.seek(&(key.clone(), Edge::Lo))?;
+            }
+            if let Some((_, v, d)) = ahead.take() {
+                f(key, &v, d);
+            }
+            for row in rows.by_ref() {
+                let (k, d) = row?;
+                let (kk, v) = &*k;
+                if kk != key {
+                    ahead = Some((kk.clone(), val(v).clone(), *d));
+                    break;
+                }
+                f(key, val(v), *d);
+            }
+        }
+        Ok(())
+    }
+
+    fn total(&self, tx: &mut WriteTx, key: &K, when: When) -> Result<Delta> {
+        let Some(totals) = self.totals else {
+            let mut total: Delta = 0;
+            self.group(tx, key, when, &mut |_, d| {
+                total = total.checked_add(d).expect("multiplicity overflowed");
+                true
+            })?;
+            return Ok(total);
+        };
+        let ks = tx.keyspace(totals);
+        let t = match when {
+            When::New => ks.get(key)?,
+            When::Old => ks.get_old(key)?,
+        };
+        Ok(t.map_or(0, |t| *t))
+    }
+}
+
+impl<K, V> Arranged<K, V>
+where
+    K: OrderedCodec + Clone + Send + Sync + 'static,
+    V: OrderedCodec + Clone + Send + Sync + 'static,
+{
+    fn scan(
+        &self,
+        tx: &mut WriteTx,
+        key: &K,
+        when: When,
+        rev: bool,
+        f: &mut dyn FnMut(&V, Delta) -> bool,
+    ) -> Result<()> {
+        let ks = tx.keyspace(self.id);
+        let span = (key.clone(), Edge::Lo)..=(key.clone(), Edge::Hi);
+        let rows = match (when, rev) {
+            (When::New, false) => ks.range(span),
+            (When::New, true) => ks.range_rev(span),
+            (When::Old, false) => ks.range_old(span),
+            (When::Old, true) => ks.range_old_rev(span),
         };
         for row in rows {
             let (k, d) = row?;
-            let (kk, v) = &*k;
-            if kk != key || !f(v.as_ref().expect("arrangements store values"), *d) {
+            if !f(val(&k.1), *d) {
                 break;
             }
+        }
+        Ok(())
+    }
+}
+
+/// The state of a [`Distinct`](crate::Distinct) node: every row whose
+/// count is positive, once, under its own key, with value `()`.
+pub struct Counted<T> {
+    id: KeyspaceId<T, Delta>,
+}
+
+impl<T> Clone for Counted<T> {
+    fn clone(&self) -> Self {
+        Counted { id: self.id }
+    }
+}
+
+impl<T> Counted<T> {
+    pub(crate) fn new(id: KeyspaceId<T, Delta>) -> Self {
+        Counted { id }
+    }
+}
+
+impl<T> State for Counted<T>
+where
+    T: OrderedCodec + Clone + Send + Sync + 'static,
+{
+    type Key = T;
+    type Value = ();
+    type Delta = Bag<T>;
+
+    fn rows(delta: &Bag<T>, f: &mut dyn FnMut(&T, &(), Delta)) {
+        for (t, d) in delta.diffs() {
+            f(t, &(), d);
+        }
+    }
+
+    fn group(
+        &self,
+        tx: &mut WriteTx,
+        key: &T,
+        when: When,
+        f: &mut dyn FnMut(&(), Delta) -> bool,
+    ) -> Result<()> {
+        let ks = tx.keyspace(self.id);
+        let count = match when {
+            When::New => ks.get(key)?,
+            When::Old => ks.get_old(key)?,
+        };
+        if count.is_some_and(|c| *c > 0) {
+            f(&(), 1);
         }
         Ok(())
     }

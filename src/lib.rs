@@ -1,26 +1,55 @@
+//! An embedded, incrementally maintained database.
+//!
+//! Applications write base tables; a dataflow graph keeps derived state
+//! (sums, joins, indexes, aggregates, constraint checks) up to date with
+//! every commit, and stores it beside the tables.
+//!
+//! - [`Db`] owns a [`Store`] and the [`OpDag`] computing its derived state.
+//!   [`Db::write`] runs a transaction, then the graph over what it wrote,
+//!   then commits. When the graph changes, opening rebuilds derived state
+//!   from the tables.
+//! - The graph's nodes are tables ([`OpDag::table`]), sources fed by hand
+//!   ([`OpDag::source`]), and operators: [`Sum`], [`Distinct`],
+//!   [`IndexBy`], [`Check`], the linear stages fused by [`FusedLinears`],
+//!   and those in [`ops`]: joins, semijoins, reductions, foreign keys.
+//! - A node's [state] is its whole output, which its children read
+//!   rather than copy: a join of two tables keyed alike stores nothing.
+//! - The [`Store`] underneath is a log-structured store: a write-ahead log,
+//!   immutable layers in memory folded in the background, and checkpoint
+//!   tables on disk read through a block cache, so data can outgrow
+//!   memory. [`Snapshot`]s read a consistent version in either direction.
+//! - Keys and values are encoded with [`codec`]'s traits; keys keep their
+//!   order on disk.
+
+#![allow(clippy::type_complexity)]
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::convert::Infallible;
 use std::{any::Any, borrow::Cow, marker::PhantomData};
 
 use crate::codec::{Codec, OrderedCodec};
 use crate::graph::Fingerprint;
-use crate::tx::{KeyspaceId, WriteTx};
 pub mod graph;
 pub mod merge;
 use crate::merge::*;
-mod codec;
-mod cursor;
+pub mod codec;
+pub mod cursor;
 pub mod error;
 
 pub mod db;
+
+pub use db::{Db, DbTx};
+pub use error::{Error, Result};
+pub use graph::{NodeRef, OpDag};
+pub use store::{DurabilityPolicy, MemoryStats, Snapshot, Store, StoreBuilder, StoreOptions};
+pub use tx::{Keyspace, KeyspaceId, WriteTx};
 pub mod index;
 mod manifest;
 pub mod ops;
 pub mod state;
-use crate::state::{Declare, Stored};
-mod store;
+use crate::state::{Counted, Declare, Stored};
+pub mod store;
 mod table;
-mod tx;
+pub mod tx;
 
 pub trait Buffer: Any + Send {
     fn empty() -> Self
@@ -74,10 +103,10 @@ impl<K: Ord, M: Merge> Register<K, M> {
         change: Change<M>,
         size: impl Fn(&K, &Change<M>) -> usize,
     ) -> isize {
-        if let Change::Modify(d) = &change {
-            if M::noop(d) {
-                return 0;
-            }
+        if let Change::Modify(d) = &change
+            && M::noop(d)
+        {
+            return 0;
         }
         match self.inner.entry(key) {
             Entry::Vacant(vac) => {
@@ -91,10 +120,10 @@ impl<K: Ord, M: Merge> Register<K, M> {
                 let Some(c) = prev.compose(change) else {
                     return -before;
                 };
-                if let Change::Modify(d) = &c {
-                    if M::noop(d) {
-                        return -before;
-                    }
+                if let Change::Modify(d) = &c
+                    && M::noop(d)
+                {
+                    return -before;
                 }
                 let after = size(&key, &c) as isize;
                 self.inner.insert(key, c);
@@ -149,13 +178,13 @@ impl<T: 'static + Send + Clone> Merge for Mergeless<T> {
     fn base() -> Self::Value {
         unreachable!("")
     }
-    fn merge<'a>(val: &mut Self::Value, diffs: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+    fn merge<'a>(_: &mut Self::Value, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {
         unreachable!("")
     }
-    fn combine<'a>(old: &mut Self::Diff, new: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+    fn combine<'a>(_: &mut Self::Diff, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {
         unreachable!("")
     }
-    fn scale(diff: &mut Self::Diff, times: Delta) {
+    fn scale(_: &mut Self::Diff, _: Delta) {
         unreachable!("")
     }
 }
@@ -403,13 +432,15 @@ where
                 Change::Replace(o, n) if n.0 == 0 => Change::Delete(o),
                 r => r,
             };
-            if ks.absorb(k.clone(), resolved.clone()).is_err() {
+            if ks.absorb(k, resolved).is_err() {
                 // the tx failed; the graph stops at this node and the
                 // commit will be refused (the drain empties `resolved`)
                 return;
             }
-            out.absorb_one(k, resolved);
         }
+        // this node is the keyspace's only writer, so what changed in it
+        // this run is exactly the delta
+        ks.run_changes(out);
     }
 }
 
@@ -438,9 +469,11 @@ where
 {
     type Takes = Bag<T>;
     type Gives = Bag<T>;
-    type State = ();
+    type State = Counted<T>;
 
-    fn state(&self) {}
+    fn state(&self) -> Counted<T> {
+        Counted::new(self.counts)
+    }
 
     fn keyspaces(&self) -> Vec<Declare> {
         vec![Declare::derived(self.counts)]
@@ -616,7 +649,7 @@ where
     }
 }
 
-//// LINEARS
+// Linear operators
 
 pub struct FusedLinears<In, X>(X, PhantomData<fn() -> In>);
 
@@ -1059,7 +1092,7 @@ mod tests {
             // each class sums to 5, but key 0 alone would be -5
             v1.write(&store, &[(0, Some(-5)), (1, Some(5)), (2, Some(10))]);
             let mut tx = store.begin().unwrap();
-            assert!(tx.rebuilding() == false);
+            assert!(!tx.rebuilding());
             let mut feed = Bag::new();
             feed.push((4, -100), 1);
             v1.g.give(v1.src, &mut feed);

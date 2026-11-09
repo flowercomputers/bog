@@ -266,6 +266,46 @@ impl<T: OrderedCodec> OrderedCodec for Option<T> {
     }
 }
 
+impl<T: ResidentSize> ResidentSize for crate::state::Edge<T> {
+    fn resident_size(&self) -> usize {
+        size_of::<Self>()
+            + match self {
+                crate::state::Edge::Val(v) => heap_size(v),
+                _ => 0,
+            }
+    }
+}
+
+// Edge: Lo < Val(_) < Hi, matching tags 0 < 1 < 2.
+impl<T: OrderedCodec> OrderedCodec for crate::state::Edge<T> {
+    fn encode_ordered(&self, out: &mut impl BufMut) {
+        use crate::state::Edge;
+        match self {
+            Edge::Lo => out.put_u8(0),
+            Edge::Val(v) => {
+                out.put_u8(1);
+                v.encode_ordered(out);
+            }
+            Edge::Hi => out.put_u8(2),
+        }
+    }
+    fn decode_ordered(b: &mut &[u8]) -> Result<Self> {
+        use crate::state::Edge;
+        match take_u8(b)? {
+            0 => Ok(Edge::Lo),
+            1 => Ok(Edge::Val(T::decode_ordered(b)?)),
+            2 => Ok(Edge::Hi),
+            tag => Err(DecodeError::InvalidTag { what: "edge", tag }),
+        }
+    }
+    fn encode_ordered_size(&self) -> usize {
+        1 + match self {
+            crate::state::Edge::Val(v) => v.encode_ordered_size(),
+            _ => 0,
+        }
+    }
+}
+
 // bool: Ord is false < true, matching 0 < 1.
 impl Codec for bool {
     fn encode(&self, out: &mut impl BufMut) {

@@ -21,11 +21,11 @@ pub trait Merge: 'static {
     fn scale(diff: &mut Self::Diff, times: Delta);
 
     /// Optional fast path for determining when a value should automatically be considered deleted
-    fn consider_delete(val: &Self::Value) -> bool {
+    fn consider_delete(_val: &Self::Value) -> bool {
         false
     }
     /// Optional fast path for determining if a diff is a no-op
-    fn noop(diff: &Self::Diff) -> bool {
+    fn noop(_diff: &Self::Diff) -> bool {
         false
     }
 }
@@ -165,12 +165,12 @@ impl<M: Merge> Merge for Sparse<M> {
     }
     #[inline]
     fn consider_delete(val: &Self::Value) -> bool {
-        M::consider_delete(&val)
+        M::consider_delete(val)
     }
     #[inline]
     fn noop(diff: &Self::Diff) -> bool {
         if let Some(inner) = diff {
-            M::noop(&inner)
+            M::noop(inner)
         } else {
             true
         }

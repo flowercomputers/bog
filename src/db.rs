@@ -38,13 +38,13 @@ impl Db {
     /// open, derived state is rebuilt from the tables. Fails with
     /// [`Error::RebuildRequired`] if the graph also has unstored sources;
     /// open those with [`open_with`](Self::open_with).
-    pub(crate) fn open(builder: StoreBuilder, graph: OpDag) -> Result<Db> {
+    pub fn open(builder: StoreBuilder, graph: OpDag) -> Result<Db> {
         Self::open_inner(builder, graph, REBUILD_CHUNK, None)
     }
 
     /// [`open`](Self::open), with `replay` to feed the graph's unstored
     /// sources during a rebuild, after the tables.
-    pub(crate) fn open_with(
+    pub fn open_with(
         builder: StoreBuilder,
         graph: OpDag,
         replay: &mut ReplayGiven<'_>,
@@ -110,11 +110,11 @@ impl Db {
     }
 
     /// The latest committed state.
-    pub(crate) fn snapshot(&self) -> Snapshot<'_> {
+    pub fn snapshot(&self) -> Snapshot<'_> {
         self.store.snapshot()
     }
 
-    pub(crate) fn store(&self) -> &Store {
+    pub fn store(&self) -> &Store {
         &self.store
     }
 }

@@ -532,7 +532,7 @@ impl OpDag {
                 unreachable!("tables are table sources");
             };
             let more = feed.deliver(tx, chunk, staging.as_any_mut())?;
-            if staging.len() > 0 {
+            if !staging.is_empty() {
                 self.pending.insert(t);
             }
             self.run(tx);
@@ -572,7 +572,7 @@ impl OpDag {
             } = &mut self.nodes[t].kind
             {
                 feed.pull(tx, staging.as_any_mut());
-                if staging.len() > 0 {
+                if !staging.is_empty() {
                     self.pending.insert(t);
                 }
             }
