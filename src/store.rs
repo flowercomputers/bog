@@ -71,7 +71,7 @@ impl Default for StoreOptions {
             cache_size: 32 << 20,
             max_tables: 8,
             compaction_width: 4,
-            max_layers: 32,
+            max_layers: 8,
         }
     }
 }
@@ -132,6 +132,8 @@ pub struct MemoryStats {
     /// of layers pinned only by old snapshots are not counted.
     pub run_index_bytes: usize,
     pub tables: usize,
+    /// Layers in memory: commits not yet folded together or checkpointed.
+    pub layers: usize,
 }
 
 /// Estimated bookkeeping a `BTreeMap` spends per entry beyond the key and
@@ -590,6 +592,38 @@ impl<'s> Snapshot<'s> {
         Ok(None)
     }
 
+    /// A reader of `keyspace`'s values for keys asked in ascending order:
+    /// one lookup per layer in memory, and one forward pass over each
+    /// table, so a sorted batch reads each table block at most once.
+    pub(crate) fn lookup<K, M>(&self, keyspace: KeyspaceId<K, M>) -> Lookup<'_, K, M::Value>
+    where
+        K: OrderedCodec + 'static,
+        M: Merge,
+    {
+        let ks = keyspace.raw();
+        Lookup {
+            trees: self
+                .version
+                .layers
+                .iter()
+                .rev()
+                .filter_map(|l| l.trees.get(&ks))
+                .map(|t| {
+                    t.tree
+                        .downcast_ref::<Resident<K, M::Value>>()
+                        .expect("keyspace id reused with a different type")
+                })
+                .collect(),
+            tables: self
+                .version
+                .tables_for(ks)
+                .map(|t| t.cursor(ks, Some(&self.store.cache)))
+                .collect(),
+            ks,
+            probe: Vec::new(),
+        }
+    }
+
     /// The live entries of `keyspace` with keys in `range`, in key order.
     pub fn range<K, M>(
         &self,
@@ -756,6 +790,45 @@ impl<'s> Snapshot<'s> {
     }
 }
 
+/// Point reads of one keyspace in ascending key order; see
+/// [`Snapshot::lookup`].
+pub(crate) struct Lookup<'a, K, V> {
+    /// Layers holding the keyspace, newest first.
+    trees: Vec<&'a Resident<K, V>>,
+    /// Its tables, newest first, each read forward.
+    tables: Vec<TableCursor<'a>>,
+    ks: u64,
+    probe: Vec<u8>,
+}
+
+impl<'a, K: OrderedCodec, V: Codec + Clone> Lookup<'a, K, V> {
+    /// The value of `key`, which must not be less than the last key asked.
+    pub(crate) fn get(&mut self, key: &K) -> Result<Option<Cow<'a, V>>> {
+        for tree in &self.trees {
+            if let Some(v) = tree.get(key) {
+                return Ok(v.as_ref().map(Cow::Borrowed));
+            }
+        }
+        if self.tables.is_empty() {
+            return Ok(None);
+        }
+        self.probe.clear();
+        key.encode_ordered(&mut self.probe);
+        for t in &mut self.tables {
+            t.seek(&self.probe)?;
+            if let Some((k, v)) = t.current()
+                && k == &self.probe[..]
+            {
+                let v = decode_all::<Option<V>>(v).map_err(|e| {
+                    Error::corrupt(t.path(), 0, format!("keyspace {}: {e}", self.ks))
+                })?;
+                return Ok(v.map(Cow::Owned));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// A keyspace's types, captured when it is registered with the builder.
 /// Replay uses it to decode WAL sections; transactions use it to refuse
 /// keyspaces nobody declared.
@@ -776,6 +849,8 @@ struct KeyspaceDecl {
     measure: fn(&(dyn Any + Send + Sync)) -> usize,
     /// Fold trees, oldest first, into one; see [`fold_trees`].
     fold: fn(&[&LayerTree], bool) -> LayerTree,
+    /// Fold a newer tree into an older one in place; see [`fold_into`].
+    fold_into: fn(&mut LayerTree, LayerTree, bool) -> Result<(), LayerTree>,
     /// Run indexes, in slot order.
     indexes: Vec<IndexKind>,
 }
@@ -793,35 +868,95 @@ where
             .downcast_ref::<Resident<K, V>>()
             .expect("layer tree has the registered type")
     }
-    let (oldest, newer) = trees.split_first().expect("folding at least one tree");
-    let mut tree = cast::<K, V>(oldest).clone();
-    let mut bytes = oldest.bytes;
-    if drop_tombstones {
-        tree.retain(|k, v| {
-            if v.is_none() {
-                bytes -= resident_entry_bytes(k, v);
+    // a k-way merge of the sorted trees, newest winning a shared key,
+    // into a sorted run the map is then built from in one pass
+    let mut its: Vec<_> = trees
+        .iter()
+        .map(|t| cast::<K, V>(t).iter().peekable())
+        .collect();
+    let mut merged: Vec<(K, Option<V>)> = Vec::with_capacity(
+        trees
+            .iter()
+            .map(|t| cast::<K, V>(t).len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut bytes = 0;
+    loop {
+        // the least head key; among equals, the newest tree's
+        let mut win: Option<(usize, &K)> = None;
+        for (i, it) in its.iter_mut().enumerate() {
+            if let Some(&(k, _)) = it.peek()
+                && win.is_none_or(|(_, best)| k <= best)
+            {
+                win = Some((i, k));
             }
-            v.is_some()
-        });
-    }
-    for (k, v) in newer.iter().flat_map(|t| cast::<K, V>(t)) {
+        }
+        let Some((w, _)) = win else { break };
+        let (k, v) = its[w].next().expect("the winner has a head");
+        for it in its.iter_mut() {
+            it.next_if(|(other, _)| *other == k);
+        }
         if drop_tombstones && v.is_none() {
-            if let Some(old) = tree.remove(k) {
-                bytes -= resident_entry_bytes(k, &old);
-            }
             continue;
         }
         bytes += resident_entry_bytes(k, v);
-        if let Some(old) = tree.insert(k.clone(), v.clone()) {
-            bytes -= resident_entry_bytes(k, &old);
-        }
+        merged.push((k.clone(), v.clone()));
     }
     LayerTree {
-        tree: Arc::new(tree),
+        tree: Arc::new(merged.into_iter().collect::<Resident<K, V>>()),
         bytes,
         // the caller registers and builds them
         indexes: Arc::default(),
     }
+}
+
+/// Apply `newer`'s entries to `base` in place, deleting rather than
+/// keeping tombstones with `drop_tombstones`. Fails, handing `newer` back,
+/// if `base`'s tree is shared, so it cannot change. The caller resets
+/// `base`'s run indexes.
+fn fold_into<K, V>(
+    base: &mut LayerTree,
+    newer: LayerTree,
+    drop_tombstones: bool,
+) -> Result<(), LayerTree>
+where
+    K: Ord + Clone + ResidentSize + Send + Sync + 'static,
+    V: Clone + ResidentSize + Send + Sync + 'static,
+{
+    let Some(tree) = Arc::get_mut(&mut base.tree) else {
+        return Err(newer);
+    };
+    let tree = tree
+        .downcast_mut::<Resident<K, V>>()
+        .expect("layer tree has the registered type");
+    let newer = newer
+        .tree
+        .downcast::<Resident<K, V>>()
+        .expect("layer tree has the registered type");
+    // moved out when nothing else holds it, else copied
+    let newer = Arc::try_unwrap(newer).unwrap_or_else(|shared| (*shared).clone());
+    let mut bytes = base.bytes;
+    for (k, v) in newer {
+        if drop_tombstones && v.is_none() {
+            if let Some(old) = tree.remove(&k) {
+                bytes -= resident_entry_bytes(&k, &old);
+            }
+            continue;
+        }
+        bytes += resident_entry_bytes(&k, &v);
+        match tree.get_mut(&k) {
+            Some(slot) => {
+                bytes -= resident_entry_bytes(&k, slot);
+                *slot = v;
+            }
+            None => {
+                tree.insert(k, v);
+            }
+        }
+    }
+    base.bytes = bytes;
+    Ok(())
 }
 
 fn measure_tree<K, V>(tree: &(dyn Any + Send + Sync)) -> usize
@@ -1011,6 +1146,7 @@ impl StoreBuilder {
             write_run: write_run::<K, M::Value>,
             measure: measure_tree::<K, M::Value>,
             fold: fold_trees::<K, M::Value>,
+            fold_into: fold_into::<K, M::Value>,
             indexes: Vec::new(),
         };
         if let Some(prev) = self.keyspaces.get(&id.raw()) {
@@ -1711,6 +1847,7 @@ impl Shared {
             index_bytes: version.tables.iter().map(|t| t.index_bytes()).sum(),
             run_index_bytes: self.run_index_bytes(&version),
             tables: version.tables.len(),
+            layers: version.layers.len(),
         }
     }
 
@@ -1869,10 +2006,12 @@ impl Store {
             floors: current.floors.clone(),
         }));
 
-        // release the writer only after publishing, so the next tx's
-        // snapshot includes this one
-        drop(writer);
+        // the tx's snapshot goes first, so maintenance waiting on the
+        // writer finds no snapshot and can fold in place; the writer is
+        // released only after publishing, so the next tx's snapshot
+        // includes this one
         drop(snapshot);
+        drop(writer);
         if self.maintenance_due() {
             self.request_maintenance();
         }
@@ -2168,6 +2307,9 @@ impl Shared {
             .layer_work
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        if let Some(folded) = self.fold_in_place() {
+            return folded;
+        }
         let before = self.current.load_full();
         let Some(start) = fold_plan(&before.layers, self.opts.max_layers) else {
             return false;
@@ -2198,6 +2340,112 @@ impl Shared {
         drop(w);
         self.progress();
         true
+    }
+
+    /// Fold every layer into the oldest in place, if no snapshot can see
+    /// them: then nothing but the current version holds them, and they
+    /// need not be copied. Returns whether there was anything to fold, or
+    /// `None` if they are shared and must be folded by copying.
+    ///
+    /// Holds the writer lock and the snapshot registry throughout, so no
+    /// commit or snapshot can start meanwhile, and swaps the current
+    /// version out to own it. Anything else still holding it, such as a
+    /// stats read, sends it back to the copying fold.
+    fn fold_in_place(&self) -> Option<bool> {
+        let w = self.lock_writer();
+        let snapshots = self.snapshots();
+        if !snapshots.is_empty() {
+            return None;
+        }
+        let current = self.current.load_full();
+        if current.layers.len() < 2 {
+            return Some(false);
+        }
+        // what readers of stats see for the moment: nobody else can read
+        // layers while the registry is held
+        let stand_in = Arc::new(Version {
+            epoch: current.epoch,
+            layers: Vec::new(),
+            tables: current.tables.clone(),
+            resident_bytes: 0,
+            floors: current.floors.clone(),
+        });
+        drop(current);
+        let version = match Arc::try_unwrap(self.current.swap(stand_in)) {
+            Ok(v) => v,
+            Err(shared) => {
+                self.current.store(shared);
+                return None;
+            }
+        };
+        let Version {
+            epoch,
+            layers,
+            tables,
+            floors,
+            ..
+        } = version;
+        let mut layers = layers.into_iter();
+        let mut base = match Arc::try_unwrap(layers.next().expect("two layers")) {
+            Ok(base) => base,
+            Err(shared) => {
+                let layers: Vec<_> = std::iter::once(shared).chain(layers).collect();
+                self.current.store(Arc::new(Version {
+                    epoch,
+                    resident_bytes: layers.iter().map(|l| l.bytes).sum(),
+                    layers,
+                    tables,
+                    floors,
+                }));
+                return None;
+            }
+        };
+        // nothing lies beneath the oldest layer without tables
+        let drop_tombstones = tables.is_empty();
+        for layer in layers {
+            let (newest, trees) = match Arc::try_unwrap(layer) {
+                Ok(l) => (l.epoch, l.trees),
+                Err(shared) => (shared.epoch, shared.trees.clone()),
+            };
+            for (ks, newer) in trees {
+                let decl = &self.keyspaces[&ks];
+                match base.trees.entry(ks) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(newer);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let slot = e.get_mut();
+                        if let Err(newer) = (decl.fold_into)(slot, newer, drop_tombstones) {
+                            // the base tree is shared after all: copy it
+                            *slot = (decl.fold)(&[&*slot, &newer], drop_tombstones);
+                        }
+                        // rebuilt by the next reader that wants them
+                        slot.indexes = Arc::new(LayerIndexes::new(decl.indexes.len()));
+                        if slot.bytes == 0 {
+                            e.remove();
+                        }
+                    }
+                }
+            }
+            base.epoch = newest;
+        }
+        base.bytes = base.trees.values().map(|t| t.bytes).sum();
+        let layers = if base.trees.is_empty() {
+            Vec::new()
+        } else {
+            vec![Arc::new(base)]
+        };
+        self.current.store(Arc::new(Version {
+            epoch,
+            resident_bytes: layers.iter().map(|l| l.bytes).sum(),
+            layers,
+            tables,
+            floors,
+        }));
+        drop(snapshots);
+        drop(w);
+        self.progress();
+        Some(true)
     }
 
     /// One layer holding `layers`, oldest first, or `None` if deletes
@@ -4035,6 +4283,44 @@ mod tests {
         assert!(store.stats().tables > 3);
         drop(store);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn layers_no_snapshot_can_see_fold_in_place() {
+        let store = mem();
+        let base_tree = |store: &Store| {
+            let v = store.current.load();
+            assert_eq!(v.layers.len(), 1, "folded into one");
+            let t = &v.layers[0].trees[&KS.raw()];
+            let measured = (store.keyspaces[&KS.raw()].measure)(&*t.tree);
+            assert_eq!(t.bytes, measured, "bytes stay exact");
+            Arc::as_ptr(&t.tree) as *const () as usize
+        };
+        for i in 0..50u8 {
+            put(&store, &[(i, Some(i as i64))]);
+        }
+        store.quiesce().unwrap();
+        let tree = base_tree(&store);
+        put(&store, &[(3, None), (60, Some(60))]);
+        store.quiesce().unwrap();
+        assert_eq!(base_tree(&store), tree, "the same tree, changed in place");
+        assert_eq!(live_rows(&store).len(), 50);
+        assert_eq!(read(&store, 3), None);
+
+        // a snapshot can see the layers, so they fold by copying, and it
+        // keeps its view
+        let snap = store.snapshot();
+        for i in 70..80u8 {
+            put(&store, &[(i, Some(1))]);
+        }
+        store.quiesce().unwrap();
+        assert_eq!(snap.range(KS, ..).count(), 50);
+        assert_eq!(snap.get(KS, &3).unwrap(), None);
+        drop(snap);
+        put(&store, &[(90, Some(1))]);
+        store.quiesce().unwrap();
+        base_tree(&store);
+        assert_eq!(live_rows(&store).len(), 61);
     }
 
     #[test]

@@ -427,9 +427,13 @@ where
         K: Clone,
         M::Value: PartialEq,
     {
-        let mut cursor = self.cursor(Bound::Unbounded, Bound::Unbounded, false);
+        self.state.check()?;
+        let mut lookup = self.snap.lookup(self.id);
         for (key, change) in changes {
-            let old = cursor.seek_get(&key)?;
+            let old = match self.writes.get(&key) {
+                Some(c) => c.new_value().map(Cow::Borrowed),
+                None => lookup.get(&key).inspect_err(|e| self.state.fail(e))?,
+            };
             if let Some(resolved) = materialize(old.as_deref(), change) {
                 out.push((key, resolved));
             }

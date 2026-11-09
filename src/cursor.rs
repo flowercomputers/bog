@@ -10,7 +10,11 @@
 //! entries are compared as encoded bytes when seeking and decoded only when
 //! they become a source's head.
 
-use std::{borrow::Cow, collections::BTreeMap, ops::Bound};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, btree_map},
+    ops::Bound,
+};
 
 use crate::{
     Change,
@@ -24,7 +28,25 @@ use crate::{
 
 type Entry<'a, K, V> = (Cow<'a, K>, Option<Cow<'a, V>>);
 
-type Pairs<'a, K, V> = std::iter::Peekable<Box<dyn Iterator<Item = (&'a K, &'a V)> + 'a>>;
+/// A map range walked forward or backward.
+pub(crate) struct Walk<'a, K, V> {
+    range: btree_map::Range<'a, K, V>,
+    rev: bool,
+}
+
+impl<'a, K, V> Iterator for Walk<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rev {
+            self.range.next_back()
+        } else {
+            self.range.next()
+        }
+    }
+}
+
+type Pairs<'a, K, V> = std::iter::Peekable<Walk<'a, K, V>>;
 
 /// `map`'s entries within the bounds, walked forward or, with `rev`,
 /// backward.
@@ -34,14 +56,16 @@ fn pairs<'a, K: Ord, V>(
     upper: Bound<&K>,
     rev: bool,
 ) -> Pairs<'a, K, V> {
-    let range = map.range::<K, _>((lower, upper));
-    let it: Box<dyn Iterator<Item = (&'a K, &'a V)> + 'a> = if rev {
-        Box::new(range.rev())
-    } else {
-        Box::new(range)
-    };
-    it.peekable()
+    Walk {
+        range: map.range::<K, _>((lower, upper)),
+        rev,
+    }
+    .peekable()
 }
+
+/// Entries a memory source steps through before a seek searches its map
+/// again instead: dense batches of seeks mostly land a few entries on.
+const SEEK_STEPS: usize = 8;
 
 /// Whether no key can lie within the bounds.
 pub(crate) fn empty_bounds<K: Ord>(lower: Bound<&K>, upper: Bound<&K>) -> bool {
@@ -267,11 +291,20 @@ where
             | Source::Layer { rev, .. }
             | Source::Table { rev, .. } => *rev,
         };
-        if self
-            .head_key()
-            .is_none_or(|k| if rev { k <= key } else { k >= key })
-        {
+        let reached = |s: &Self| {
+            s.head_key()
+                .is_none_or(|k| if rev { k <= key } else { k >= key })
+        };
+        if reached(self) {
             return Ok(());
+        }
+        if !matches!(self, Source::Table { .. }) {
+            for _ in 0..SEEK_STEPS {
+                self.advance()?;
+                if reached(self) {
+                    return Ok(());
+                }
+            }
         }
         let (lower, upper) = if rev {
             (Bound::Unbounded, Bound::Included(key))
