@@ -186,6 +186,14 @@ impl<'tx> WriteTx<'tx> {
     pub fn failure(&self) -> Option<Error> {
         self.state.check().err()
     }
+
+    /// Reject this tx with an application error. The tx fails as it would
+    /// on a read error: the graph stops, and finishing it returns
+    /// [`Error::Rejected`] carrying `err`. A tx that already failed keeps its
+    /// first error.
+    pub fn reject(&self, err: impl std::error::Error + Send + Sync + 'static) {
+        self.state.fail(&Error::Rejected(std::sync::Arc::new(err)));
+    }
     pub(crate) fn into_parts(
         self,
     ) -> (

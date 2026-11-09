@@ -39,6 +39,29 @@ impl Merge for () {
     fn scale(_: &mut Self::Diff, _: Delta) {}
 }
 
+impl Merge for i128 {
+    type Diff = i128;
+    type Value = i128;
+    fn base() -> i128 {
+        0
+    }
+    #[inline]
+    fn merge<'a>(val: &mut i128, diffs: impl Iterator<Item = Cow<'a, i128>>) {
+        *val += diffs.map(|d| *d).sum::<i128>();
+    }
+    #[inline]
+    fn combine<'a>(old: &mut i128, new: impl Iterator<Item = Cow<'a, i128>>) {
+        *old += new.map(|d| *d).sum::<i128>();
+    }
+    #[inline]
+    fn noop(diff: &Self::Diff) -> bool {
+        *diff == 0
+    }
+    fn scale(d: &mut i128, n: Delta) {
+        *d *= n as i128;
+    }
+}
+
 impl Merge for i64 {
     type Diff = i64;
     type Value = i64;

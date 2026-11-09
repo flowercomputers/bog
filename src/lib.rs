@@ -10,6 +10,7 @@ use crate::merge::*;
 mod codec;
 mod cursor;
 pub mod error;
+
 mod manifest;
 mod store;
 mod table;
@@ -342,6 +343,175 @@ where
                 return;
             }
             out.absorb_one(k, resolved);
+        }
+    }
+}
+
+/// Counts each row's multiplicity in `counts` and emits a row when its
+/// presence changes: `+1` when its count becomes positive, `-1` when it
+/// stops being positive. Downstream sees each row at most once.
+pub struct Distinct<T> {
+    counts: KeyspaceId<T, Delta>,
+    scratch: Bag<T>,
+    resolved: Vec<(T, Change<Delta>)>,
+}
+
+impl<T: Ord> Distinct<T> {
+    pub fn new(counts: KeyspaceId<T, Delta>) -> Self {
+        Distinct {
+            counts,
+            scratch: Bag::new(),
+            resolved: Vec::new(),
+        }
+    }
+}
+
+impl<T> Nary for Distinct<T>
+where
+    T: OrderedCodec + Clone + Send + Sync + 'static,
+{
+    type Takes = Bag<T>;
+    type Gives = Bag<T>;
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], out: &mut Bag<T>) {
+        self.scratch.clear();
+        for b in batches {
+            for (t, d) in b.diffs() {
+                self.scratch.push(t.clone(), d);
+            }
+        }
+        let mut ks = tx.keyspace(self.counts);
+        if ks
+            .resolve_sorted(std::mem::take(&mut self.scratch), &mut self.resolved)
+            .is_err()
+        {
+            self.resolved.clear();
+            return;
+        }
+        for (t, change) in self.resolved.drain(..) {
+            let (old, new) = match &change {
+                Change::Insert(n) => (0, *n),
+                Change::Delete(o) => (*o, 0),
+                Change::Replace(o, n) => (*o, *n),
+                Change::Modify(_) => unreachable!("resolved"),
+            };
+            // a count of zero means the row is gone
+            let change = match change {
+                Change::Insert(0) => continue,
+                Change::Replace(o, 0) => Change::Delete(o),
+                c => c,
+            };
+            if ks.absorb(t.clone(), change).is_err() {
+                return;
+            }
+            match (old > 0, new > 0) {
+                (false, true) => out.push(t, 1),
+                (true, false) => out.push(t, -1),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Rejects the tx when a value its input view is left holding fails
+/// `check`. Only the values an epoch ends with are checked, so a tx that
+/// passes through a bad state and recovers within itself is accepted.
+pub struct Check<K, M, F>(F, PhantomData<fn() -> (K, M)>);
+
+impl<K, M, F> Check<K, M, F> {
+    pub fn new(check: F) -> Self {
+        Check(check, PhantomData)
+    }
+}
+
+impl<K, M, F, E> Nary for Check<K, M, F>
+where
+    K: Ord + Send + 'static,
+    M: Merge + Send,
+    M::Value: Send,
+    M::Diff: Send,
+    F: Fn(&K, &M::Value) -> Result<(), E> + Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type Takes = Register<K, M>;
+    type Gives = Bag<()>;
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Register<K, M>], _out: &mut Bag<()>) {
+        for b in batches {
+            for (k, change) in b.iter() {
+                if let Some(v) = change.new_value()
+                    && let Err(e) = (self.0)(k, v)
+                {
+                    tx.reject(e);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Maintains `index`, a keyspace holding `key(k, v)` for every live
+/// `(k, v)` of its input view for which `key` returns one, and emits the
+/// index's changes. `key` must not map two live entries to one index key.
+///
+/// An index ordered differently from its source is how a view is read in
+/// another order: a leaderboard is balances keyed by `(-balance, user)`.
+pub struct IndexBy<K, M, K2, F> {
+    index: KeyspaceId<K2, ()>,
+    key: F,
+    _m: PhantomData<fn() -> (K, M)>,
+}
+
+impl<K, M: Merge, K2, F> IndexBy<K, M, K2, F> {
+    pub fn new(index: KeyspaceId<K2, ()>, key: F) -> Self {
+        IndexBy {
+            index,
+            key,
+            _m: PhantomData,
+        }
+    }
+}
+
+impl<K, M, K2, F> Nary for IndexBy<K, M, K2, F>
+where
+    K: Ord + Send + 'static,
+    M: Merge + Send,
+    M::Value: Send,
+    M::Diff: Send,
+    K2: OrderedCodec + Clone + Send + Sync + 'static,
+    F: Fn(&K, &M::Value) -> Option<K2> + Send,
+{
+    type Takes = Register<K, M>;
+    type Gives = Bag<K2>;
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Register<K, M>], out: &mut Bag<K2>) {
+        let mut ix = tx.keyspace(self.index);
+        for b in batches {
+            for (k, change) in b.iter() {
+                let (old, new) = match change {
+                    Change::Insert(v) => (None, Some(v)),
+                    Change::Delete(o) => (Some(o), None),
+                    Change::Replace(o, n) => (Some(o), Some(n)),
+                    Change::Modify(_) => unreachable!("views hold materialized changes"),
+                };
+                let old = old.and_then(|v| (self.key)(k, v));
+                let new = new.and_then(|v| (self.key)(k, v));
+                if old == new {
+                    continue;
+                }
+                if let Some(o) = old {
+                    if ix.absorb(o.clone(), Change::Delete(())).is_err() {
+                        return;
+                    }
+                    out.push(o, -1);
+                }
+                if let Some(n) = new {
+                    if ix.absorb(n.clone(), Change::Insert(())).is_err() {
+                        return;
+                    }
+                    out.push(n, 1);
+                }
+            }
         }
     }
 }

@@ -44,6 +44,10 @@ pub enum Error {
     UnknownKeyspace(u64),
     /// A write transaction outgrew its memory limit and was killed.
     OutOfMemory(OutOfMemory),
+    /// The application rejected a write transaction, typically from an
+    /// operator enforcing a constraint. Carries the application's error;
+    /// downcast it to recover the original.
+    Rejected(Arc<dyn std::error::Error + Send + Sync>),
     /// An earlier failure left what is on disk uncertain, so the store
     /// refuses writes until it is reopened, which recovers from disk.
     Poisoned(Arc<Error>),
@@ -92,6 +96,7 @@ impl fmt::Display for Error {
                 write!(f, "the store holds keyspace {id}, which is not registered")
             }
             Self::OutOfMemory(oom) => oom.fmt(f),
+            Self::Rejected(why) => write!(f, "transaction rejected: {why}"),
             Self::Poisoned(cause) => write!(f, "store refuses writes until reopened: {cause}"),
             Self::AfterCommit { epoch, source } => {
                 write!(
@@ -110,6 +115,7 @@ impl std::error::Error for Error {
             Self::Poisoned(cause) => Some(&**cause),
             Self::AfterCommit { source, .. } => Some(&**source),
             Self::OutOfMemory(oom) => Some(oom),
+            Self::Rejected(why) => Some(&**why),
             _ => None,
         }
     }
