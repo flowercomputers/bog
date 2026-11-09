@@ -2,12 +2,12 @@ use std::{
     any::{Any, type_name},
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt,
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, Write},
+    io::Write,
+    ops::{Bound, Range, RangeBounds},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
     time::Instant,
@@ -16,100 +16,16 @@ use std::{
 use arc_swap::ArcSwap;
 
 use crate::{
+    Change,
     codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
-    manifest::{self, Checkpoint, MANIFEST_TMP, Manifest, Segment},
+    cursor::{Cursor, Source},
+    error::{Error, IoContext, Result},
+    manifest::{self, Checkpoint, InstallError, MANIFEST_TMP, Manifest, Segment},
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
-    table::{BlockCache, DEFAULT_BLOCK_SIZE, Table, TableBuilder, TableError},
-    tx::{KeyspaceId, OutOfMemory, WriteTx},
+    table::{BlockCache, DEFAULT_BLOCK_SIZE, TOMBSTONE, Table, TableBuilder, TableCursor},
+    tx::{KeyspaceId, TxState, WriteTx},
 };
-
-/// Why a store could not be opened.
-#[derive(Debug)]
-pub enum OpenError {
-    Io(io::Error),
-    /// The durability policy is invalid, or needs a directory.
-    Policy(&'static str),
-    /// A size option is out of range.
-    InvalidOption(&'static str),
-    /// Another `Store` holds this directory.
-    Locked,
-    Manifest(String),
-    /// A keyspace is registered with different types than it was written with.
-    KeyspaceType {
-        id: u64,
-        recorded: (String, String),
-        registered: (&'static str, &'static str),
-    },
-    /// The WAL holds data for a keyspace that was not registered.
-    UnknownKeyspace(u64),
-    /// A logged frame is damaged somewhere it cannot be a torn tail.
-    Corrupt {
-        file: PathBuf,
-        offset: u64,
-        why: String,
-    },
-}
-
-impl fmt::Display for OpenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "io error: {e}"),
-            Self::Policy(why) => write!(f, "durability policy: {why}"),
-            Self::InvalidOption(why) => write!(f, "invalid option: {why}"),
-            Self::Locked => f.write_str("store directory is locked by another open store"),
-            Self::Manifest(why) => write!(f, "bad manifest: {why}"),
-            Self::KeyspaceType {
-                id,
-                recorded,
-                registered,
-            } => write!(
-                f,
-                "keyspace {id} was written as {recorded:?} but is registered as {registered:?}"
-            ),
-            Self::UnknownKeyspace(id) => {
-                write!(f, "the WAL holds keyspace {id}, which is not registered")
-            }
-            Self::Corrupt { file, offset, why } => {
-                write!(f, "{} is corrupt at byte {offset}: {why}", file.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for OpenError {}
-
-impl From<io::Error> for OpenError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-/// Why [`Store::finish`] did not cleanly commit a transaction.
-#[derive(Debug)]
-pub enum CommitError {
-    /// The tx was killed for outgrowing its memory limit. Nothing was
-    /// committed or logged.
-    OutOfMemory(OutOfMemory),
-    /// The tx committed as `epoch` and is durable per the policy, but the
-    /// automatic checkpoint after it failed. The next commit retries it;
-    /// until one succeeds, memory and the WAL stay over their limits.
-    Checkpoint { epoch: u64, error: io::Error },
-}
-
-impl fmt::Display for CommitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OutOfMemory(oom) => oom.fmt(f),
-            Self::Checkpoint { epoch, error } => write!(
-                f,
-                "committed epoch {epoch}, but the checkpoint after it failed: {error}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CommitError {}
 
 /// Size limits. Memory use is estimated with [`ResidentSize`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,6 +44,12 @@ pub(crate) struct StoreOptions {
     pub block_size: usize,
     /// Bytes of table blocks to keep cached.
     pub cache_size: usize,
+    /// Compact once there are more checkpoint tables than this. Every
+    /// table is checked on a read that misses memory, so this bounds read
+    /// cost.
+    pub max_tables: usize,
+    /// How many adjacent tables one compaction merges.
+    pub compaction_width: usize,
 }
 
 impl Default for StoreOptions {
@@ -138,19 +60,27 @@ impl Default for StoreOptions {
             tx_memory_limit: 64 << 20,
             block_size: DEFAULT_BLOCK_SIZE,
             cache_size: 32 << 20,
+            max_tables: 8,
+            compaction_width: 4,
         }
     }
 }
 
 impl StoreOptions {
-    fn validate(&self) -> Result<(), OpenError> {
-        if self.block_size == 0 {
-            return Err(OpenError::InvalidOption(
-                "block size must be at least one byte",
+    fn validate(&self) -> Result<()> {
+        if self.max_tables == 0 {
+            return Err(Error::InvalidOption("max tables must be at least one"));
+        }
+        if self.compaction_width < 2 {
+            return Err(Error::InvalidOption(
+                "compaction must merge at least two tables",
             ));
         }
+        if self.block_size == 0 {
+            return Err(Error::InvalidOption("block size must be at least one byte"));
+        }
         if self.block_size > u32::MAX as usize / 2 {
-            return Err(OpenError::InvalidOption("block size must fit a u32 block"));
+            return Err(Error::InvalidOption("block size must fit a u32 block"));
         }
         Ok(())
     }
@@ -163,6 +93,8 @@ impl StoreOptions {
             ("tx-memory-limit", self.tx_memory_limit as u64),
             ("block-size", self.block_size as u64),
             ("cache-size", self.cache_size as u64),
+            ("max-tables", self.max_tables as u64),
+            ("compaction-width", self.compaction_width as u64),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -324,12 +256,15 @@ struct Version {
 }
 
 struct Wal {
+    path: PathBuf,
     file: File,
+    /// Make the next write fail, to test what a failed write does.
+    #[cfg(test)]
+    fail_next_write: bool,
     buffer: Vec<u8>,
     size: usize,
 }
 impl Wal {
-    // todo: make this fallible!
     /// Buffer one frame holding a whole transaction, so replay sees either
     /// all of a tx or none of it: `crc32 | epoch u64 | len u64 | payload`,
     /// little endian, with the crc covering everything after it. `payload`
@@ -347,22 +282,22 @@ impl Wal {
         self.size += self.buffer.len() - start;
     }
 
-    fn flush(&mut self, write: bool, sync: bool) {
+    fn flush(&mut self, write: bool, sync: bool) -> Result<()> {
+        #[cfg(test)]
+        if write && std::mem::take(&mut self.fail_next_write) {
+            return Err(std::io::Error::other("injected write failure"))
+                .ctx("writing WAL", &self.path);
+        }
         if write && !self.buffer.is_empty() {
-            self.file.write_all(&self.buffer).unwrap();
+            self.file
+                .write_all(&self.buffer)
+                .ctx("writing WAL", &self.path)?;
             self.buffer.clear();
         }
         if sync {
-            self.file.sync_data().unwrap();
+            self.file.sync_data().ctx("syncing WAL", &self.path)?;
         }
-    }
-
-    fn size(&self) -> usize {
-        debug_assert_eq!(
-            self.size,
-            self.file.metadata().unwrap().len() as usize + self.buffer.len()
-        );
-        self.size
+        Ok(())
     }
 }
 /// Append one payload section, `keyspace u64 | len u64 | body`, with the
@@ -381,7 +316,8 @@ impl Drop for Wal {
     /// A clean shutdown hands buffered frames to the OS. It does not fsync:
     /// that is the policy's call.
     fn drop(&mut self) {
-        self.flush(true, false);
+        // nowhere to report a failure; the next open replays what landed
+        let _ = self.flush(true, false);
     }
 }
 
@@ -397,6 +333,9 @@ pub(crate) struct StoreWriter {
     dp: DurabilityPolicy,
     last_write: Option<Instant>,
     last_fsync: Option<Instant>,
+    /// Set when a failure leaves what is on disk uncertain; every later
+    /// write fails with it until the store is reopened.
+    poisoned: Option<Error>,
 }
 impl StoreWriter {
     fn new(
@@ -412,7 +351,54 @@ impl StoreWriter {
             dp,
             last_write: None,
             last_fsync: None,
+            poisoned: None,
         }
+    }
+
+    fn check(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuse every later write: `cause` left what is on disk uncertain.
+    ///
+    /// Buffered WAL frames are discarded rather than written on drop: after
+    /// a failed write the file may end in a partial frame, and replay stops
+    /// there, so nothing appended after it would be seen anyway, and the tx
+    /// that failed must not reappear on reopen.
+    fn poison(&mut self, cause: Error) -> Error {
+        if let Some(wal) = self.wal.as_mut() {
+            wal.buffer.clear();
+        }
+        let e = self
+            .poisoned
+            .get_or_insert(Error::Poisoned(Arc::new(cause)))
+            .clone();
+        e
+    }
+
+    /// Make `next` the live manifest. A failure that leaves the old one
+    /// live is an ordinary error; one that leaves it unknown which survives
+    /// a crash poisons the store.
+    fn install_manifest(&mut self, dir: &Path, next: Manifest) -> Result<()> {
+        manifest::stage(dir, &next).ctx("writing manifest in", dir)?;
+        match manifest::install(dir) {
+            Ok(()) => {}
+            Err(InstallError::Unchanged(e)) => {
+                return Err(Error::io(
+                    format!("installing manifest in {}", dir.display()),
+                    e,
+                ));
+            }
+            Err(InstallError::Uncertain(e)) => {
+                let cause = Error::io(format!("syncing {}", dir.display()), e);
+                return Err(self.poison(cause));
+            }
+        }
+        self.manifest = next;
+        Ok(())
     }
 
     /// Log one transaction, its payload written by `payload` (given `None`
@@ -420,17 +406,22 @@ impl StoreWriter {
     /// the bytes appended to the WAL.
     // todo: windowed policies only flush when the next tx commits; a quiet
     // store needs a clock source to flush on its own.
-    fn log_with(&mut self, epoch: u64, payload: impl FnOnce(Option<&mut Vec<u8>>)) -> u64 {
+    ///
+    /// A failed write or fsync poisons the store: the frame, and frames
+    /// buffered before it, may or may not be on disk.
+    fn log_with(&mut self, epoch: u64, payload: impl FnOnce(Option<&mut Vec<u8>>)) -> Result<u64> {
         let Some(wal) = self.wal.as_mut() else {
             payload(None);
-            return 0;
+            return Ok(0);
         };
         let before = wal.size;
         wal.append_with(epoch, |buf| payload(Some(buf)));
         let appended = (wal.size - before) as u64;
         let now = Instant::now();
         let (write, sync) = self.dp.should(now, self.last_write, self.last_fsync);
-        wal.flush(write, sync);
+        if let Err(e) = wal.flush(write, sync) {
+            return Err(self.poison(e));
+        }
         if write {
             self.last_write = Some(now);
         }
@@ -438,7 +429,7 @@ impl StoreWriter {
             // to accurately reflect the time it actually took to fsync
             self.last_fsync = Some(Instant::now());
         }
-        appended
+        Ok(appended)
     }
 }
 
@@ -448,7 +439,7 @@ pub struct Snapshot<'s> {
 }
 impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
-        let mut map = self.store.active_snapshots.lock().unwrap();
+        let mut map = self.store.snapshots();
         match map.get_mut(&self.version.epoch) {
             Some(n) if *n > 1 => *n -= 1,
             Some(_) => {
@@ -469,8 +460,13 @@ impl<'s> Snapshot<'s> {
     }
 
     /// The newest committed value of `key`: the first layer, newest first,
-    /// that mentions the key decides, and a tombstone there means absent.
-    pub(crate) fn get<K, M>(&self, keyspace: KeyspaceId<K, M>, key: &K) -> Option<Cow<'_, M::Value>>
+    /// that mentions the key decides, then the first table, newest first.
+    /// A tombstone there means absent.
+    pub(crate) fn get<K, M>(
+        &self,
+        keyspace: KeyspaceId<K, M>,
+        key: &K,
+    ) -> Result<Option<Cow<'_, M::Value>>>
     where
         K: OrderedCodec + 'static,
         M: Merge,
@@ -489,27 +485,76 @@ impl<'s> Snapshot<'s> {
             })
             .find_map(|tree| tree.get(key));
         if let Some(slot) = hit {
-            return slot.as_ref().map(Cow::Borrowed);
+            return Ok(slot.as_ref().map(Cow::Borrowed));
         }
         if self.version.tables.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut probe = Vec::with_capacity(key.encode_ordered_size());
         key.encode_ordered(&mut probe);
-        // todo: surface read errors instead of panicking once reads are fallible
         for table in self.version.tables.iter().rev() {
-            let found = table
-                .get(ks, &probe, &self.store.cache)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", table.path().display()));
-            if let Some((block, range)) = found {
-                let value = decode_all::<Option<M::Value>>(&block[range]).unwrap_or_else(|e| {
-                    panic!("decoding keyspace {ks} in {}: {e}", table.path().display())
-                });
-                return value.map(Cow::Owned);
+            if let Some((block, range)) = table.get(ks, &probe, &self.store.cache)? {
+                let value = decode_all::<Option<M::Value>>(&block[range])
+                    .map_err(|e| Error::corrupt(table.path(), 0, format!("keyspace {ks}: {e}")))?;
+                return Ok(value.map(Cow::Owned));
             }
         }
-        None
+        Ok(None)
+    }
+
+    /// The live entries of `keyspace` with keys in `range`, in key order.
+    pub(crate) fn range<K, M>(
+        &self,
+        keyspace: KeyspaceId<K, M>,
+        range: impl RangeBounds<K>,
+    ) -> Cursor<'_, K, M>
+    where
+        K: OrderedCodec + Clone + 'static,
+        M: Merge,
+        M::Value: Codec,
+    {
+        self.cursor(
+            keyspace,
+            None,
+            range.start_bound(),
+            range.end_bound().cloned(),
+            None,
+        )
+    }
+
+    /// A merged cursor over `keyspace`, with `overlay`, a write tx's own
+    /// changes, on top when given.
+    pub(crate) fn cursor<'a, K, M>(
+        &'a self,
+        keyspace: KeyspaceId<K, M>,
+        overlay: Option<&'a BTreeMap<K, Change<M>>>,
+        lower: Bound<&K>,
+        upper: Bound<K>,
+        tx: Option<&'a TxState>,
+    ) -> Cursor<'a, K, M>
+    where
+        K: OrderedCodec + Clone + 'static,
+        M: Merge,
+        M::Value: Codec,
+    {
+        let ks = keyspace.raw();
+        let mut sources = Vec::new();
+        if let Some(overlay) = overlay {
+            sources.push(Source::overlay(overlay, lower));
+        }
+        for layer in self.version.layers.iter().rev() {
+            if let Some(tree) = layer.trees.get(&ks) {
+                let tree = tree
+                    .downcast_ref::<Resident<K, M::Value>>()
+                    .expect("keyspace id reused with a different type");
+                sources.push(Source::layer(tree, lower));
+            }
+        }
+        for table in self.version.tables.iter().rev() {
+            sources.push(Source::table(table.cursor(ks, Some(&self.store.cache)), ks));
+        }
+        Cursor::new(sources, lower, upper, tx)
     }
 }
 
@@ -524,10 +569,8 @@ struct KeyspaceDecl {
     replay: fn(&mut Option<Box<dyn Any + Send + Sync>>, &[u8]) -> Result<(), DecodeError>,
     /// Merge this keyspace's trees, newest first, into one sorted run of
     /// encoded rows.
-    write_run: fn(
-        &[&(dyn Any + Send + Sync)],
-        &mut dyn FnMut(&[u8], &[u8]) -> io::Result<()>,
-    ) -> io::Result<()>,
+    write_run:
+        fn(&[&(dyn Any + Send + Sync)], &mut dyn FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()>,
     /// Estimated resident bytes of one of this keyspace's trees.
     measure: fn(&(dyn Any + Send + Sync)) -> usize,
 }
@@ -569,8 +612,8 @@ where
 /// as encoded `(key, Option<value>)` in key order.
 fn write_run<K, V>(
     trees: &[&(dyn Any + Send + Sync)],
-    rows: &mut dyn FnMut(&[u8], &[u8]) -> io::Result<()>,
-) -> io::Result<()>
+    rows: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
+) -> Result<()>
 where
     K: OrderedCodec + Send + Sync + 'static,
     V: Codec + Send + Sync + 'static,
@@ -619,6 +662,12 @@ impl StoreBuilder {
     /// Replace every size limit at once.
     pub(crate) fn options(mut self, opts: StoreOptions) -> Self {
         self.opts = opts;
+        self
+    }
+
+    /// Adjust the size limits in place.
+    pub(crate) fn options_with(mut self, f: impl FnOnce(&mut StoreOptions)) -> Self {
+        f(&mut self.opts);
         self
     }
 
@@ -687,19 +736,19 @@ impl StoreBuilder {
         self
     }
 
-    pub(crate) fn build(self) -> Result<Store, OpenError> {
+    pub(crate) fn build(self) -> Result<Store> {
         let StoreBuilder {
             durability_policy: dp,
             dir,
             keyspaces,
             opts,
         } = self;
-        dp.validate().map_err(OpenError::Policy)?;
+        dp.validate().map_err(Error::Policy)?;
         opts.validate()?;
 
         let Some(dir) = dir else {
             if !matches!(dp.write, Never) {
-                return Err(OpenError::Policy("writing a WAL needs a directory"));
+                return Err(Error::Policy("writing a WAL needs a directory"));
             }
             let writer = StoreWriter::new(None, Manifest::new(dp), None, dp);
             return Ok(Store::new(
@@ -713,29 +762,31 @@ impl StoreBuilder {
             ));
         };
 
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).ctx("creating", &dir)?;
+        let lock_path = dir.join("LOCK");
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(dir.join("LOCK"))?;
+            .open(&lock_path)
+            .ctx("opening", &lock_path)?;
         match lock.try_lock() {
             Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(OpenError::Locked),
-            Err(TryLockError::Error(e)) => return Err(e.into()),
+            Err(TryLockError::WouldBlock) => return Err(Error::Locked(dir)),
+            Err(TryLockError::Error(e)) => return Err(e).ctx("locking", &lock_path),
         }
 
         // replay whatever is on disk even if this run will not write: the
         // previous run's settings may have differed from these
-        let mut m = match manifest::read(&dir)? {
-            Some(text) => Manifest::parse(&text).map_err(OpenError::Manifest)?,
+        let mut m = match manifest::read(&dir).ctx("reading manifest in", &dir)? {
+            Some(text) => Manifest::parse(&text).map_err(Error::Manifest)?,
             None => Manifest::new(dp),
         };
         for (id, decl) in &keyspaces {
             if let Some((key, merge)) = m.keyspaces.get(id)
                 && (key.as_str(), merge.as_str()) != (decl.key, decl.merge)
             {
-                return Err(OpenError::KeyspaceType {
+                return Err(Error::KeyspaceType {
                     id: *id,
                     recorded: (key.clone(), merge.clone()),
                     registered: (decl.key, decl.merge),
@@ -756,12 +807,17 @@ impl StoreBuilder {
         } else {
             Some(match m.active() {
                 Some(seg) => {
+                    let path = dir.join(seg.file_name());
                     let file = OpenOptions::new()
                         .append(true)
-                        .open(dir.join(seg.file_name()))?;
-                    let size = file.metadata()?.len() as usize;
+                        .open(&path)
+                        .ctx("opening WAL", &path)?;
+                    let size = file.metadata().ctx("opening WAL", &path)?.len() as usize;
                     Wal {
+                        path,
                         file,
+                        #[cfg(test)]
+                        fail_next_write: false,
                         buffer: Vec::new(),
                         size,
                     }
@@ -773,9 +829,10 @@ impl StoreBuilder {
         // what the next open would replay, which drives auto-checkpoints
         let mut wal_bytes = 0;
         for seg in &m.segments {
+            let path = dir.join(seg.file_name());
             wal_bytes += match seg.sealed {
                 Some(len) => len,
-                None => fs::metadata(dir.join(seg.file_name()))?.len(),
+                None => fs::metadata(&path).ctx("reading", &path)?.len(),
             };
         }
 
@@ -785,7 +842,12 @@ impl StoreBuilder {
             .iter()
             .map(|(id, d)| (*id, (d.key.to_string(), d.merge.to_string())))
             .collect();
-        manifest::write(&dir, &m)?;
+        manifest::stage(&dir, &m).ctx("writing manifest in", &dir)?;
+        manifest::install(&dir).map_err(|e| match e {
+            InstallError::Unchanged(e) | InstallError::Uncertain(e) => {
+                Error::io(format!("installing manifest in {}", dir.display()), e)
+            }
+        })?;
 
         let writer = StoreWriter::new(Some(dir), m, wal, dp);
         let store = Store::new(
@@ -799,11 +861,12 @@ impl StoreBuilder {
         );
         // the previous run may have left more than these limits allow
         {
-            let mut writer = store.writer.lock().unwrap();
+            let mut writer = store.lock_writer();
             if store.over_limits(&writer) {
                 store.checkpoint_locked(&mut writer)?;
             }
         }
+        store.compact_while_over()?;
         Ok(store)
     }
 }
@@ -811,19 +874,24 @@ impl StoreBuilder {
 /// Create the next WAL segment and list it in `m` as active. The file is
 /// created before the manifest names it; the manifest write syncs the
 /// directory entry.
-fn new_segment(dir: &Path, m: &mut Manifest) -> io::Result<Wal> {
+fn new_segment(dir: &Path, m: &mut Manifest) -> Result<Wal> {
     let seg = Segment {
         number: m.next_file,
         sealed: None,
     };
+    let path = dir.join(seg.file_name());
     let file = OpenOptions::new()
         .append(true)
         .create_new(true)
-        .open(dir.join(seg.file_name()))?;
+        .open(&path)
+        .ctx("creating WAL", &path)?;
     m.next_file += 1;
     m.segments.push(seg);
     Ok(Wal {
+        path,
         file,
+        #[cfg(test)]
+        fail_next_write: false,
         buffer: Vec::new(),
         size: 0,
     })
@@ -833,10 +901,10 @@ fn new_segment(dir: &Path, m: &mut Manifest) -> io::Result<Wal> {
 /// half-written manifest. A crash between creating a file and naming it,
 /// or between dropping a file from the manifest and deleting it, leaves
 /// these behind. Files with other names are left alone.
-fn sweep_orphans(dir: &Path, m: &Manifest) -> io::Result<()> {
+fn sweep_orphans(dir: &Path, m: &Manifest) -> Result<()> {
     let live: HashSet<String> = m.live_files().collect();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in fs::read_dir(dir).ctx("listing", dir)? {
+        let entry = entry.ctx("listing", dir)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let numbered = name.split_once('.').is_some_and(|(num, ext)| {
@@ -845,7 +913,7 @@ fn sweep_orphans(dir: &Path, m: &Manifest) -> io::Result<()> {
                 && num.bytes().all(|b| b.is_ascii_digit())
         });
         if (numbered && !live.contains(name)) || name == MANIFEST_TMP {
-            fs::remove_file(entry.path())?;
+            fs::remove_file(entry.path()).ctx("removing orphan", &entry.path())?;
         }
     }
     Ok(())
@@ -862,17 +930,13 @@ struct Replayed {
     torn_active: Option<u64>,
 }
 
-fn corrupt(path: &Path, offset: usize, why: impl Into<String>) -> OpenError {
-    OpenError::Corrupt {
-        file: path.to_path_buf(),
-        offset: offset as u64,
-        why: why.into(),
-    }
+fn corrupt(path: &Path, offset: usize, why: impl Into<String>) -> Error {
+    Error::corrupt(path, offset as u64, why)
 }
 
-fn frame_error(path: &Path, offset: usize) -> impl Fn(FrameError) -> OpenError + '_ {
+fn frame_error(path: &Path, offset: usize) -> impl Fn(FrameError) -> Error + '_ {
     move |e| match e {
-        FrameError::Unknown(id) => OpenError::UnknownKeyspace(id),
+        FrameError::Unknown(id) => Error::UnknownKeyspace(id),
         FrameError::Decode(why) => corrupt(path, offset, why),
     }
 }
@@ -883,11 +947,11 @@ fn open_tables(
     dir: &Path,
     m: &Manifest,
     decls: &HashMap<u64, KeyspaceDecl>,
-) -> Result<Vec<Arc<Table>>, OpenError> {
+) -> Result<Vec<Arc<Table>>> {
     let mut tables = Vec::with_capacity(m.checkpoints.len());
     for ckpt in &m.checkpoints {
         let path = dir.join(ckpt.file_name());
-        let table = Table::open(&path, ckpt.number).map_err(|e| table_error(&path, e))?;
+        let table = Table::open(&path, ckpt.number)?;
         if table.epoch() != ckpt.epoch {
             return Err(corrupt(
                 &path,
@@ -900,36 +964,25 @@ fn open_tables(
             ));
         }
         if let Some(ks) = table.keyspaces().find(|ks| !decls.contains_key(ks)) {
-            return Err(OpenError::UnknownKeyspace(ks));
+            return Err(Error::UnknownKeyspace(ks));
         }
         tables.push(Arc::new(table));
     }
     Ok(tables)
 }
 
-fn table_error(path: &Path, e: TableError) -> OpenError {
-    match e {
-        TableError::Io(e) => OpenError::Io(e),
-        TableError::Corrupt { offset, why } => corrupt(path, offset as usize, why),
-    }
-}
-
 /// Replay every WAL segment, folding all frames into one tree per
 /// keyspace. Nothing can hold a snapshot during open, so one layer is
 /// equivalent to a layer per epoch, and reads stay cheap. The WAL holds
 /// only epochs after the last checkpoint, so replay starts there.
-fn replay(
-    dir: &Path,
-    m: &Manifest,
-    decls: &HashMap<u64, KeyspaceDecl>,
-) -> Result<Replayed, OpenError> {
+fn replay(dir: &Path, m: &Manifest, decls: &HashMap<u64, KeyspaceDecl>) -> Result<Replayed> {
     let mut out = Replayed {
         epoch: m.checkpointed(),
         ..Replayed::default()
     };
     for seg in &m.segments {
         let path = dir.join(seg.file_name());
-        let bytes = fs::read(&path)?;
+        let bytes = fs::read(&path).ctx("reading WAL", &path)?;
         let limit = match seg.sealed {
             Some(len) if (len as usize) > bytes.len() => {
                 return Err(corrupt(
@@ -1039,6 +1092,8 @@ pub struct Store {
     /// WAL bytes the next open would replay. Written under the writer
     /// lock; atomic so stats can read it while a tx is open.
     wal_bytes: AtomicU64,
+    /// Held while compacting, so one compaction runs at a time.
+    compaction: Mutex<()>,
     /// Held for the store's life; released when the file is dropped.
     _lock: Option<File>,
 }
@@ -1080,8 +1135,22 @@ impl Store {
             cache: BlockCache::new(opts.cache_size),
             opts,
             wal_bytes: AtomicU64::new(wal_bytes),
+            compaction: Mutex::new(()),
             _lock: lock,
         }
+    }
+
+    /// The writer. A panic while a tx held it does not poison it: a tx
+    /// changes the writer only inside `finish`, and real failures there
+    /// poison the store explicitly.
+    fn lock_writer(&self) -> MutexGuard<'_, StoreWriter> {
+        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn snapshots(&self) -> MutexGuard<'_, BTreeMap<u64, usize>> {
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn stats(&self) -> MemoryStats {
@@ -1121,7 +1190,7 @@ impl Store {
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot<'_> {
-        let mut map = self.active_snapshots.lock().unwrap();
+        let mut map = self.snapshots();
         let version = self.current.load_full();
         *map.entry(version.epoch).or_default() += 1;
         drop(map);
@@ -1133,11 +1202,16 @@ impl Store {
 
     /// Open a write transaction over the latest committed state. Blocks
     /// while another write transaction is open. Dropping the tx without
-    /// [`finish`](Self::finish) aborts it.
-    pub(crate) fn begin(&self) -> WriteTx<'_> {
+    /// [`finish`](Self::finish) aborts it. Fails if the store is poisoned.
+    pub(crate) fn begin(&self) -> Result<WriteTx<'_>> {
         // lock first: the snapshot must not be older than the last commit
-        let writer = self.writer.lock().unwrap();
-        WriteTx::new(self.snapshot(), writer, self.opts.tx_memory_limit)
+        let writer = self.lock_writer();
+        writer.check()?;
+        Ok(WriteTx::new(
+            self.snapshot(),
+            writer,
+            self.opts.tx_memory_limit,
+        ))
     }
 
     /// Commit `tx`: log it, then publish it to readers. Returns the epoch
@@ -1145,17 +1219,20 @@ impl Store {
     /// epoch is spent and nothing is logged.
     ///
     /// The WAL write and fsync happen before readers can see the tx, so
-    /// under a strict policy nothing visible can be lost to a crash.
+    /// under a strict policy nothing visible can be lost to a crash. If they
+    /// fail, nothing is published and the store is poisoned.
     ///
     /// If the commit takes the WAL or the memtable over its limit, a
-    /// checkpoint runs before this returns.
-    pub(crate) fn finish(&self, tx: WriteTx<'_>) -> Result<Option<u64>, CommitError> {
+    /// checkpoint runs before this returns, and then compaction if there
+    /// are too many tables. A failure there is [`Error::AfterCommit`]: the
+    /// commit stands.
+    pub(crate) fn finish(&self, tx: WriteTx<'_>) -> Result<Option<u64>> {
         let (epoch, overlay, snapshot, mut writer) = tx.into_parts();
         debug_assert!(
             std::ptr::eq(snapshot.store(), self),
             "tx from another store"
         );
-        let overlay = overlay.map_err(CommitError::OutOfMemory)?;
+        let overlay = overlay?;
 
         // opening a keyspace only to read it leaves an empty handle behind
         let mut sections: Vec<_> = overlay.into_iter().filter(|(_, u)| !u.is_empty()).collect();
@@ -1177,7 +1254,7 @@ impl Store {
                 bytes += n;
                 trees.insert(ks, tree);
             }
-        });
+        })?;
         self.wal_bytes.fetch_add(logged, Relaxed);
 
         let current = self.current.load();
@@ -1195,20 +1272,23 @@ impl Store {
             resident_bytes: current.resident_bytes + bytes,
         }));
 
-        let result = if self.over_limits(&writer) {
-            match self.checkpoint_locked(&mut writer) {
-                Ok(_) => Ok(Some(epoch)),
-                Err(error) => Err(CommitError::Checkpoint { epoch, error }),
-            }
+        let checkpointed = if self.over_limits(&writer) {
+            self.checkpoint_locked(&mut writer).map(|_| ())
         } else {
-            Ok(Some(epoch))
+            Ok(())
         };
-
         // release the writer only after publishing, so the next tx's
-        // snapshot includes this one
+        // snapshot includes this one; compaction does not need it until
+        // it installs its result
         drop(writer);
         drop(snapshot);
-        result
+        checkpointed
+            .and_then(|()| self.compact_if_due())
+            .map_err(|e| Error::AfterCommit {
+                epoch,
+                source: Arc::new(e),
+            })?;
+        Ok(Some(epoch))
     }
 
     /// Write everything committed since the last checkpoint to a new table,
@@ -1217,20 +1297,23 @@ impl Store {
     /// the epoch it covers through, or `None` if nothing was committed
     /// since the last one or the store is in memory.
     ///
-    /// Each checkpoint is a delta over the previous one; they accumulate
-    /// until compaction exists. Snapshots taken before a checkpoint keep
-    /// their own layers alive until they are dropped.
+    /// Each checkpoint is a delta over the previous one, until compaction
+    /// merges them. Snapshots taken before a checkpoint keep their own
+    /// layers alive until they are dropped.
     ///
-    /// Holds the writer lock throughout, so commits wait for it.
-    pub(crate) fn checkpoint(&self) -> io::Result<Option<u64>> {
-        let mut writer = self.writer.lock().unwrap();
+    /// Holds the writer lock throughout, so commits wait for it, and it
+    /// must not be called while this thread holds a write tx.
+    pub(crate) fn checkpoint(&self) -> Result<Option<u64>> {
+        let mut writer = self.lock_writer();
+        writer.check()?;
         self.checkpoint_locked(&mut writer)
     }
 
-    fn checkpoint_locked(&self, w: &mut StoreWriter) -> io::Result<Option<u64>> {
-        let Some(dir) = w.dir.as_deref() else {
+    fn checkpoint_locked(&self, w: &mut StoreWriter) -> Result<Option<u64>> {
+        let Some(dir) = w.dir.clone() else {
             return Ok(None);
         };
+        let dir = &*dir;
         // stable: commits need the writer lock we hold
         let version = self.current.load_full();
         if version.layers.is_empty() {
@@ -1271,10 +1354,7 @@ impl Store {
             (self.keyspaces[&ks].write_run)(&trees, &mut |k, v| table.push(k, v))?;
         }
         table.finish(ckpt.epoch)?;
-        let table = Table::open(&path, ckpt.number).map_err(|e| match e {
-            TableError::Io(e) => e,
-            e => io::Error::other(e.to_string()),
-        })?;
+        let table = Table::open(&path, ckpt.number)?;
         next.checkpoints.push(ckpt);
 
         // every segment holds only epochs the checkpoint now covers
@@ -1283,7 +1363,7 @@ impl Store {
             Some(_) => Some(new_segment(dir, &mut next)?),
             None => None,
         };
-        manifest::write(dir, &next)?;
+        w.install_manifest(dir, next)?;
 
         // the checkpoint is durable: swap its table in for the layers it
         // covers, which is all of them
@@ -1300,19 +1380,196 @@ impl Store {
         // the old segment's buffered frames, if any, are covered too; its
         // drop flushes them into a file that is about to be deleted
         w.wal = wal;
-        w.manifest = next;
         for seg in retired {
             // a failure leaves an orphan for the next open to sweep
             let _ = fs::remove_file(dir.join(seg.file_name()));
         }
         Ok(Some(version.epoch))
     }
+
+    /// Compact if there are more tables than `max_tables`, unless another
+    /// compaction is already running.
+    fn compact_if_due(&self) -> Result<()> {
+        if self.current.load().tables.len() <= self.opts.max_tables {
+            return Ok(());
+        }
+        let running = match self.compaction.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            // another thread is compacting; it will get there
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+        };
+        self.compact_over(&running).map(|_| ())
+    }
+
+    /// Merge windows of adjacent tables until no more than `max_tables`
+    /// remain. Returns how many merges ran.
+    fn compact_while_over(&self) -> Result<usize> {
+        let running = self
+            .compaction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.compact_over(&running)
+    }
+
+    /// [`compact_while_over`](Self::compact_while_over), with the compaction
+    /// lock already held.
+    fn compact_over(&self, _running: &MutexGuard<'_, ()>) -> Result<usize> {
+        let mut merges = 0;
+        loop {
+            let tables = self.current.load().tables.clone();
+            if tables.len() <= self.opts.max_tables {
+                return Ok(merges);
+            }
+            let window = cheapest_window(&tables, self.opts.compaction_width);
+            self.merge_tables(&tables, window)?;
+            merges += 1;
+        }
+    }
+
+    /// Merge every table into one, dropping every tombstone. Returns
+    /// whether there was anything to merge.
+    ///
+    /// Commits continue while it merges; it takes the writer lock only to
+    /// install the result, so it must not be called while this thread
+    /// holds a write tx.
+    pub(crate) fn compact(&self) -> Result<bool> {
+        let _running = self
+            .compaction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let tables = self.current.load().tables.clone();
+        if tables.is_empty() {
+            return Ok(false);
+        }
+        self.merge_tables(&tables, 0..tables.len())?;
+        Ok(true)
+    }
+
+    /// Merge `tables[window]` into one table that replaces them. The window
+    /// must be adjacent tables, so that newest-wins within it is right. If
+    /// it starts at the oldest table nothing lies beneath it, so tombstones
+    /// are dropped.
+    ///
+    /// The merge reads straight from disk, bypassing the cache, and holds no
+    /// lock but the compaction lock. Only checkpoints change the table list
+    /// meanwhile, and they only append newer tables, so the window is still
+    /// in place when the result is installed.
+    fn merge_tables(&self, tables: &[Arc<Table>], window: Range<usize>) -> Result<()> {
+        let inputs = &tables[window.clone()];
+        let drop_tombstones = window.start == 0;
+        let epoch = inputs.last().expect("a window holds tables").epoch();
+
+        // reserve a file number; it reaches disk with the next manifest, and
+        // a crash before then leaves an orphan the next open sweeps
+        let (dir, number) = {
+            let mut w = self.lock_writer();
+            w.check()?;
+            let Some(dir) = w.dir.clone() else {
+                return Ok(());
+            };
+            let number = w.manifest.next_file;
+            w.manifest.next_file += 1;
+            (dir, number)
+        };
+        let ckpt = Checkpoint { number, epoch };
+        let path = dir.join(ckpt.file_name());
+
+        let mut out = TableBuilder::create(&path, self.opts.block_size)?;
+        let ids: BTreeSet<u64> = inputs.iter().flat_map(|t| t.keyspaces()).collect();
+        let (mut key, mut value) = (Vec::new(), Vec::new());
+        for ks in ids {
+            out.begin_keyspace(ks)?;
+            // newest first, so the first cursor holding a key wins
+            let mut cursors: Vec<TableCursor> =
+                inputs.iter().rev().map(|t| t.cursor(ks, None)).collect();
+            for c in &mut cursors {
+                c.start()?;
+            }
+            loop {
+                let mut win: Option<usize> = None;
+                for (i, c) in cursors.iter().enumerate() {
+                    if let Some((k, _)) = c.current()
+                        && win.is_none_or(|w| k < cursors[w].current().unwrap().0)
+                    {
+                        win = Some(i);
+                    }
+                }
+                let Some(w) = win else { break };
+                let (k, v) = cursors[w].current().unwrap();
+                key.clear();
+                key.extend_from_slice(k);
+                value.clear();
+                value.extend_from_slice(v);
+                for c in &mut cursors {
+                    if c.current().is_some_and(|(k, _)| k == &key[..]) {
+                        c.advance()?;
+                    }
+                }
+                if !(drop_tombstones && value == TOMBSTONE) {
+                    out.push(&key, &value)?;
+                }
+            }
+        }
+        out.finish(epoch)?;
+        let merged = Arc::new(Table::open(&path, number)?);
+
+        {
+            let mut w = self.lock_writer();
+            w.check()?;
+            let first = inputs[0].number();
+            let mut next = w.manifest.clone();
+            let at = next
+                .checkpoints
+                .iter()
+                .position(|c| c.number == first)
+                .expect("compaction inputs are still listed");
+            debug_assert!(
+                next.checkpoints[at..at + inputs.len()]
+                    .iter()
+                    .zip(inputs)
+                    .all(|(c, t)| c.number == t.number()),
+                "compaction inputs are still adjacent"
+            );
+            next.checkpoints.splice(at..at + inputs.len(), [ckpt]);
+            w.install_manifest(&dir, next)?;
+
+            // publish under the writer lock, which every publisher holds
+            let current = self.current.load_full();
+            let mut tables = current.tables.clone();
+            tables.splice(at..at + inputs.len(), [merged]);
+            self.current.store(Arc::new(Version {
+                epoch: current.epoch,
+                layers: current.layers.clone(),
+                tables,
+                resident_bytes: current.resident_bytes,
+            }));
+        }
+
+        // snapshots still reading the inputs keep their files open, and an
+        // open file outlives its name
+        for t in inputs {
+            let _ = fs::remove_file(t.path());
+            self.cache.forget(t.number());
+        }
+        Ok(())
+    }
 }
 
+/// The `width` adjacent tables, or all of them if there are fewer, with the
+/// fewest bytes between them: merging small recent tables often and large
+/// old ones rarely keeps the bytes rewritten per merge low.
+fn cheapest_window(tables: &[Arc<Table>], width: usize) -> Range<usize> {
+    let width = width.min(tables.len());
+    let start = (0..=tables.len() - width)
+        .min_by_key(|&i| tables[i..i + width].iter().map(|t| t.size()).sum::<u64>())
+        .unwrap_or(0);
+    start..start + width
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Change;
+    use crate::{Change, Register};
 
     const KS: KeyspaceId<u8, i64> = KeyspaceId::new(3);
 
@@ -1330,19 +1587,19 @@ mod tests {
         dir
     }
 
-    fn open(dir: &Path, dp: DurabilityPolicy) -> Result<Store, OpenError> {
+    fn open(dir: &Path, dp: DurabilityPolicy) -> Result<Store> {
         StoreBuilder::new(dp).dir(dir).keyspace(KS).build()
     }
 
     fn put(store: &Store, kvs: &[(u8, Option<i64>)]) -> Option<u64> {
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         let mut ks = tx.keyspace(KS);
         for &(k, v) in kvs {
             let change = match v {
                 Some(v) => Change::Insert(v),
                 None => Change::Delete(0),
             };
-            if let Some(r) = ks.resolve(&k, change) {
+            if let Some(r) = ks.resolve(&k, change).unwrap() {
                 ks.absorb(k, r).unwrap();
             }
         }
@@ -1350,7 +1607,7 @@ mod tests {
     }
 
     fn read(store: &Store, k: u8) -> Option<i64> {
-        store.snapshot().get(KS, &k).map(|v| *v)
+        store.snapshot().get(KS, &k).unwrap().map(|v| *v)
     }
 
     fn manifest_of(dir: &Path) -> Manifest {
@@ -1376,7 +1633,7 @@ mod tests {
         put(&store, &[(1, Some(10))]);
         let before = store.snapshot();
         put(&store, &[(1, Some(11))]);
-        assert_eq!(before.get(KS, &1).as_deref(), Some(&10));
+        assert_eq!(before.get(KS, &1).unwrap().as_deref(), Some(&10));
         assert_eq!(before.epoch(), 1);
         assert_eq!(read(&store, 1), Some(11));
     }
@@ -1385,12 +1642,12 @@ mod tests {
     fn empty_and_aborted_txs_spend_no_epoch() {
         let store = mem();
         // read-only: the keyspace is opened but nothing is written
-        let mut tx = store.begin();
-        assert_eq!(tx.keyspace(KS).get(&1), None);
+        let mut tx = store.begin().unwrap();
+        assert_eq!(tx.keyspace(KS).get(&1).unwrap(), None);
         assert_eq!(store.finish(tx).unwrap(), None);
         // aborted: dropped without finish
         {
-            let mut tx = store.begin();
+            let mut tx = store.begin().unwrap();
             tx.keyspace(KS).absorb(1, Change::Insert(5)).unwrap();
         }
         assert_eq!(read(&store, 1), None);
@@ -1402,14 +1659,14 @@ mod tests {
     #[should_panic(expected = "keyspace 9 not declared")]
     fn undeclared_keyspaces_are_refused() {
         let store = mem();
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         tx.keyspace(KeyspaceId::<u8, i64>::new(9));
     }
 
     #[test]
     fn writing_policies_need_a_directory() {
         let err = StoreBuilder::new(DurabilityPolicy::RELAXED).build();
-        assert!(matches!(err, Err(OpenError::Policy(_))));
+        assert!(matches!(err, Err(Error::Policy(_))));
     }
 
     #[test]
@@ -1532,7 +1789,7 @@ mod tests {
         bytes[first - 1] ^= 0xff;
         fs::write(&wal, &bytes).unwrap();
         let err = open(&dir, DurabilityPolicy::RELAXED).err().unwrap();
-        assert!(matches!(err, OpenError::Corrupt { offset: 0, .. }), "{err}");
+        assert!(matches!(err, Error::Corrupt { offset: 0, .. }), "{err}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1547,12 +1804,12 @@ mod tests {
             .dir(&dir)
             .keyspace(KeyspaceId::<u8, (i64, i64)>::new(3))
             .build();
-        assert!(matches!(other, Err(OpenError::KeyspaceType { id: 3, .. })));
+        assert!(matches!(other, Err(Error::KeyspaceType { id: 3, .. })));
 
         let missing = StoreBuilder::new(DurabilityPolicy::RELAXED)
             .dir(&dir)
             .build();
-        assert!(matches!(missing, Err(OpenError::UnknownKeyspace(3))));
+        assert!(matches!(missing, Err(Error::UnknownKeyspace(3))));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1562,7 +1819,7 @@ mod tests {
         let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
         assert!(matches!(
             open(&dir, DurabilityPolicy::RELAXED),
-            Err(OpenError::Locked)
+            Err(Error::Locked(_))
         ));
         drop(store);
         assert!(open(&dir, DurabilityPolicy::RELAXED).is_ok());
@@ -1592,16 +1849,17 @@ mod tests {
     /// The rows of keyspace `KS` in a checkpoint's table.
     fn checkpoint_rows(path: &Path) -> Vec<(u8, Option<i64>)> {
         let table = Table::open(path, 0).unwrap();
-        table
-            .scan(KS.raw(), &BlockCache::new(1 << 20))
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    crate::codec::decode_all_ordered::<u8>(&k).unwrap(),
-                    decode_all::<Option<i64>>(&v).unwrap(),
-                )
-            })
-            .collect()
+        let mut c = table.cursor(KS.raw(), None);
+        c.start().unwrap();
+        let mut rows = Vec::new();
+        while let Some((k, v)) = c.current() {
+            rows.push((
+                crate::codec::decode_all_ordered::<u8>(k).unwrap(),
+                decode_all::<Option<i64>>(v).unwrap(),
+            ));
+            c.advance().unwrap();
+        }
+        rows
     }
 
     fn files_in(dir: &Path) -> BTreeSet<String> {
@@ -1775,7 +2033,7 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 0xff;
         fs::write(&path, &bytes).unwrap();
         let err = open(&dir, DurabilityPolicy::RELAXED).err().unwrap();
-        assert!(matches!(err, OpenError::Corrupt { .. }), "{err}");
+        assert!(matches!(err, Error::Corrupt { .. }), "{err}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1796,9 +2054,9 @@ mod tests {
         assert_eq!(store.cache.stats().1, 1, "one block, read once");
 
         // reads in a write tx fall through to the table too
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         let mut ks = tx.keyspace(KS);
-        let r = ks.resolve(&1, Change::Modify(5)).unwrap();
+        let r = ks.resolve(&1, Change::Modify(5)).unwrap().unwrap();
         assert!(matches!(r, Change::Replace(10, 15)));
         ks.absorb(1, r).unwrap();
         store.finish(tx).unwrap();
@@ -1818,10 +2076,10 @@ mod tests {
         store.checkpoint().unwrap();
         put(&store, &[(2, None)]);
 
-        assert_eq!(first.get(KS, &1).as_deref(), Some(&10));
-        assert_eq!(first.get(KS, &2).as_deref(), None);
-        assert_eq!(second.get(KS, &1).as_deref(), Some(&11));
-        assert_eq!(second.get(KS, &2).as_deref(), Some(&20));
+        assert_eq!(first.get(KS, &1).unwrap().as_deref(), Some(&10));
+        assert_eq!(first.get(KS, &2).unwrap().as_deref(), None);
+        assert_eq!(second.get(KS, &1).unwrap().as_deref(), Some(&11));
+        assert_eq!(second.get(KS, &2).unwrap().as_deref(), Some(&20));
         assert_eq!(read(&store, 1), Some(11));
         assert_eq!(read(&store, 2), None);
         drop((first, second));
@@ -1845,7 +2103,7 @@ mod tests {
         {
             let store = build();
             for chunk in (0..20_000u32).collect::<Vec<_>>().chunks(5_000) {
-                let mut tx = store.begin();
+                let mut tx = store.begin().unwrap();
                 let mut ks = tx.keyspace(BIG);
                 for &i in chunk {
                     ks.absorb(i, Change::Insert(i as i64 * 3)).unwrap();
@@ -1858,10 +2116,10 @@ mod tests {
         let store = build();
         let snap = store.snapshot();
         for i in (0..20_000u32).step_by(7) {
-            assert_eq!(snap.get(BIG, &i).as_deref(), Some(&(i as i64 * 3)));
+            assert_eq!(snap.get(BIG, &i).unwrap().as_deref(), Some(&(i as i64 * 3)));
         }
-        assert_eq!(snap.get(BIG, &20_000).as_deref(), None);
-        assert_eq!(snap.get(KS, &1).as_deref(), Some(&10));
+        assert_eq!(snap.get(BIG, &20_000).unwrap().as_deref(), None);
+        assert_eq!(snap.get(KS, &1).unwrap().as_deref(), Some(&10));
         let (cached, loads) = store.cache.stats();
         assert!(cached <= 16 << 10, "cache over budget: {cached}");
         assert!(loads > 4, "blocks were paged in and evicted: {loads}");
@@ -1874,7 +2132,7 @@ mod tests {
         dir: &Path,
         dp: DurabilityPolicy,
         f: impl FnOnce(StoreBuilder) -> StoreBuilder,
-    ) -> Result<Store, OpenError> {
+    ) -> Result<Store> {
         f(StoreBuilder::new(dp).dir(dir).keyspace(KS)).build()
     }
 
@@ -1887,7 +2145,7 @@ mod tests {
             .unwrap();
         put(&store, &[(0, Some(1))]);
 
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         let mut ks = tx.keyspace(KS);
         let mut killed = None;
         for k in 1..=255u8 {
@@ -1896,14 +2154,19 @@ mod tests {
                 break;
             }
         }
-        let (at, oom) = killed.expect("1 KiB cannot hold 255 entries");
+        let (at, err) = killed.expect("1 KiB cannot hold 255 entries");
         assert!(at > 1, "a few entries fit");
+        let Error::OutOfMemory(oom) = err else {
+            panic!("{err}")
+        };
         assert!(oom.used > 1024 && oom.limit == 1024, "{oom}");
-        assert_eq!(ks.absorb(250, Change::Insert(1)), Err(oom), "stays dead");
-        assert_eq!(ks.get(&1).as_deref(), None, "its writes were released");
-        assert_eq!(tx.killed(), Some(oom));
+        let is_oom = |r: Result<()>| matches!(r, Err(Error::OutOfMemory(e)) if e == oom);
+        assert!(is_oom(ks.absorb(250, Change::Insert(1))), "stays dead");
+        assert!(ks.get(&1).is_err(), "reads fail too");
+        drop(ks);
+        assert!(matches!(tx.failure(), Some(Error::OutOfMemory(e)) if e == oom));
         assert_eq!(tx.memory_used(), 0);
-        assert!(matches!(store.finish(tx), Err(CommitError::OutOfMemory(e)) if e == oom));
+        assert!(matches!(store.finish(tx), Err(Error::OutOfMemory(e)) if e == oom));
 
         assert_eq!(store.snapshot().epoch(), 1, "no epoch spent");
         assert_eq!(read(&store, 1), None);
@@ -1917,7 +2180,7 @@ mod tests {
     #[test]
     fn tx_memory_tracks_entries_that_change_and_cancel() {
         let store = mem();
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         let mut ks = tx.keyspace(KS);
         ks.absorb(1, Change::Insert(10)).unwrap();
         ks.absorb(2, Change::Insert(20)).unwrap();
@@ -2041,11 +2304,11 @@ mod tests {
 
         let mut failed = None;
         for i in 0..20u8 {
-            let mut tx = store.begin();
+            let mut tx = store.begin().unwrap();
             tx.keyspace(KS).absorb(i, Change::Insert(i as i64)).unwrap();
             match store.finish(tx) {
                 Ok(_) => {}
-                Err(CommitError::Checkpoint { epoch, .. }) => {
+                Err(Error::AfterCommit { epoch, .. }) => {
                     failed = Some((i, epoch));
                     break;
                 }
@@ -2068,7 +2331,7 @@ mod tests {
     fn options_are_validated_and_recorded() {
         let dir = tmpdir("options");
         let bad = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.block_size(0));
-        assert!(matches!(bad, Err(OpenError::InvalidOption(_))));
+        assert!(matches!(bad, Err(Error::InvalidOption(_))));
         drop(
             open_with(&dir, DurabilityPolicy::RELAXED, |b| {
                 b.block_size(512).cache_size(1 << 20)
@@ -2079,6 +2342,282 @@ mod tests {
         assert_eq!(m.options["block-size"], 512);
         assert_eq!(m.options["cache-size"], 1 << 20);
         assert_eq!(m.options["wal-limit"], 64 << 20);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn live_rows(store: &Store) -> Vec<(u8, i64)> {
+        store
+            .snapshot()
+            .range(KS, ..)
+            .map(|r| r.map(|(k, v)| (*k, *v)))
+            .collect::<Result<_>>()
+            .unwrap()
+    }
+
+    /// Keys 1..=6 spread over two tables and a memory layer, with
+    /// overwrites and deletes at every level.
+    fn layered(store: &Store) {
+        put(
+            store,
+            &[(1, Some(1)), (2, Some(2)), (3, Some(3)), (4, Some(4))],
+        );
+        store.checkpoint().unwrap();
+        put(store, &[(2, Some(20)), (3, None), (5, Some(5))]);
+        store.checkpoint().unwrap();
+        put(store, &[(4, Some(40)), (5, None), (6, Some(6))]);
+    }
+
+    #[test]
+    fn range_merges_memory_and_tables_newest_first() {
+        let dir = tmpdir("range");
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        layered(&store);
+        let v = store.current.load();
+        assert_eq!((v.layers.len(), v.tables.len()), (1, 2));
+        drop(v);
+
+        assert_eq!(live_rows(&store), [(1, 1), (2, 20), (4, 40), (6, 6)]);
+        let snap = store.snapshot();
+        let keys = |c: Cursor<'_, u8, i64>| -> Vec<u8> { c.map(|r| *r.unwrap().0).collect() };
+        assert_eq!(keys(snap.range(KS, 2..=4)), [2, 4]);
+        assert_eq!(keys(snap.range(KS, 2..4)), [2]);
+        assert_eq!(
+            keys(snap.range(KS, (Bound::Excluded(2), Bound::Unbounded))),
+            [4, 6]
+        );
+        assert_eq!(keys(snap.range(KS, 7..)), Vec::<u8>::new());
+
+        // a write tx's cursor sees its own writes on top
+        let mut tx = store.begin().unwrap();
+        let mut ks = tx.keyspace(KS);
+        ks.absorb(1, Change::Delete(1)).unwrap();
+        ks.absorb(3, Change::Insert(30)).unwrap();
+        let rows: Vec<(u8, i64)> = ks
+            .range(..)
+            .map(|r| r.map(|(k, v)| (*k, *v)).unwrap())
+            .collect();
+        assert_eq!(rows, [(2, 20), (3, 30), (4, 40), (6, 6)]);
+        drop(ks);
+        drop(tx);
+        drop(snap);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn batch_resolve_reads_each_block_at_most_once() {
+        const BIG: KeyspaceId<u32, i64> = KeyspaceId::new(8);
+        let dir = tmpdir("resolve-pass");
+        let store = StoreBuilder::new(DurabilityPolicy::RELAXED)
+            .dir(&dir)
+            .keyspace(BIG)
+            .cache_size(DEFAULT_BLOCK_SIZE)
+            .build()
+            .unwrap();
+        let mut tx = store.begin().unwrap();
+        let mut ks = tx.keyspace(BIG);
+        for i in 0..20_000u32 {
+            ks.absorb(i, Change::Insert(i as i64)).unwrap();
+        }
+        store.finish(tx).unwrap();
+        store.checkpoint().unwrap();
+        let blocks = store.current.load().tables[0].blocks(BIG.raw());
+        let loads_before = store.cache.stats().1;
+
+        let mut changes = Register::new();
+        for i in (0..20_000u32).step_by(7) {
+            changes.absorb_one(i, Change::Modify(1));
+        }
+        changes.absorb_one(30_000, Change::Modify(1));
+        let mut tx = store.begin().unwrap();
+        let ks = tx.keyspace(BIG);
+        let mut out = Vec::new();
+        ks.resolve_sorted(changes, &mut out).unwrap();
+        let loads = store.cache.stats().1 - loads_before;
+        assert!(loads <= blocks as u64, "{loads} loads for {blocks} blocks");
+        assert!(matches!(out[1], (7, Change::Replace(7, 8))));
+        assert!(matches!(out.last(), Some((30_000, Change::Insert(1)))));
+        drop(ks);
+        drop(tx);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn too_many_tables_are_compacted_after_commits() {
+        let dir = tmpdir("auto-compact");
+        let opts = |b: StoreBuilder| {
+            b.memtable_limit(300).options_with(|o| {
+                o.max_tables = 3;
+                o.compaction_width = 2;
+            })
+        };
+        {
+            let store = open_with(&dir, DurabilityPolicy::RELAXED, opts).unwrap();
+            for round in 0..6u8 {
+                for i in 0..10u8 {
+                    put(&store, &[(i, Some(round as i64 * 100 + i as i64))]);
+                    assert!(store.stats().tables <= 3, "{:?}", store.stats());
+                }
+            }
+            put(&store, &[(3, None)]);
+            assert_eq!(live_rows(&store).len(), 9);
+            assert_eq!(read(&store, 4), Some(504));
+        }
+        let m = manifest_of(&dir);
+        let on_disk = files_in(&dir)
+            .into_iter()
+            .filter(|f| f.ends_with(".ckpt"))
+            .count();
+        assert_eq!(on_disk, m.checkpoints.len(), "merged inputs are deleted");
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, opts).unwrap();
+        assert_eq!(read(&store, 3), None);
+        assert_eq!(read(&store, 9), Some(509));
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn full_compaction_drops_tombstones() {
+        let dir = tmpdir("compact-all");
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        layered(&store);
+        store.checkpoint().unwrap();
+        assert_eq!(store.stats().tables, 3);
+        assert!(store.compact().unwrap());
+        assert_eq!(store.stats().tables, 1);
+        let path = store.current.load().tables[0].path().to_path_buf();
+        assert_eq!(
+            checkpoint_rows(&path),
+            [(1, Some(1)), (2, Some(20)), (4, Some(40)), (6, Some(6))],
+            "no tombstones left"
+        );
+        assert_eq!(live_rows(&store), [(1, 1), (2, 20), (4, 40), (6, 6)]);
+        drop(store);
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(live_rows(&store), [(1, 1), (2, 20), (4, 40), (6, 6)]);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compacting_above_the_oldest_table_keeps_tombstones() {
+        let dir = tmpdir("compact-mid");
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| {
+            b.options_with(|o| {
+                o.max_tables = 2;
+                o.compaction_width = 2;
+            })
+        })
+        .unwrap();
+        // a big oldest table makes the newer two the cheapest window
+        let big: Vec<_> = (0..200u8).map(|i| (i, Some(i as i64))).collect();
+        put(&store, &big);
+        store.checkpoint().unwrap();
+        put(&store, &[(1, None)]);
+        store.checkpoint().unwrap();
+        put(&store, &[(250, Some(250))]);
+        store.checkpoint().unwrap();
+        // the explicit checkpoint path does not compact; a commit does
+        put(&store, &[(251, Some(251))]);
+        let v = store.current.load_full();
+        assert_eq!(v.tables.len(), 2);
+        assert!(checkpoint_rows(v.tables[1].path()).contains(&(1, None)));
+        assert_eq!(
+            read(&store, 1),
+            None,
+            "the tombstone still hides the oldest table's value"
+        );
+        assert_eq!(read(&store, 2), Some(2));
+        drop(v);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshots_read_tables_that_compaction_deleted() {
+        let dir = tmpdir("compact-snap");
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        layered(&store);
+        store.checkpoint().unwrap();
+        let old = store.snapshot();
+        let old_paths: Vec<_> = old
+            .version
+            .tables
+            .iter()
+            .map(|t| t.path().to_path_buf())
+            .collect();
+        put(&store, &[(1, Some(100))]);
+        store.compact().unwrap();
+        assert!(old_paths.iter().all(|p| !p.exists()), "inputs are deleted");
+        assert_eq!(old.get(KS, &1).unwrap().as_deref(), Some(&1));
+        let rows: Vec<u8> = old.range(KS, ..).map(|r| *r.unwrap().0).collect();
+        assert_eq!(rows, [1, 2, 4, 6]);
+        assert_eq!(read(&store, 1), Some(100));
+        drop(old);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_wal_write_poisons_the_store_until_reopened() {
+        let dir = tmpdir("poison");
+        {
+            let store = open(&dir, DurabilityPolicy::STRICT).unwrap();
+            put(&store, &[(1, Some(10))]);
+            store.lock_writer().wal.as_mut().unwrap().fail_next_write = true;
+
+            let mut tx = store.begin().unwrap();
+            tx.keyspace(KS).absorb(2, Change::Insert(20)).unwrap();
+            let err = store.finish(tx).unwrap_err();
+            assert!(matches!(err, Error::Poisoned(_)), "{err}");
+            assert_eq!(read(&store, 2), None, "nothing was published");
+            assert!(matches!(store.begin(), Err(Error::Poisoned(_))));
+            assert!(matches!(store.checkpoint(), Err(Error::Poisoned(_))));
+            assert_eq!(read(&store, 1), Some(10), "reads still work");
+        }
+        let store = open(&dir, DurabilityPolicy::STRICT).unwrap();
+        assert_eq!(read(&store, 1), Some(10));
+        assert_eq!(read(&store, 2), None);
+        assert_eq!(put(&store, &[(2, Some(20))]), Some(2));
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_error_fails_the_tx_but_not_the_store() {
+        let dir = tmpdir("read-err");
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        put(&store, &[(1, Some(10)), (2, Some(20))]);
+        store.checkpoint().unwrap();
+        // damage the only data block; open handles see the new bytes
+        let path = store.current.load().tables[0].path().to_path_buf();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[12] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            store.snapshot().get(KS, &1),
+            Err(Error::Corrupt { .. })
+        ));
+        let snap = store.snapshot();
+        let mut cursor_errs = snap.range(KS, ..).collect::<Vec<_>>();
+        assert_eq!(cursor_errs.len(), 1, "a cursor stops at its first error");
+        assert!(cursor_errs.pop().unwrap().is_err());
+        drop(cursor_errs);
+        drop(snap);
+
+        let mut tx = store.begin().unwrap();
+        let mut ks = tx.keyspace(KS);
+        assert!(ks.get(&1).is_err());
+        assert!(ks.absorb(3, Change::Insert(30)).is_err(), "the tx failed");
+        drop(ks);
+        assert!(matches!(store.finish(tx), Err(Error::Corrupt { .. })));
+        // the store is fine: a tx that does not read the damage commits
+        let mut tx = store.begin().unwrap();
+        tx.keyspace(KS).absorb(3, Change::Insert(30)).unwrap();
+        assert_eq!(store.finish(tx).unwrap(), Some(2));
+        drop(store);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

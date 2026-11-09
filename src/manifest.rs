@@ -198,10 +198,16 @@ impl Manifest {
                         number: parse_u64(num).map_err(at)?,
                         epoch: parse_u64(epoch).map_err(at)?,
                     };
-                    if let Some(prev) = checkpoints.last()
-                        && (prev.number >= c.number || prev.epoch >= c.epoch)
+                    // compaction gives a merged table a fresh number, so
+                    // numbers need not ascend; epochs must
+                    if checkpoints
+                        .last()
+                        .is_some_and(|p: &Checkpoint| p.epoch >= c.epoch)
                     {
                         return Err(at("checkpoints out of order".into()));
+                    }
+                    if checkpoints.iter().any(|p| p.number == c.number) {
+                        return Err(at(format!("checkpoint {} listed twice", c.number)));
                     }
                     checkpoints.push(c);
                 }
@@ -234,10 +240,13 @@ impl Manifest {
             checkpoints,
             segments,
         };
-        let newest = |n: Option<u64>| n.is_some_and(|n| n >= manifest.next_file);
-        if newest(manifest.segments.last().map(|s| s.number))
-            || newest(manifest.checkpoints.last().map(|c| c.number))
-        {
+        let highest = manifest
+            .segments
+            .iter()
+            .map(|s| s.number)
+            .chain(manifest.checkpoints.iter().map(|c| c.number))
+            .max();
+        if highest.is_some_and(|n| n >= manifest.next_file) {
             return Err("file numbered at or past next-file".into());
         }
         Ok(manifest)
@@ -253,16 +262,28 @@ pub(crate) fn read(dir: &Path) -> io::Result<Option<String>> {
     }
 }
 
-/// Atomically replace the manifest in `dir`.
-pub(crate) fn write(dir: &Path, manifest: &Manifest) -> io::Result<()> {
-    let tmp = dir.join(MANIFEST_TMP);
-    let mut f = File::create(&tmp)?;
+/// Write `manifest` to the temporary file and fsync it. Failing here
+/// leaves the installed manifest untouched.
+pub(crate) fn stage(dir: &Path, manifest: &Manifest) -> io::Result<()> {
+    let mut f = File::create(dir.join(MANIFEST_TMP))?;
     f.write_all(manifest.encode().as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, dir.join(MANIFEST))?;
+    f.sync_all()
+}
+
+/// How installing a staged manifest failed.
+pub(crate) enum InstallError {
+    /// The rename failed, so the old manifest is still the live one.
+    Unchanged(io::Error),
+    /// The rename happened but the directory sync failed: the new manifest
+    /// is live now, but may not survive a crash.
+    Uncertain(io::Error),
+}
+
+/// Atomically replace the live manifest with the staged one.
+pub(crate) fn install(dir: &Path) -> Result<(), InstallError> {
+    fs::rename(dir.join(MANIFEST_TMP), dir.join(MANIFEST)).map_err(InstallError::Unchanged)?;
     // persists the rename, and any file created since the last dir sync
-    sync_dir(dir)
+    sync_dir(dir).map_err(InstallError::Uncertain)
 }
 
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -333,5 +354,8 @@ mod tests {
         assert!(Manifest::parse(&format!("{ok}bogus\n")).is_err());
         assert!(Manifest::parse(&format!("{ok}checkpoint\t1\t5\ncheckpoint\t2\t5\n")).is_err());
         assert!(Manifest::parse(&format!("{ok}checkpoint\t3\t5\n")).is_err());
+        // a compacted table gets a fresh number, out of order with the rest
+        assert!(Manifest::parse(&format!("{ok}checkpoint\t2\t5\ncheckpoint\t1\t9\n")).is_ok());
+        assert!(Manifest::parse(&format!("{ok}checkpoint\t1\t5\ncheckpoint\t1\t9\n")).is_err());
     }
 }

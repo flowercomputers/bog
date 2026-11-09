@@ -8,6 +8,8 @@ pub mod graph;
 pub mod merge;
 use crate::merge::*;
 mod codec;
+mod cursor;
+pub mod error;
 mod manifest;
 mod store;
 mod table;
@@ -92,6 +94,9 @@ impl<K: Ord, M: Merge> Register<K, M> {
                 after - before
             }
         }
+    }
+    pub(crate) fn map(&self) -> &BTreeMap<K, Change<M>> {
+        &self.inner
     }
     pub fn get(&self, key: &K) -> Option<&Change<M>> {
         self.inner.get(key)
@@ -316,7 +321,14 @@ where
 
         // 2. one sorted sweep resolves every Modify against the keyspace
         let mut ks = tx.keyspace(self.ks);
-        ks.resolve_sorted(std::mem::take(&mut self.scratch), &mut self.resolved);
+        if ks
+            .resolve_sorted(std::mem::take(&mut self.scratch), &mut self.resolved)
+            .is_err()
+        {
+            // the tx failed, and with it this epoch; the graph stops here
+            self.resolved.clear();
+            return;
+        }
         for (k, resolved) in self.resolved.drain(..) {
             // a count of zero means the key is gone
             let resolved = match resolved {
@@ -325,8 +337,8 @@ where
                 r => r,
             };
             if ks.absorb(k.clone(), resolved.clone()).is_err() {
-                // the tx was killed for running out of memory; the graph
-                // stops at this node and the commit will be refused
+                // the tx failed; the graph stops at this node and the
+                // commit will be refused (the drain empties `resolved`)
                 return;
             }
             out.absorb_one(k, resolved);
@@ -493,7 +505,7 @@ mod tests {
             .keyspace(TOTALS)
             .build()
             .unwrap();
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
 
         let mut b = Bag::new();
         b.push((1, 10), 1);
@@ -501,21 +513,21 @@ mod tests {
         g.give(src, &mut b);
         g.run(&mut tx);
         let ks = tx.keyspace(TOTALS);
-        assert_eq!(ks.get(&1).as_deref(), Some(&(2, 15)));
+        assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&(2, 15)));
 
         let mut b = Bag::new();
         b.push((1, 10), -1);
         g.give(src, &mut b);
         g.run(&mut tx);
         let ks = tx.keyspace(TOTALS);
-        assert_eq!(ks.get(&1).as_deref(), Some(&(1, 5)));
+        assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&(1, 5)));
 
         let mut b = Bag::new();
         b.push((1, 5), -1);
         g.give(src, &mut b);
         g.run(&mut tx);
         let ks = tx.keyspace(TOTALS);
-        assert_eq!(ks.get(&1).as_deref(), None);
+        assert_eq!(ks.get(&1).unwrap().as_deref(), None);
         // insert then delete within one tx cancels out entirely
         assert!(ks.inner_is_empty());
     }
@@ -537,19 +549,22 @@ mod tests {
             b.push((k, 1), 1);
         }
         g.give(src, &mut b);
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         g.run(&mut tx);
-        assert!(tx.killed().is_some());
+        assert!(tx.failure().is_some());
         assert!(store.finish(tx).is_err());
-        assert_eq!(store.snapshot().get(TOTALS, &0), None);
+        assert_eq!(store.snapshot().get(TOTALS, &0).unwrap(), None);
 
         // the graph is clean for the next epoch
         let mut b = Bag::new();
         b.push((3, 5), 1);
         g.give(src, &mut b);
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         g.run(&mut tx);
         assert_eq!(store.finish(tx).unwrap(), Some(1));
-        assert_eq!(store.snapshot().get(TOTALS, &3).as_deref(), Some(&(1, 5)));
+        assert_eq!(
+            store.snapshot().get(TOTALS, &3).unwrap().as_deref(),
+            Some(&(1, 5))
+        );
     }
 }

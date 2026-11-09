@@ -172,9 +172,8 @@ impl OpDag {
                 }
             }
 
-            // a tx killed for running out of memory will not commit, so
-            // nothing downstream needs to run
-            if tx.killed().is_some() {
+            // a failed tx will not commit, so nothing downstream needs to run
+            if tx.failure().is_some() {
                 self.pending.clear();
                 break;
             }
@@ -265,7 +264,7 @@ mod tests {
         g.give(a, &mut in_a);
         g.give(b, &mut in_b);
         let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
-        g.run(&mut store.begin());
+        g.run(&mut store.begin().unwrap());
 
         assert!(g.pending.is_empty());
         assert!(g.touched.is_empty());

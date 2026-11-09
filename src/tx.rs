@@ -1,10 +1,19 @@
 use std::{
-    any::Any, borrow::Cow, collections::HashMap, fmt, marker::PhantomData, sync::MutexGuard,
+    any::Any,
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    fmt,
+    marker::PhantomData,
+    ops::{Bound, RangeBounds},
+    sync::MutexGuard,
 };
 
 use crate::{
     Change, Register,
     codec::{Codec, OrderedCodec, ResidentSize, heap_size},
+    cursor::Cursor,
+    error::{Error, Result},
     merge::Merge,
     store::{ENTRY_OVERHEAD, Resident, Snapshot, StoreWriter, resident_entry_bytes},
 };
@@ -30,26 +39,50 @@ impl fmt::Display for OutOfMemory {
 
 impl std::error::Error for OutOfMemory {}
 
-/// A write tx's memory accounting: the estimated resident bytes of every
-/// change in its overlay.
-struct Budget {
-    used: usize,
+/// A write tx's health: the estimated resident bytes of its overlay, and
+/// the first failure, if any. Behind cells so reads, which take `&self`,
+/// can fail the tx.
+pub(crate) struct TxState {
+    used: Cell<usize>,
     limit: usize,
-    killed: Option<OutOfMemory>,
+    failure: RefCell<Option<Error>>,
 }
 
-impl Budget {
+impl TxState {
+    /// The tx's failure, if it has one.
+    pub(crate) fn check(&self) -> Result<()> {
+        match &*self.failure.borrow() {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Fail the tx with `e`, unless it already failed.
+    pub(crate) fn fail(&self, e: &Error) {
+        let mut failure = self.failure.borrow_mut();
+        if failure.is_none() {
+            *failure = Some(e.clone());
+        }
+    }
+
+    /// Run a read, failing the tx if it fails.
+    fn read<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.check()?;
+        f().inspect_err(|e| self.fail(e))
+    }
+
     /// Apply an entry's growth; returns true when that kills the tx.
-    fn grow(&mut self, delta: isize) -> bool {
-        self.used = self.used.saturating_add_signed(delta);
-        if self.used > self.limit && self.killed.is_none() {
-            self.killed = Some(OutOfMemory {
-                used: self.used,
+    fn grow(&self, delta: isize) -> bool {
+        let used = self.used.get().saturating_add_signed(delta);
+        if used > self.limit {
+            self.fail(&Error::OutOfMemory(OutOfMemory {
+                used,
                 limit: self.limit,
-            });
-            self.used = 0;
+            }));
+            self.used.set(0);
             return true;
         }
+        self.used.set(used);
         false
     }
 }
@@ -112,15 +145,15 @@ pub trait ErasedUnderlay: Any {
 /// Dropping it without [`Store::finish`](crate::store::Store::finish)
 /// aborts: the overlay is discarded and nothing is logged.
 ///
-/// Its writes count against a memory limit. A write that takes them over
-/// it kills the tx: every write so far is released, later writes fail with
-/// [`OutOfMemory`], and so does committing. Reads still work but no longer
-/// see the tx's own writes.
+/// A tx fails on the first read error, or when a write takes its writes
+/// over the memory limit, which also releases every write so far. A failed
+/// tx stays failed: every later read, write and the commit return the
+/// error that failed it.
 pub struct WriteTx<'tx> {
     /// The epoch this tx will commit as: one past the snapshot's.
     epoch: u64,
     overlay: HashMap<u64, Box<dyn ErasedUnderlay>>,
-    budget: Budget,
+    state: TxState,
     snapshot: Snapshot<'tx>,
     writer: MutexGuard<'tx, StoreWriter>,
 }
@@ -134,10 +167,10 @@ impl<'tx> WriteTx<'tx> {
         WriteTx {
             epoch: snapshot.epoch() + 1,
             overlay: HashMap::new(),
-            budget: Budget {
-                used: 0,
+            state: TxState {
+                used: Cell::new(0),
                 limit: memory_limit,
-                killed: None,
+                failure: RefCell::new(None),
             },
             snapshot,
             writer,
@@ -146,32 +179,29 @@ impl<'tx> WriteTx<'tx> {
 
     /// Estimated bytes held by this tx's writes.
     pub fn memory_used(&self) -> usize {
-        self.budget.used
+        self.state.used.get()
     }
 
-    /// Why this tx was killed, if it was.
-    pub fn killed(&self) -> Option<OutOfMemory> {
-        self.budget.killed
+    /// Why this tx failed, if it did.
+    pub fn failure(&self) -> Option<Error> {
+        self.state.check().err()
     }
     pub(crate) fn into_parts(
         self,
     ) -> (
         u64,
-        Result<HashMap<u64, Box<dyn ErasedUnderlay>>, OutOfMemory>,
+        Result<HashMap<u64, Box<dyn ErasedUnderlay>>>,
         Snapshot<'tx>,
         MutexGuard<'tx, StoreWriter>,
     ) {
         let WriteTx {
             epoch,
             overlay,
-            budget,
+            state,
             snapshot,
             writer,
         } = self;
-        let overlay = match budget.killed {
-            Some(oom) => Err(oom),
-            None => Ok(overlay),
-        };
+        let overlay = state.check().map(|()| overlay);
         (epoch, overlay, snapshot, writer)
     }
     pub fn epoch(&self) -> u64 {
@@ -191,7 +221,7 @@ pub struct KeyspaceHandle<K, M: Merge> {
 pub struct Keyspace<'a, 'tx, K, M: Merge> {
     id: KeyspaceId<K, M>,
     writes: &'a mut Register<K, M>,
-    budget: &'a mut Budget,
+    state: &'a TxState,
     snap: &'a Snapshot<'tx>,
 }
 
@@ -273,24 +303,22 @@ where
         self.writes.is_empty()
     }
 
-    /// Record a materialized change. Fails if the tx has been killed for
-    /// running out of memory, including by this write.
-    pub fn absorb(&mut self, key: K, change: Change<M>) -> Result<(), OutOfMemory> {
+    /// Record a materialized change. Fails if the tx has failed, including
+    /// by this write taking it over its memory limit.
+    pub fn absorb(&mut self, key: K, change: Change<M>) -> Result<()> {
         debug_assert!(
             !matches!(change, Change::Modify(_)),
             "resolve before absorbing"
         );
-        if let Some(oom) = self.budget.killed {
-            return Err(oom);
-        }
+        self.state.check()?;
         let delta = self
             .writes
             .absorb_one_measured(key, change, change_bytes::<K, M>);
-        if self.budget.grow(delta) {
+        if self.state.grow(delta) {
             // release this keyspace's writes now; the tx drops the rest
             // the next time it opens a keyspace, or when it ends
             *self.writes = Register::new();
-            return Err(self.budget.killed.expect("just killed"));
+            return self.state.check();
         }
         Ok(())
     }
@@ -298,46 +326,65 @@ where
     /// Current value of `key` as seen by this transaction: the overlay
     /// wins (a Delete there shadows the snapshot), otherwise the snapshot.
     /// Overlay hits borrow; snapshot hits are owned.
-    pub fn get(&self, key: &K) -> Option<Cow<'_, M::Value>> {
-        match self.writes.get(key) {
-            Some(c) => c.new_value().map(Cow::Borrowed),
+    pub fn get(&self, key: &K) -> Result<Option<Cow<'_, M::Value>>> {
+        self.state.read(|| match self.writes.get(key) {
+            Some(c) => Ok(c.new_value().map(Cow::Borrowed)),
             None => self.snap.get(self.id, key),
-        }
+        })
     }
 
     /// Materialize `change` against the current value of `key`. Returns the
     /// Insert/Delete/Replace to record, or None if nothing changes.
-    pub fn resolve(&self, key: &K, change: Change<M>) -> Option<Change<M>>
+    pub fn resolve(&self, key: &K, change: Change<M>) -> Result<Option<Change<M>>>
     where
         M::Value: PartialEq,
     {
-        materialize(self.get(key).as_deref(), change)
+        Ok(materialize(self.get(key)?.as_deref(), change))
     }
 
-    /// [`resolve`](Self::resolve) for a whole batch: `changes` is sorted by
-    /// key, so the overlay is read in one forward pass rather than a probe
-    /// per key. Keys the overlay does not mention are point-probed in the
-    /// snapshot. Resolved changes land in `out` in key order.
-    // todo: once the snapshot exposes a sorted cursor, make this a three-way
-    // merge so disk runs fault each block once.
-    pub fn resolve_sorted(&self, changes: Register<K, M>, out: &mut Vec<(K, Change<M>)>)
+    /// [`resolve`](Self::resolve) for a whole batch. `changes` is sorted, so
+    /// one cursor walks the overlay, the layers and the tables forward
+    /// together, and each table block is read at most once. Resolved
+    /// changes land in `out` in key order.
+    pub fn resolve_sorted(
+        &self,
+        changes: Register<K, M>,
+        out: &mut Vec<(K, Change<M>)>,
+    ) -> Result<()>
     where
+        K: Clone,
         M::Value: PartialEq,
     {
-        let mut current = self.writes.iter().peekable();
+        let mut cursor = self.cursor(Bound::Unbounded, Bound::Unbounded);
         for (key, change) in changes {
-            // advance the cursor to the first entry at or past `key`
-            while current.peek().is_some_and(|(k, _)| **k < key) {
-                current.next();
-            }
-            let old = match current.peek().filter(|(k, _)| **k == key) {
-                Some((_, c)) => c.new_value().map(Cow::Borrowed),
-                None => self.snap.get(self.id, &key),
-            };
+            let old = cursor.seek_get(&key)?;
             if let Some(resolved) = materialize(old.as_deref(), change) {
                 out.push((key, resolved));
             }
         }
+        Ok(())
+    }
+
+    /// The live entries with keys in `range`, in order, as this tx sees
+    /// them: its own writes over the snapshot.
+    pub fn range(&self, range: impl RangeBounds<K>) -> Cursor<'_, K, M>
+    where
+        K: Clone,
+    {
+        self.cursor(range.start_bound(), range.end_bound().cloned())
+    }
+
+    fn cursor(&self, lower: Bound<&K>, upper: Bound<K>) -> Cursor<'_, K, M>
+    where
+        K: Clone,
+    {
+        self.snap.cursor(
+            self.id,
+            Some(self.writes.map()),
+            lower,
+            upper,
+            Some(self.state),
+        )
     }
 }
 
@@ -377,8 +424,8 @@ impl<'tx> WriteTx<'tx> {
         M: Merge,
         M::Value: Codec + Sync,
     {
-        if self.budget.killed.is_some() {
-            // a killed tx holds no writes
+        if self.state.check().is_err() {
+            // a failed tx will not commit, so its writes are dead weight
             self.overlay.clear();
         }
         let store = self.snapshot.store();
@@ -395,7 +442,7 @@ impl<'tx> WriteTx<'tx> {
         Keyspace {
             id,
             writes: &mut handle.inner,
-            budget: &mut self.budget,
+            state: &self.state,
             snap: &self.snapshot,
         }
     }
@@ -414,39 +461,39 @@ mod tests {
             .keyspace(KS)
             .build()
             .unwrap();
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         let mut ks = tx.keyspace(KS);
         ks.absorb(1, Change::Insert(10)).unwrap();
         ks.absorb(2, Change::Insert(20)).unwrap();
         store.finish(tx).unwrap();
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         tx.keyspace(KS).absorb(2, Change::Delete(20)).unwrap();
         store.finish(tx).unwrap();
 
-        let mut tx = store.begin();
+        let mut tx = store.begin().unwrap();
         let mut ks = tx.keyspace(KS);
-        assert_eq!(ks.get(&1).as_deref(), Some(&10));
-        assert_eq!(ks.get(&2).as_deref(), None, "committed tombstone");
-        assert_eq!(ks.get(&3).as_deref(), None, "never written");
+        assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&10));
+        assert_eq!(ks.get(&2).unwrap().as_deref(), None, "committed tombstone");
+        assert_eq!(ks.get(&3).unwrap().as_deref(), None, "never written");
 
         // a Modify resolves against the snapshot value
-        let r = ks.resolve(&1, Change::Modify(5)).unwrap();
+        let r = ks.resolve(&1, Change::Modify(5)).unwrap().unwrap();
         assert!(matches!(r, Change::Replace(10, 15)));
         ks.absorb(1, r).unwrap();
-        assert_eq!(ks.get(&1).as_deref(), Some(&15), "overlay wins");
+        assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&15), "overlay wins");
 
         // a Delete in the overlay shadows the snapshot
-        let r = ks.resolve(&1, Change::Delete(0)).unwrap();
+        let r = ks.resolve(&1, Change::Delete(0)).unwrap().unwrap();
         assert!(matches!(r, Change::Delete(15)));
         ks.absorb(1, r).unwrap();
-        assert_eq!(ks.get(&1).as_deref(), None);
+        assert_eq!(ks.get(&1).unwrap().as_deref(), None);
 
         // resolve_sorted mixes overlay hits and snapshot misses
         let mut changes = Register::new();
         changes.absorb_one(1, Change::Modify(1));
         changes.absorb_one(3, Change::Modify(7));
         let mut out = Vec::new();
-        ks.resolve_sorted(changes, &mut out);
+        ks.resolve_sorted(changes, &mut out).unwrap();
         // key 1 is deleted in the overlay, so the snapshot's 10 is invisible
         assert!(matches!(out[0], (1, Change::Insert(1))));
         assert!(matches!(out[1], (3, Change::Insert(7))));

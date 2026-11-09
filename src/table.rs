@@ -13,56 +13,32 @@
 //! ```
 //!
 //! An entry is `key len u32 | key | value len u32 | value`, the value being
-//! the encoded `Option<V>` (a tombstone is `None`). All integers are little
-//! endian.
+//! the encoded `Option<V>`: a tombstone is `None`, the single byte `0`. All
+//! integers are little endian.
 //!
 //! Opening a table reads only its footer and index. Data blocks are read on
-//! demand through a [`BlockCache`] shared by every table in the store, and
-//! their checksums are verified when they are loaded.
+//! demand, through a [`BlockCache`] shared by every table in the store for
+//! reads, or straight from disk for compaction. Their checksums are
+//! verified whenever they are read from disk.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    fmt,
     fs::{File, OpenOptions},
-    io::{self, BufWriter, Write},
+    io::{BufWriter, Write},
     ops::Range,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
+
+use crate::error::{Error, IoContext, Result};
 
 const MAGIC: &[u8; 8] = b"fold3sst";
 const FOOTER: usize = 8 + 8 + 8 + 4 + 8;
 /// The default block size: a block is cut once its entries reach this.
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4096;
-
-#[derive(Debug)]
-pub(crate) enum TableError {
-    Io(io::Error),
-    Corrupt { offset: u64, why: String },
-}
-
-impl fmt::Display for TableError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "io error: {e}"),
-            Self::Corrupt { offset, why } => write!(f, "corrupt at byte {offset}: {why}"),
-        }
-    }
-}
-
-impl From<io::Error> for TableError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-fn corrupt(offset: u64, why: impl Into<String>) -> TableError {
-    TableError::Corrupt {
-        offset,
-        why: why.into(),
-    }
-}
+/// The encoded value of a tombstone, `None::<V>`.
+pub(crate) const TOMBSTONE: &[u8] = &[0];
 
 struct BlockHandle {
     offset: u64,
@@ -74,6 +50,7 @@ struct BlockHandle {
 /// Writes a table. Keyspaces must be begun in ascending id order and keys
 /// pushed in ascending encoded order within each.
 pub(crate) struct TableBuilder {
+    path: PathBuf,
     out: BufWriter<File>,
     block_size: usize,
     offset: u64,
@@ -85,11 +62,16 @@ pub(crate) struct TableBuilder {
 impl TableBuilder {
     /// Create a new table file; fails if it already exists. Blocks are cut
     /// once their entries reach `block_size` bytes.
-    pub fn create(path: &Path, block_size: usize) -> io::Result<Self> {
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    pub fn create(path: &Path, block_size: usize) -> Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .ctx("creating table", path)?;
         let mut out = BufWriter::new(file);
-        out.write_all(MAGIC)?;
+        out.write_all(MAGIC).ctx("writing table", path)?;
         Ok(TableBuilder {
+            path: path.to_path_buf(),
             out,
             block_size,
             offset: MAGIC.len() as u64,
@@ -99,7 +81,7 @@ impl TableBuilder {
         })
     }
 
-    pub fn begin_keyspace(&mut self, ks: u64) -> io::Result<()> {
+    pub fn begin_keyspace(&mut self, ks: u64) -> Result<()> {
         self.cut_block()?;
         if let Some((prev, _)) = self.index.last() {
             assert!(*prev < ks, "keyspaces out of order");
@@ -108,7 +90,7 @@ impl TableBuilder {
         Ok(())
     }
 
-    pub fn push(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+    pub fn push(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         assert!(!self.index.is_empty(), "push before begin_keyspace");
         if self.block_first.is_none() {
             self.block_first = Some(key.to_vec());
@@ -123,13 +105,15 @@ impl TableBuilder {
         Ok(())
     }
 
-    fn cut_block(&mut self) -> io::Result<()> {
+    fn cut_block(&mut self) -> Result<()> {
         let Some(first_key) = self.block_first.take() else {
             return Ok(());
         };
         self.block
             .extend(crc32fast::hash(&self.block).to_le_bytes());
-        self.out.write_all(&self.block)?;
+        self.out
+            .write_all(&self.block)
+            .ctx("writing table", &self.path)?;
         let len = self.block.len() as u32;
         self.index
             .last_mut()
@@ -147,7 +131,7 @@ impl TableBuilder {
 
     /// Write the index and footer, then fsync. `epoch` is the newest epoch
     /// the table covers.
-    pub fn finish(mut self, epoch: u64) -> io::Result<()> {
+    pub fn finish(mut self, epoch: u64) -> Result<()> {
         self.cut_block()?;
         let mut index = Vec::new();
         let keyspaces: Vec<_> = self.index.iter().filter(|(_, b)| !b.is_empty()).collect();
@@ -162,14 +146,22 @@ impl TableBuilder {
                 index.extend(&b.first_key);
             }
         }
-        self.out.write_all(&index)?;
-        self.out.write_all(&self.offset.to_le_bytes())?;
-        self.out.write_all(&(index.len() as u64).to_le_bytes())?;
-        self.out.write_all(&epoch.to_le_bytes())?;
-        self.out.write_all(&crc32fast::hash(&index).to_le_bytes())?;
-        self.out.write_all(MAGIC)?;
-        let file = self.out.into_inner().map_err(|e| e.into_error())?;
-        file.sync_all()
+        let mut footer = Vec::with_capacity(FOOTER);
+        footer.extend(self.offset.to_le_bytes());
+        footer.extend((index.len() as u64).to_le_bytes());
+        footer.extend(epoch.to_le_bytes());
+        footer.extend(crc32fast::hash(&index).to_le_bytes());
+        footer.extend(MAGIC);
+
+        let path = self.path;
+        self.out.write_all(&index).ctx("writing table", &path)?;
+        self.out.write_all(&footer).ctx("writing table", &path)?;
+        let file = self
+            .out
+            .into_inner()
+            .map_err(|e| e.into_error())
+            .ctx("writing table", &path)?;
+        file.sync_all().ctx("syncing table", &path)
     }
 }
 
@@ -179,6 +171,8 @@ pub(crate) struct Table {
     number: u64,
     path: PathBuf,
     file: File,
+    /// Bytes on disk.
+    size: u64,
     epoch: u64,
     index: HashMap<u64, Vec<BlockHandle>>,
 }
@@ -186,46 +180,64 @@ pub(crate) struct Table {
 /// A little-endian cursor over the index bytes.
 struct Reader<'a> {
     b: &'a [u8],
-    base: u64,
     at: usize,
 }
 
 impl Reader<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8], TableError> {
-        let end = self
-            .at
-            .checked_add(n)
-            .filter(|&end| end <= self.b.len())
-            .ok_or_else(|| corrupt(self.base + self.at as u64, "index truncated"))?;
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let end = self.at.checked_add(n).filter(|&end| end <= self.b.len())?;
         let s = &self.b[self.at..end];
         self.at = end;
-        Ok(s)
+        Some(s)
     }
-    fn u32(&mut self) -> Result<u32, TableError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> Result<u64, TableError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+}
+
+/// One entry of a verified block: key and value ranges, and where the next
+/// entry starts. `None` at the end of the block.
+fn entry_at(block: &[u8], at: usize) -> Result<Option<(Range<usize>, Range<usize>, usize)>, usize> {
+    if at == block.len() {
+        return Ok(None);
+    }
+    let field = |at: usize| -> Result<(Range<usize>, usize), usize> {
+        let len_end = at.checked_add(4).filter(|&e| e <= block.len()).ok_or(at)?;
+        let len = u32::from_le_bytes(block[at..len_end].try_into().unwrap()) as usize;
+        let end = len_end
+            .checked_add(len)
+            .filter(|&e| e <= block.len())
+            .ok_or(len_end)?;
+        Ok((len_end..end, end))
+    };
+    let (key, at) = field(at)?;
+    let (value, next) = field(at)?;
+    Ok(Some((key, value, next)))
 }
 
 impl Table {
     /// Open a table, reading and checking its footer and index.
-    pub fn open(path: &Path, number: u64) -> Result<Table, TableError> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        if len < (MAGIC.len() + FOOTER) as u64 {
+    pub fn open(path: &Path, number: u64) -> Result<Table> {
+        let corrupt = |offset: u64, why: &str| Error::corrupt(path, offset, why);
+        let file = File::open(path).ctx("opening table", path)?;
+        let size = file.metadata().ctx("opening table", path)?.len();
+        if size < (MAGIC.len() + FOOTER) as u64 {
             return Err(corrupt(0, "too short to be a table"));
         }
         let mut head = [0u8; 8];
-        file.read_exact_at(&mut head, 0)?;
+        file.read_exact_at(&mut head, 0)
+            .ctx("reading table", path)?;
         if &head != MAGIC {
             return Err(corrupt(0, "not a table"));
         }
 
-        let footer_at = len - FOOTER as u64;
+        let footer_at = size - FOOTER as u64;
         let mut footer = [0u8; FOOTER];
-        file.read_exact_at(&mut footer, footer_at)?;
+        file.read_exact_at(&mut footer, footer_at)
+            .ctx("reading table", path)?;
         let field = |at: usize| u64::from_le_bytes(footer[at..at + 8].try_into().unwrap());
         let (index_at, index_len, epoch) = (field(0), field(8), field(16));
         let crc = u32::from_le_bytes(footer[24..28].try_into().unwrap());
@@ -240,31 +252,32 @@ impl Table {
         }
 
         let mut raw = vec![0u8; index_len as usize];
-        file.read_exact_at(&mut raw, index_at)?;
+        file.read_exact_at(&mut raw, index_at)
+            .ctx("reading table", path)?;
         if crc32fast::hash(&raw) != crc {
             return Err(corrupt(index_at, "index checksum mismatch"));
         }
-        let mut r = Reader {
-            b: &raw,
-            base: index_at,
-            at: 0,
-        };
+        let truncated = || corrupt(index_at, "index truncated");
+        let mut r = Reader { b: &raw, at: 0 };
         let mut index = HashMap::new();
-        for _ in 0..r.u32()? {
-            let ks = r.u64()?;
-            let n = r.u32()?;
-            let mut blocks = Vec::with_capacity(n as usize);
+        for _ in 0..r.u32().ok_or_else(truncated)? {
+            let ks = r.u64().ok_or_else(truncated)?;
+            let n = r.u32().ok_or_else(truncated)?;
+            let mut blocks: Vec<BlockHandle> = Vec::with_capacity(n as usize);
             for _ in 0..n {
-                let offset = r.u64()?;
-                let len = r.u32()?;
-                let key_len = r.u32()? as usize;
-                let first_key: Box<[u8]> = r.take(key_len)?.into();
+                let offset = r.u64().ok_or_else(truncated)?;
+                let len = r.u32().ok_or_else(truncated)?;
+                let key_len = r.u32().ok_or_else(truncated)? as usize;
+                let first_key: Box<[u8]> = r.take(key_len).ok_or_else(truncated)?.into();
                 if offset
                     .checked_add(len as u64)
                     .is_none_or(|end| end > index_at)
                     || len < 4
                 {
                     return Err(corrupt(index_at, "block outside the data region"));
+                }
+                if blocks.last().is_some_and(|b| b.first_key >= first_key) {
+                    return Err(corrupt(index_at, "blocks out of order"));
                 }
                 blocks.push(BlockHandle {
                     offset,
@@ -282,9 +295,14 @@ impl Table {
             number,
             path: path.to_path_buf(),
             file,
+            size,
             epoch,
             index,
         })
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
     }
 
     pub fn epoch(&self) -> u64 {
@@ -293,6 +311,11 @@ impl Table {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Bytes on disk.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 
     /// Estimated bytes the in-memory index holds.
@@ -304,19 +327,29 @@ impl Table {
             .sum()
     }
 
+    /// Data blocks in keyspace `ks`.
+    #[cfg(test)]
+    pub fn blocks(&self, ks: u64) -> usize {
+        self.index.get(&ks).map_or(0, Vec::len)
+    }
+
     pub fn keyspaces(&self) -> impl Iterator<Item = u64> + '_ {
         self.index.keys().copied()
     }
 
+    fn corrupt(&self, offset: u64, why: &str) -> Error {
+        Error::corrupt(&self.path, offset, why)
+    }
+
     /// The encoded value stored for `key` in keyspace `ks`, as a block and
     /// the value's byte range within it. `None` if this table does not
-    /// mention the key; a tombstone is a hit whose value decodes to `None`.
+    /// mention the key; a tombstone is a hit whose value is [`TOMBSTONE`].
     pub fn get(
         &self,
         ks: u64,
         key: &[u8],
         cache: &BlockCache,
-    ) -> Result<Option<(Arc<[u8]>, Range<usize>)>, TableError> {
+    ) -> Result<Option<(Arc<[u8]>, Range<usize>)>> {
         let Some(blocks) = self.index.get(&ks) else {
             return Ok(None);
         };
@@ -326,15 +359,13 @@ impl Table {
         let Some(handle) = i.checked_sub(1).map(|i| &blocks[i]) else {
             return Ok(None);
         };
-        let block = self.block(handle, cache)?;
-        let mut entries = Entries {
-            b: &block,
-            at: 0,
-            base: handle.offset,
-        };
-        while let Some((k, v)) = entries.next()? {
-            match k.cmp(key) {
-                std::cmp::Ordering::Less => continue,
+        let block = self.block(handle, Some(cache))?;
+        let mut at = 0;
+        while let Some((k, v, next)) =
+            entry_at(&block, at).map_err(|o| self.bad_entry(handle, o))?
+        {
+            match block[k].cmp(key) {
+                std::cmp::Ordering::Less => at = next,
                 std::cmp::Ordering::Equal => return Ok(Some((block.clone(), v))),
                 std::cmp::Ordering::Greater => break,
             }
@@ -342,68 +373,138 @@ impl Table {
         Ok(None)
     }
 
-    /// A block's entries, from the cache or from disk.
-    fn block(&self, handle: &BlockHandle, cache: &BlockCache) -> Result<Arc<[u8]>, TableError> {
-        cache.get_or_load((self.number, handle.offset), || {
+    fn bad_entry(&self, handle: &BlockHandle, at: usize) -> Error {
+        self.corrupt(handle.offset + at as u64, "entry runs past its block")
+    }
+
+    /// A block's entries, from the cache if one is given, else from disk.
+    fn block(&self, handle: &BlockHandle, cache: Option<&BlockCache>) -> Result<Arc<[u8]>> {
+        let read = || {
             let mut buf = vec![0u8; handle.len as usize];
-            self.file.read_exact_at(&mut buf, handle.offset)?;
+            self.file
+                .read_exact_at(&mut buf, handle.offset)
+                .ctx("reading table", &self.path)?;
             let (entries, crc) = buf.split_at(buf.len() - 4);
             if crc32fast::hash(entries) != u32::from_le_bytes(crc.try_into().unwrap()) {
-                return Err(corrupt(handle.offset, "block checksum mismatch"));
+                return Err(self.corrupt(handle.offset, "block checksum mismatch"));
             }
             buf.truncate(buf.len() - 4);
             Ok(buf.into())
-        })
+        };
+        match cache {
+            Some(cache) => cache.get_or_load((self.number, handle.offset), read),
+            None => read(),
+        }
     }
 
-    /// Every entry in keyspace `ks`, in order, as raw bytes.
-    #[cfg(test)]
-    pub fn scan(&self, ks: u64, cache: &BlockCache) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut out = Vec::new();
-        for handle in self.index.get(&ks).into_iter().flatten() {
-            let block = self.block(handle, cache).unwrap();
-            let mut entries = Entries {
-                b: &block,
-                at: 0,
-                base: handle.offset,
-            };
-            while let Some((k, v)) = entries.next().unwrap() {
-                out.push((k.to_vec(), block[v].to_vec()));
+    /// A cursor over keyspace `ks`, before its first entry. With no cache,
+    /// blocks are read straight from disk and not kept.
+    pub fn cursor<'a>(&'a self, ks: u64, cache: Option<&'a BlockCache>) -> TableCursor<'a> {
+        TableCursor {
+            table: self,
+            blocks: self.index.get(&ks).map_or(&[], |b| &b[..]),
+            cache,
+            bi: 0,
+            block: None,
+            cur: None,
+            started: false,
+        }
+    }
+}
+
+/// Walks one keyspace of a table in key order, a block at a time. It only
+/// moves forward.
+pub(crate) struct TableCursor<'a> {
+    table: &'a Table,
+    blocks: &'a [BlockHandle],
+    cache: Option<&'a BlockCache>,
+    /// The loaded block's index; `blocks.len()` once exhausted.
+    bi: usize,
+    block: Option<Arc<[u8]>>,
+    /// The current entry: key range, value range, next entry's offset.
+    cur: Option<(Range<usize>, Range<usize>, usize)>,
+    started: bool,
+}
+
+impl<'a> TableCursor<'a> {
+    pub fn path(&self) -> &'a Path {
+        &self.table.path
+    }
+
+    /// The current entry's encoded key and value.
+    pub fn current(&self) -> Option<(&[u8], &[u8])> {
+        let (k, v, _) = self.cur.as_ref()?;
+        let block = self.block.as_deref()?;
+        Some((&block[k.clone()], &block[v.clone()]))
+    }
+
+    /// Move to the first entry, if not yet started.
+    pub fn start(&mut self) -> Result<()> {
+        if !self.started {
+            self.started = true;
+            self.load(0)?;
+        }
+        Ok(())
+    }
+
+    /// Move to the next entry.
+    pub fn advance(&mut self) -> Result<()> {
+        self.start()?;
+        match self.cur.take() {
+            Some((_, _, next)) => self.read_from(next),
+            None => Ok(()),
+        }
+    }
+
+    /// Move forward to the first entry whose key is at or past `probe`.
+    /// Never moves backward.
+    pub fn seek(&mut self, probe: &[u8]) -> Result<()> {
+        self.start()?;
+        if self.current().is_none_or(|(k, _)| k >= probe) {
+            return Ok(());
+        }
+        // the last block starting at or before the probe; later blocks all
+        // start past it
+        let target = self
+            .blocks
+            .partition_point(|b| &*b.first_key <= probe)
+            .saturating_sub(1)
+            .max(self.bi);
+        if target != self.bi {
+            self.load(target)?;
+        }
+        while self.current().is_some_and(|(k, _)| k < probe) {
+            self.advance()?;
+        }
+        Ok(())
+    }
+
+    /// Load block `bi` and position at its first entry, skipping to later
+    /// blocks if it is empty.
+    fn load(&mut self, bi: usize) -> Result<()> {
+        self.bi = bi;
+        self.cur = None;
+        self.block = None;
+        if let Some(handle) = self.blocks.get(bi) {
+            self.block = Some(self.table.block(handle, self.cache)?);
+            self.read_from(0)?;
+        }
+        Ok(())
+    }
+
+    /// Read the entry at `at` in the loaded block, or move to the next block.
+    fn read_from(&mut self, at: usize) -> Result<()> {
+        let Some(block) = self.block.as_deref() else {
+            return Ok(());
+        };
+        match entry_at(block, at) {
+            Ok(Some(entry)) => {
+                self.cur = Some(entry);
+                Ok(())
             }
+            Ok(None) => self.load(self.bi + 1),
+            Err(o) => Err(self.table.bad_entry(&self.blocks[self.bi], o)),
         }
-        out
-    }
-}
-
-/// Walks the entries of a verified block.
-struct Entries<'a> {
-    b: &'a [u8],
-    at: usize,
-    base: u64,
-}
-
-impl<'a> Entries<'a> {
-    /// The next `(key, value range)`, or `None` at the end of the block.
-    fn next(&mut self) -> Result<Option<(&'a [u8], Range<usize>)>, TableError> {
-        if self.at == self.b.len() {
-            return Ok(None);
-        }
-        let key = self.field()?;
-        let value = self.field()?;
-        Ok(Some((&self.b[key], value)))
-    }
-
-    fn field(&mut self) -> Result<Range<usize>, TableError> {
-        let bad = |at: usize| corrupt(self.base + at as u64, "entry runs past its block");
-        let len_end = self.at.checked_add(4).filter(|&e| e <= self.b.len());
-        let len_end = len_end.ok_or_else(|| bad(self.at))?;
-        let len = u32::from_le_bytes(self.b[self.at..len_end].try_into().unwrap()) as usize;
-        let end = len_end
-            .checked_add(len)
-            .filter(|&e| e <= self.b.len())
-            .ok_or_else(|| bad(len_end))?;
-        self.at = end;
-        Ok(len_end..end)
     }
 }
 
@@ -434,13 +535,19 @@ impl BlockCache {
         }
     }
 
-    fn get_or_load<E>(
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheInner> {
+        // the cache is consistent between statements; a panic elsewhere
+        // while holding it leaves nothing half-done
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn get_or_load(
         &self,
         key: (u64, u64),
-        load: impl FnOnce() -> Result<Arc<[u8]>, E>,
-    ) -> Result<Arc<[u8]>, E> {
+        load: impl FnOnce() -> Result<Arc<[u8]>>,
+    ) -> Result<Arc<[u8]>> {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.lock();
             let inner = &mut *inner;
             inner.tick += 1;
             if let Some((block, used)) = inner.blocks.get_mut(&key) {
@@ -455,7 +562,7 @@ impl BlockCache {
         // and the later insert simply replaces the earlier one
         let block = load()?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         let inner = &mut *inner;
         inner.loads += 1;
         inner.tick += 1;
@@ -476,15 +583,32 @@ impl BlockCache {
         Ok(block)
     }
 
+    /// Drop every cached block of table `number`, which no longer exists.
+    pub fn forget(&self, number: u64) {
+        let mut inner = self.lock();
+        let inner = &mut *inner;
+        let dead: Vec<_> = inner
+            .blocks
+            .iter()
+            .filter(|((n, _), _)| *n == number)
+            .map(|(k, (b, used))| (*k, b.len(), *used))
+            .collect();
+        for (key, len, used) in dead {
+            inner.blocks.remove(&key);
+            inner.lru.remove(&used);
+            inner.used -= len;
+        }
+    }
+
     /// Bytes of blocks currently cached.
     pub fn used(&self) -> usize {
-        self.inner.lock().unwrap().used
+        self.lock().used
     }
 
     /// (bytes cached, blocks read from disk so far)
     #[cfg(test)]
     pub fn stats(&self) -> (usize, u64) {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         (inner.used, inner.loads)
     }
 }
@@ -511,7 +635,7 @@ mod tests {
             b.push(&key(i), &[1, i as u8]).unwrap();
         }
         b.begin_keyspace(5).unwrap();
-        b.push(&key(7), &[0]).unwrap();
+        b.push(&key(7), TOMBSTONE).unwrap();
         b.finish(42).unwrap();
     }
 
@@ -534,15 +658,47 @@ mod tests {
             assert_eq!(get(1, i), want, "key {i}");
         }
         assert_eq!(get(1, 5000), None, "past the end");
-        assert_eq!(get(5, 7), Some(vec![0]), "tombstone is a hit");
+        assert_eq!(get(5, 7), Some(TOMBSTONE.to_vec()), "tombstone is a hit");
         assert_eq!(get(5, 6), None, "before the first key");
         assert_eq!(get(9, 0), None, "unknown keyspace");
-        assert_eq!(t.scan(1, &cache).len(), 1000);
         std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
-    fn cache_serves_repeat_reads_and_stays_in_budget() {
+    fn cursor_walks_and_seeks_across_blocks() {
+        let path = tmp("cursor");
+        build(&path);
+        let t = Table::open(&path, 1).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let mut c = t.cursor(1, Some(&cache));
+        c.start().unwrap();
+        let mut n = 0;
+        while let Some((k, _)) = c.current() {
+            assert_eq!(k, key(n * 2));
+            n += 1;
+            c.advance().unwrap();
+        }
+        assert_eq!(n, 1000);
+
+        let mut c = t.cursor(1, None);
+        c.seek(&key(501)).unwrap();
+        assert_eq!(c.current().unwrap().0, key(502), "next key at or past");
+        c.seek(&key(1700)).unwrap();
+        assert_eq!(c.current().unwrap().0, key(1700), "skips blocks");
+        c.seek(&key(10)).unwrap();
+        assert_eq!(c.current().unwrap().0, key(1700), "never moves back");
+        c.seek(&key(9999)).unwrap();
+        assert!(c.current().is_none());
+
+        let mut empty = t.cursor(9, Some(&cache));
+        empty.seek(&key(0)).unwrap();
+        assert!(empty.current().is_none());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn cache_serves_repeat_reads_stays_in_budget_and_forgets() {
         let path = tmp("cache");
         build(&path);
         let t = Table::open(&path, 1).unwrap();
@@ -551,6 +707,8 @@ mod tests {
         t.get(1, &key(0), &cache).unwrap();
         t.get(1, &key(2), &cache).unwrap();
         assert_eq!(cache.stats().1, 1, "same block: one disk read");
+        cache.forget(1);
+        assert_eq!(cache.used(), 0);
 
         let small = BlockCache::new(DEFAULT_BLOCK_SIZE * 2);
         for i in (0..2000).step_by(2) {
@@ -566,7 +724,7 @@ mod tests {
         build(&path);
         let good = std::fs::read(&path).unwrap();
 
-        // a flipped data byte fails only the read of that block
+        // a flipped data byte fails only the reads of that block
         let mut bytes = good.clone();
         bytes[MAGIC.len() + 10] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
@@ -574,8 +732,10 @@ mod tests {
         let cache = BlockCache::new(1 << 20);
         assert!(matches!(
             t.get(1, &key(0), &cache),
-            Err(TableError::Corrupt { .. })
+            Err(Error::Corrupt { .. })
         ));
+        let mut c = t.cursor(1, None);
+        assert!(matches!(c.start(), Err(Error::Corrupt { .. })));
         assert!(t.get(1, &key(1998), &cache).unwrap().is_some());
 
         // a flipped index byte fails the open
@@ -583,10 +743,7 @@ mod tests {
         let at = bytes.len() - FOOTER - 3;
         bytes[at] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
-        assert!(matches!(
-            Table::open(&path, 1),
-            Err(TableError::Corrupt { .. })
-        ));
+        assert!(matches!(Table::open(&path, 1), Err(Error::Corrupt { .. })));
         std::fs::remove_file(&path).unwrap();
     }
 }
