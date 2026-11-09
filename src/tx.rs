@@ -6,7 +6,6 @@ use std::{
     fmt,
     marker::PhantomData,
     ops::{Bound, RangeBounds},
-    sync::MutexGuard,
 };
 
 use crate::{
@@ -15,7 +14,7 @@ use crate::{
     cursor::Cursor,
     error::{Error, Result},
     merge::Merge,
-    store::{ENTRY_OVERHEAD, Resident, Snapshot, StoreWriter, resident_entry_bytes},
+    store::{ENTRY_OVERHEAD, Resident, Snapshot, WriterGuard, resident_entry_bytes},
 };
 
 /// A write tx outgrew its memory limit and was killed. Its writes were
@@ -155,13 +154,15 @@ pub struct WriteTx<'tx> {
     overlay: HashMap<u64, Box<dyn ErasedUnderlay>>,
     state: TxState,
     snapshot: Snapshot<'tx>,
-    writer: MutexGuard<'tx, StoreWriter>,
+    writer: WriterGuard<'tx>,
+    /// Part of a rebuild of derived state at open.
+    rebuilding: bool,
 }
 
 impl<'tx> WriteTx<'tx> {
     pub(crate) fn new(
         snapshot: Snapshot<'tx>,
-        writer: MutexGuard<'tx, StoreWriter>,
+        writer: WriterGuard<'tx>,
         memory_limit: usize,
     ) -> Self {
         WriteTx {
@@ -174,7 +175,20 @@ impl<'tx> WriteTx<'tx> {
             },
             snapshot,
             writer,
+            rebuilding: false,
         }
+    }
+
+    /// Whether this tx is one chunk of a rebuild of derived state, replaying
+    /// base rows already accepted when they were first written. Checks
+    /// that only make sense on the final state, or in the order rows were
+    /// first written, should be skipped in one.
+    pub fn rebuilding(&self) -> bool {
+        self.rebuilding
+    }
+
+    pub(crate) fn set_rebuilding(&mut self) {
+        self.rebuilding = true;
     }
 
     /// Estimated bytes held by this tx's writes.
@@ -200,7 +214,7 @@ impl<'tx> WriteTx<'tx> {
         u64,
         Result<HashMap<u64, Box<dyn ErasedUnderlay>>>,
         Snapshot<'tx>,
-        MutexGuard<'tx, StoreWriter>,
+        WriterGuard<'tx>,
     ) {
         let WriteTx {
             epoch,
@@ -208,6 +222,7 @@ impl<'tx> WriteTx<'tx> {
             state,
             snapshot,
             writer,
+            rebuilding: _,
         } = self;
         let overlay = state.check().map(|()| overlay);
         (epoch, overlay, snapshot, writer)

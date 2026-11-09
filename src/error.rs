@@ -55,6 +55,10 @@ pub enum Error {
     /// keyspace was added or dropped, and must be rebuilt, but the store
     /// was opened without a replay to rebuild it with.
     RebuildRequired,
+    /// The maintenance thread panicked, so layers are no longer folded or
+    /// tables compacted. Commits still work until there are too many
+    /// layers; reopen the store to restart it.
+    MaintenancePanicked,
     /// The transaction committed as `epoch`, but maintenance that ran
     /// after it failed. The commit stands; the next commit retries.
     AfterCommit { epoch: u64, source: Arc<Error> },
@@ -101,6 +105,7 @@ impl fmt::Display for Error {
             }
             Self::OutOfMemory(oom) => oom.fmt(f),
             Self::Rejected(why) => write!(f, "transaction rejected: {why}"),
+            Self::MaintenancePanicked => write!(f, "the maintenance thread panicked"),
             Self::RebuildRequired => write!(
                 f,
                 "derived state must be rebuilt for a changed graph; open with a replay"

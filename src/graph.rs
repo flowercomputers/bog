@@ -84,11 +84,22 @@ pub struct OpDag {
     pending: BTreeSet<OpDagNodeId>,
     /// Nodes that ran this epoch. Cleared after every graph run.
     touched: Vec<OpDagNodeId>,
+    /// Mixed into the fingerprint; see [`OpDag::version`].
+    version: u64,
 }
 
 impl OpDag {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the version mixed into the [`fingerprint`](Self::fingerprint).
+    /// Changing it rebuilds derived state at the next open, which is how to
+    /// make a change the fingerprint cannot see, such as to a closure's
+    /// body or a captured constant, take effect on existing data.
+    pub fn version(&mut self, version: u64) -> &mut Self {
+        self.version = version;
+        self
     }
 
     pub fn source<B: Buffer>(&mut self) -> NodeRef<B> {
@@ -174,10 +185,11 @@ impl OpDag {
     /// when the graph opens under another.
     ///
     /// Closures appear only by type name, which names where they are
-    /// defined but not their bodies. Mix a version into the fingerprint
-    /// to force a rebuild when only a closure's body changed.
+    /// defined but not their bodies, and nor are values they capture. Bump
+    /// [`version`](Self::version) when only those change.
     pub fn fingerprint(&self) -> u64 {
         let mut fp = Fingerprint::new();
+        fp.write_u64(self.version);
         fp.write_u64(self.nodes.len() as u64);
         for node in &self.nodes {
             fp.write_str(node.name);

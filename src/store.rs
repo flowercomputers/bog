@@ -4,12 +4,14 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions, TryLockError},
     io::Write,
-    ops::{Bound, Range, RangeBounds},
+    ops::{Bound, Deref, Range, RangeBounds},
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
+    thread::{self, JoinHandle},
     time::Instant,
 };
 
@@ -51,6 +53,10 @@ pub(crate) struct StoreOptions {
     pub max_tables: usize,
     /// How many adjacent tables one compaction merges.
     pub compaction_width: usize,
+    /// Commits wait for the maintenance thread once there are more memory
+    /// layers than this. Every layer is checked on a read, so this bounds
+    /// read cost when maintenance falls behind.
+    pub max_layers: usize,
 }
 
 impl Default for StoreOptions {
@@ -63,6 +69,7 @@ impl Default for StoreOptions {
             cache_size: 32 << 20,
             max_tables: 8,
             compaction_width: 4,
+            max_layers: 32,
         }
     }
 }
@@ -76,6 +83,9 @@ impl StoreOptions {
             return Err(Error::InvalidOption(
                 "compaction must merge at least two tables",
             ));
+        }
+        if self.max_layers < 2 {
+            return Err(Error::InvalidOption("max layers must be at least two"));
         }
         if self.block_size == 0 {
             return Err(Error::InvalidOption("block size must be at least one byte"));
@@ -96,6 +106,7 @@ impl StoreOptions {
             ("cache-size", self.cache_size as u64),
             ("max-tables", self.max_tables as u64),
             ("compaction-width", self.compaction_width as u64),
+            ("max-layers", self.max_layers as u64),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -244,8 +255,8 @@ struct LayerTree {
 
 /// What one or more consecutive epochs committed, keyed by keyspace id:
 /// the newest value of every key they wrote. Commits push a layer per
-/// epoch, and [`fold_layers`](Store::fold_layers) merges neighbors so
-/// there are only logarithmically many.
+/// epoch, and the maintenance thread folds neighbors together so there
+/// are only logarithmically many; see [`fold_plan`].
 struct Layer {
     /// The newest epoch it holds.
     epoch: u64,
@@ -254,11 +265,32 @@ struct Layer {
     bytes: usize,
 }
 
-/// Fold layers while the older of the last two is no more than this many
-/// times the newer's size. Layer sizes then grow geometrically from newest
-/// to oldest, so there are O(log n) of them, and each entry is copied
+/// A layer should be more than this many times the size of every newer
+/// layer together. Layer sizes then grow geometrically from newest to
+/// oldest, so there are O(log n) of them, and each entry is copied
 /// O(log n) times over its life in memory.
 const FOLD_RATIO: usize = 2;
+
+/// Where the newest layers should be folded from: every layer from the
+/// returned index on merges into one. That is the oldest layer no more
+/// than [`FOLD_RATIO`] times the size of all newer layers together, so
+/// after the fold every layer again outweighs everything newer. Past
+/// `max_layers`, at least the newest half is folded regardless.
+fn fold_plan(layers: &[Arc<Layer>], max_layers: usize) -> Option<usize> {
+    let mut start = None;
+    let mut newer = 0usize;
+    for (i, layer) in layers.iter().enumerate().rev() {
+        if i + 1 < layers.len() && layer.bytes <= FOLD_RATIO * newer.max(1) {
+            start = Some(i);
+        }
+        newer += layer.bytes;
+    }
+    if layers.len() > max_layers {
+        let half = layers.len() / 2;
+        start = Some(start.map_or(half, |s| s.min(half)));
+    }
+    start
+}
 
 /// An immutable view of committed state. Commit builds a new one and swaps
 /// it in; a snapshot holds one for its whole life, so its epoch and its
@@ -626,18 +658,14 @@ struct KeyspaceDecl {
         fn(&[&(dyn Any + Send + Sync)], &mut dyn FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()>,
     /// Estimated resident bytes of one of this keyspace's trees.
     measure: fn(&(dyn Any + Send + Sync)) -> usize,
-    /// Fold a newer tree over an older one; see [`fold_trees`].
-    fold: fn(Option<&LayerTree>, Option<&LayerTree>, bool) -> LayerTree,
+    /// Fold trees, oldest first, into one; see [`fold_trees`].
+    fold: fn(&[&LayerTree], bool) -> LayerTree,
 }
 
-/// One tree holding `older` overwritten by `newer`, either of which may
-/// be missing. With `drop_tombstones`, nothing lies beneath, so deletes
-/// are applied rather than kept.
-fn fold_trees<K, V>(
-    older: Option<&LayerTree>,
-    newer: Option<&LayerTree>,
-    drop_tombstones: bool,
-) -> LayerTree
+/// One tree holding `trees`, oldest first, each overwriting the ones
+/// before it. With `drop_tombstones`, nothing lies beneath, so deletes are
+/// applied rather than kept.
+fn fold_trees<K, V>(trees: &[&LayerTree], drop_tombstones: bool) -> LayerTree
 where
     K: Ord + Clone + ResidentSize + Send + Sync + 'static,
     V: Clone + ResidentSize + Send + Sync + 'static,
@@ -647,10 +675,9 @@ where
             .downcast_ref::<Resident<K, V>>()
             .expect("layer tree has the registered type")
     }
-    let (mut tree, mut bytes) = match older {
-        Some(t) => (cast::<K, V>(t).clone(), t.bytes),
-        None => (Resident::new(), 0),
-    };
+    let (oldest, newer) = trees.split_first().expect("folding at least one tree");
+    let mut tree = cast::<K, V>(oldest).clone();
+    let mut bytes = oldest.bytes;
     if drop_tombstones {
         tree.retain(|k, v| {
             if v.is_none() {
@@ -659,7 +686,7 @@ where
             v.is_some()
         });
     }
-    for (k, v) in newer.map(cast::<K, V>).into_iter().flatten() {
+    for (k, v) in newer.iter().flat_map(|t| cast::<K, V>(t)) {
         if drop_tombstones && v.is_none() {
             if let Some(old) = tree.remove(k) {
                 bytes -= resident_entry_bytes(k, &old);
@@ -892,8 +919,11 @@ impl StoreBuilder {
     /// through the tx, as inserts, and run it; chunking keeps each tx
     /// within the tx memory limit. Chunks commit as they go, but the store
     /// is not handed out until the last, so nobody sees a partial rebuild.
-    /// Constraints that depend on the order rows arrive in must be met by
-    /// the order `replay` feeds them, or by feeding everything at once.
+    /// Each tx reports [`WriteTx::rebuilding`], and [`Check`](crate::Check)
+    /// accepts everything in one: a chunk can hold a state the rows never
+    /// passed through, such as a sum with only its negative rows so far.
+    /// The rows were checked when first written; a check added since is
+    /// enforced only on later writes.
     ///
     /// If `replay` or a commit fails, open fails, and the next open starts
     /// the rebuild over.
@@ -1061,14 +1091,10 @@ impl StoreBuilder {
             wal_bytes,
             Some(lock),
         );
-        // the previous run may have left more than these limits allow
-        {
-            let mut writer = store.lock_writer();
-            if store.over_limits(&writer) {
-                store.checkpoint_locked(&mut writer)?;
-            }
+        // the previous run may have left too much WAL, memtable, or tables
+        if store.maintenance_due() {
+            store.request_maintenance();
         }
-        store.compact_while_over()?;
         store.reconcile_graph(fp, &dropped, rebuild)?;
         Ok(store)
     }
@@ -1300,9 +1326,76 @@ fn apply_frame(
     Ok(())
 }
 
+/// An open store: a handle on its [`Shared`] state. Dropping it stops and
+/// joins the maintenance thread, if one was started.
 pub struct Store {
-    /// The latest committed state. Only `finish` stores into it, and only
-    /// while holding `writer`.
+    shared: Arc<Shared>,
+}
+
+impl Deref for Store {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Relaxed);
+        {
+            let mut st = self.shared.maintenance.lock();
+            st.shutdown = true;
+            self.shared.maintenance.wake.notify_all();
+            self.shared.maintenance.progress.notify_all();
+        }
+        let worker = self
+            .shared
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            // a panic there was already recorded; nothing more to report
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Coordination between commits and the maintenance thread.
+#[derive(Default)]
+struct Maintenance {
+    state: Mutex<MaintenanceState>,
+    /// The thread waits on this for work.
+    wake: Condvar,
+    /// Signalled whenever the thread installs a result or goes idle;
+    /// throttled commits and [`Store::quiesce`] wait on it.
+    progress: Condvar,
+}
+
+#[derive(Default)]
+struct MaintenanceState {
+    /// Work was asked for since the thread last started a pass.
+    requested: bool,
+    /// The thread is in a pass.
+    busy: bool,
+    shutdown: bool,
+    /// The thread panicked and exited.
+    dead: bool,
+    /// How the last pass failed, if it did. Cleared by a clean pass.
+    error: Option<Error>,
+}
+
+impl Maintenance {
+    fn lock(&self) -> MutexGuard<'_, MaintenanceState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Everything an open store holds, shared by the [`Store`] handle and its
+/// maintenance thread.
+pub struct Shared {
+    /// The latest committed state. Commits, checkpoints, and maintenance
+    /// store into it, always while holding `writer`.
     current: ArcSwap<Version>,
     writer: Mutex<StoreWriter>,
     /// Live snapshot count per epoch; the minimum bounds which layers
@@ -1317,8 +1410,60 @@ pub struct Store {
     wal_bytes: AtomicU64,
     /// Held while compacting, so one compaction runs at a time.
     compaction: Mutex<()>,
+    /// Held while folding or checkpointing. A checkpoint drops the layers
+    /// it wrote by epoch when it installs, so no fold may merge them with
+    /// newer ones in between.
+    layer_work: Mutex<()>,
+    /// Whether there is a directory to checkpoint to.
+    durable: bool,
+    maintenance: Maintenance,
+    /// The maintenance thread, started by the first request for it.
+    worker: Mutex<Option<JoinHandle<()>>>,
+    /// This, for handing to the maintenance thread.
+    me: Weak<Shared>,
+    /// Which thread holds the open write tx, if any, as a [`thread_tag`],
+    /// so calls that would wait on that tx can panic instead of deadlock.
+    tx_thread: AtomicU64,
+    /// Set when the store is dropped; long maintenance work checks it.
+    shutdown: AtomicBool,
+    /// Make every compaction fail, to test what a failed one does.
+    #[cfg(test)]
+    fail_merges: AtomicBool,
     /// Held for the store's life; released when the file is dropped.
     _lock: Option<File>,
+}
+
+/// A number unique to the calling thread, never 0.
+fn thread_tag() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local!(static TAG: u64 = NEXT.fetch_add(1, Relaxed));
+    TAG.with(|t| *t)
+}
+
+/// The writer lock as a write tx holds it: records the holding thread
+/// while it lives.
+pub(crate) struct WriterGuard<'a> {
+    guard: MutexGuard<'a, StoreWriter>,
+    owner: &'a AtomicU64,
+}
+
+impl Deref for WriterGuard<'_> {
+    type Target = StoreWriter;
+    fn deref(&self) -> &StoreWriter {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut StoreWriter {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        self.owner.store(0, Relaxed);
+    }
 }
 
 impl Store {
@@ -1350,7 +1495,7 @@ impl Store {
                 bytes,
             })]
         };
-        Store {
+        let shared = Arc::new_cyclic(|me| Shared {
             current: ArcSwap::from_pointee(Version {
                 epoch,
                 layers,
@@ -1358,6 +1503,7 @@ impl Store {
                 resident_bytes: bytes,
                 floors: Arc::new(writer.manifest.floors.clone()),
             }),
+            durable: writer.dir.is_some(),
             writer: Mutex::new(writer),
             active_snapshots: Mutex::new(BTreeMap::new()),
             keyspaces,
@@ -1365,10 +1511,21 @@ impl Store {
             opts,
             wal_bytes: AtomicU64::new(wal_bytes),
             compaction: Mutex::new(()),
+            layer_work: Mutex::new(()),
+            maintenance: Maintenance::default(),
+            worker: Mutex::new(None),
+            me: me.clone(),
+            tx_thread: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_merges: AtomicBool::new(false),
             _lock: lock,
-        }
+        });
+        Store { shared }
     }
+}
 
+impl Shared {
     /// The writer. A panic while a tx held it does not poison it: a tx
     /// changes the writer only inside `finish`, and real failures there
     /// poison the store explicitly.
@@ -1393,14 +1550,25 @@ impl Store {
         }
     }
 
-    /// Whether a checkpoint is due: the WAL or the memtable is over its
-    /// limit, and there is somewhere to checkpoint to.
-    fn over_limits(&self, w: &StoreWriter) -> bool {
+    /// Whether the WAL or the memtable is at `factor` times its limit, and
+    /// there is somewhere to checkpoint to. At 1 a checkpoint is due; at 2
+    /// commits wait for one.
+    fn over_limits(&self, factor: u64) -> bool {
         let version = self.current.load();
-        w.dir.is_some()
+        self.durable
             && !version.layers.is_empty()
-            && (self.wal_bytes.load(Relaxed) >= self.opts.wal_limit
-                || version.resident_bytes >= self.opts.memtable_limit)
+            && (self.wal_bytes.load(Relaxed) >= self.opts.wal_limit.saturating_mul(factor)
+                || version.resident_bytes as u64
+                    >= (self.opts.memtable_limit as u64).saturating_mul(factor))
+    }
+
+    /// Panics if this thread holds the open write tx: `what` would wait
+    /// for it to finish, which it never would.
+    fn assert_no_tx_here(&self, what: &str) {
+        assert!(
+            self.tx_thread.load(Relaxed) != thread_tag(),
+            "{what} called while this thread holds a write tx, which it would wait on forever"
+        );
     }
 
     /// Panics unless `id` was declared on the builder with these types.
@@ -1417,7 +1585,9 @@ impl Store {
             None => panic!("keyspace {id} not declared; register it with StoreBuilder::keyspace"),
         }
     }
+}
 
+impl Store {
     pub(crate) fn snapshot(&self) -> Snapshot<'_> {
         let mut map = self.snapshots();
         let version = self.current.load_full();
@@ -1433,8 +1603,14 @@ impl Store {
     /// while another write transaction is open. Dropping the tx without
     /// [`finish`](Self::finish) aborts it. Fails if the store is poisoned.
     pub(crate) fn begin(&self) -> Result<WriteTx<'_>> {
+        self.assert_no_tx_here("begin");
         // lock first: the snapshot must not be older than the last commit
-        let writer = self.lock_writer();
+        let guard = self.lock_writer();
+        self.tx_thread.store(thread_tag(), Relaxed);
+        let writer = WriterGuard {
+            guard,
+            owner: &self.tx_thread,
+        };
         writer.check()?;
         Ok(WriteTx::new(
             self.snapshot(),
@@ -1451,9 +1627,10 @@ impl Store {
     /// under a strict policy nothing visible can be lost to a crash. If they
     /// fail, nothing is published and the store is poisoned.
     ///
-    /// If the commit takes the WAL or the memtable over its limit, a
-    /// checkpoint runs before this returns, and then compaction if there
-    /// are too many tables. A failure there is [`Error::AfterCommit`]: the
+    /// Checkpointing, folding layers and compacting tables are left to the
+    /// maintenance thread. If it falls far enough behind (see
+    /// [`throttle`](Shared::throttle)), this waits for it, and if the pass
+    /// it waited on failed, returns that as [`Error::AfterCommit`]: the
     /// commit stands.
     pub(crate) fn finish(&self, tx: WriteTx<'_>) -> Result<Option<u64>> {
         let (epoch, overlay, snapshot, mut writer) = tx.into_parts();
@@ -1500,7 +1677,6 @@ impl Store {
             trees,
             bytes,
         }));
-        self.fold_layers(&mut layers, current.tables.is_empty());
         self.current.store(Arc::new(Version {
             epoch,
             resident_bytes: layers.iter().map(|l| l.bytes).sum(),
@@ -1509,22 +1685,17 @@ impl Store {
             floors: current.floors.clone(),
         }));
 
-        let checkpointed = if self.over_limits(&writer) {
-            self.checkpoint_locked(&mut writer).map(|_| ())
-        } else {
-            Ok(())
-        };
         // release the writer only after publishing, so the next tx's
-        // snapshot includes this one; compaction does not need it until
-        // it installs its result
+        // snapshot includes this one
         drop(writer);
         drop(snapshot);
-        checkpointed
-            .and_then(|()| self.compact_if_due())
-            .map_err(|e| Error::AfterCommit {
-                epoch,
-                source: Arc::new(e),
-            })?;
+        if self.maintenance_due() {
+            self.request_maintenance();
+        }
+        self.throttle().map_err(|e| Error::AfterCommit {
+            epoch,
+            source: Arc::new(e),
+        })?;
         Ok(Some(epoch))
     }
 
@@ -1567,6 +1738,7 @@ impl Store {
             if let (true, Some(replay)) = (rebuild, replay) {
                 loop {
                     let mut tx = self.begin()?;
+                    tx.set_rebuilding();
                     let more = replay(&mut tx)?;
                     self.finish(tx)?;
                     if !more {
@@ -1581,6 +1753,25 @@ impl Store {
         w.update_manifest(next)
     }
 
+    /// Wait until the maintenance thread has finished a full pass begun
+    /// after this call: layers are folded and tables compacted as far as
+    /// the policy wants. Returns how that pass failed, if it did.
+    pub(crate) fn quiesce(&self) -> Result<()> {
+        self.assert_no_tx_here("quiesce");
+        let m = &self.maintenance;
+        let mut st = m.lock();
+        self.request_locked(&mut st);
+        while (st.requested || st.busy) && !st.dead && !st.shutdown {
+            st = m.progress.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+        if st.dead {
+            return Err(Error::MaintenancePanicked);
+        }
+        st.error.clone().map_or(Ok(()), Err)
+    }
+}
+
+impl Shared {
     /// Empty keyspaces `ids` as of the current epoch, and forget `dropped`
     /// ones entirely. Older data stays where it is, hidden by a floor:
     /// reads skip tables no newer than it, replay skips WAL sections no
@@ -1638,49 +1829,216 @@ impl Store {
         Ok(())
     }
 
-    /// Fold the newest layers together while the older of the last two is
-    /// no more than [`FOLD_RATIO`] times the newer's size, so a run of
-    /// small commits does not leave a layer each for reads to probe.
-    ///
-    /// Snapshots hold the layers they were taken with, so folding never
-    /// changes what one sees; it only stops sharing memory with them.
-    /// With `bottomless`, nothing lies beneath the oldest layer, so a fold
-    /// that reaches it applies deletes instead of keeping tombstones.
-    fn fold_layers(&self, layers: &mut Vec<Arc<Layer>>, bottomless: bool) {
-        while let [.., older, newer] = &layers[..]
-            && older.bytes <= FOLD_RATIO * newer.bytes.max(1)
+    /// Whether there may be a checkpoint to write, layers to fold or
+    /// tables to compact.
+    fn maintenance_due(&self) -> bool {
+        let v = self.current.load();
+        v.layers.len() >= 2 || v.tables.len() > self.opts.max_tables || self.over_limits(1)
+    }
+
+    /// Wake the maintenance thread, starting it if this is the first
+    /// request. If it cannot be started, the request is recorded as failed.
+    pub(crate) fn request_maintenance(&self) {
+        self.request_locked(&mut self.maintenance.lock());
+    }
+
+    fn request_locked(&self, st: &mut MaintenanceState) {
+        st.requested = true;
+        self.maintenance.wake.notify_one();
+        if st.shutdown || st.dead {
+            return;
+        }
+        let mut worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
+        if worker.is_some() {
+            return;
+        }
+        let me = self.me.upgrade().expect("a store is alive while used");
+        match thread::Builder::new()
+            .name("fold3-maintenance".into())
+            .spawn(move || me.maintenance_loop())
         {
-            let drop_tombstones = bottomless && layers.len() == 2;
-            let ids: BTreeSet<u64> = older
-                .trees
-                .keys()
-                .chain(newer.trees.keys())
-                .copied()
-                .collect();
-            let mut trees = HashMap::with_capacity(ids.len());
-            for ks in ids {
-                let (o, n) = (older.trees.get(&ks), newer.trees.get(&ks));
-                let folded = match (o, n) {
-                    // untouched by the other side and nothing to drop: share it
-                    (Some(t), None) | (None, Some(t)) if !drop_tombstones => t.clone(),
-                    _ => (self.keyspaces[&ks].fold)(o, n, drop_tombstones),
-                };
-                // every entry costs at least ENTRY_OVERHEAD, so no bytes
-                // means deletes emptied the tree
-                if folded.bytes > 0 {
-                    trees.insert(ks, folded);
-                }
-            }
-            let epoch = newer.epoch;
-            layers.truncate(layers.len() - 2);
-            if !trees.is_empty() {
-                layers.push(Arc::new(Layer {
-                    epoch,
-                    bytes: trees.values().map(|t| t.bytes).sum(),
-                    trees,
-                }));
+            Ok(handle) => *worker = Some(handle),
+            Err(e) => {
+                st.requested = false;
+                st.error = Some(Error::io("starting the maintenance thread", e));
+                self.maintenance.progress.notify_all();
             }
         }
+    }
+
+    /// Tell anyone waiting on maintenance that something changed.
+    fn progress(&self) {
+        let _st = self.maintenance.lock();
+        self.maintenance.progress.notify_all();
+    }
+
+    /// Wait while there are more than `max_layers` layers or twice
+    /// `max_tables` tables, or the WAL or memtable is at twice its limit,
+    /// so reads and memory stay bounded when commits outrun the
+    /// maintenance thread. Fails if a pass run since it started waiting
+    /// failed, rather than waiting on one that keeps failing.
+    fn throttle(&self) -> Result<()> {
+        let over = || {
+            let v = self.current.load();
+            v.layers.len() > self.opts.max_layers
+                || v.tables.len() > 2 * self.opts.max_tables
+                || self.over_limits(2)
+        };
+        if !over() {
+            return Ok(());
+        }
+        let m = &self.maintenance;
+        let mut st = m.lock();
+        let mut asked = false;
+        // checked under the lock the thread signals progress under, so a
+        // result installed after this check wakes the wait below
+        while over() {
+            if st.dead {
+                return Err(Error::MaintenancePanicked);
+            }
+            if st.shutdown {
+                break;
+            }
+            // idle after being asked: the pass that answered has finished
+            if asked
+                && !st.requested
+                && !st.busy
+                && let Some(e) = &st.error
+            {
+                return Err(e.clone());
+            }
+            asked = true;
+            self.request_locked(&mut st);
+            st = m.progress.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+        Ok(())
+    }
+
+    /// The maintenance thread: wait for a request, then run a pass, until
+    /// the store is dropped. A failed pass is recorded and retried at the
+    /// next request; a panic is recorded and ends the thread.
+    fn maintenance_loop(&self) {
+        let m = &self.maintenance;
+        loop {
+            {
+                let mut st = m.lock();
+                while !st.requested && !st.shutdown {
+                    st = m.wake.wait(st).unwrap_or_else(PoisonError::into_inner);
+                }
+                if st.shutdown {
+                    return;
+                }
+                st.requested = false;
+                st.busy = true;
+            }
+            let res = panic::catch_unwind(AssertUnwindSafe(|| self.maintain()));
+            let mut st = m.lock();
+            st.busy = false;
+            match res {
+                Ok(res) => st.error = res.err(),
+                Err(_) => {
+                    st.dead = true;
+                    st.error = Some(Error::MaintenancePanicked);
+                }
+            }
+            m.progress.notify_all();
+            if st.dead {
+                return;
+            }
+        }
+    }
+
+    /// One maintenance pass: checkpoint if the WAL or memtable is over its
+    /// limit, fold layers until the plan is satisfied, then compact tables
+    /// until there are few enough.
+    fn maintain(&self) -> Result<()> {
+        // a failed checkpoint should not stop folds and compaction, which
+        // keep reads fast while it is retried
+        let checkpointed = if self.over_limits(1) {
+            self.checkpoint_now().map(|_| ())
+        } else {
+            Ok(())
+        };
+        while !self.shutdown.load(Relaxed) && self.fold_once() {}
+        let compacted = self.compact_while_over().map(|_| ());
+        checkpointed.and(compacted)
+    }
+
+    /// Fold the layers [`fold_plan`] picks into one. Returns whether there
+    /// was anything to do.
+    ///
+    /// The merge runs without locks, over the layers as they were when it
+    /// started. Commits only append layers meanwhile, so it installs over
+    /// the same layers, now with newer ones after them. Checkpoints wait
+    /// for it; a truncation in between replaces every layer, and the
+    /// result is thrown away.
+    ///
+    /// Snapshots hold the layers they were taken with, so folding never
+    /// changes what one sees; it only stops sharing memory with them. With
+    /// no tables, nothing lies beneath the oldest layer, so a fold that
+    /// reaches it applies deletes instead of keeping tombstones.
+    fn fold_once(&self) -> bool {
+        let _layers = self
+            .layer_work
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let before = self.current.load_full();
+        let Some(start) = fold_plan(&before.layers, self.opts.max_layers) else {
+            return false;
+        };
+        let window = &before.layers[start..];
+        let drop_tombstones = start == 0 && before.tables.is_empty();
+        let merged = self.merge_layers(window, drop_tombstones);
+
+        let w = self.lock_writer();
+        let now = self.current.load_full();
+        let in_place = now.layers.len() >= before.layers.len()
+            && now.layers[start..before.layers.len()]
+                .iter()
+                .zip(window)
+                .all(|(a, b)| Arc::ptr_eq(a, b));
+        if in_place {
+            let mut layers = now.layers[..start].to_vec();
+            layers.extend(merged.map(Arc::new));
+            layers.extend_from_slice(&now.layers[before.layers.len()..]);
+            self.current.store(Arc::new(Version {
+                epoch: now.epoch,
+                resident_bytes: layers.iter().map(|l| l.bytes).sum(),
+                layers,
+                tables: now.tables.clone(),
+                floors: now.floors.clone(),
+            }));
+        }
+        drop(w);
+        self.progress();
+        true
+    }
+
+    /// One layer holding `layers`, oldest first, or `None` if deletes
+    /// emptied it. Trees only one layer has are shared, not copied.
+    fn merge_layers(&self, layers: &[Arc<Layer>], drop_tombstones: bool) -> Option<Layer> {
+        let ids: BTreeSet<u64> = layers
+            .iter()
+            .flat_map(|l| l.trees.keys().copied())
+            .collect();
+        let mut trees = HashMap::with_capacity(ids.len());
+        for ks in ids {
+            let parts: Vec<&LayerTree> = layers.iter().filter_map(|l| l.trees.get(&ks)).collect();
+            let folded = match parts[..] {
+                [only] if !drop_tombstones => only.clone(),
+                _ => (self.keyspaces[&ks].fold)(&parts, drop_tombstones),
+            };
+            // every entry costs at least ENTRY_OVERHEAD, so no bytes means
+            // deletes emptied the tree
+            if folded.bytes > 0 {
+                trees.insert(ks, folded);
+            }
+        }
+        (!trees.is_empty()).then(|| Layer {
+            epoch: layers.last().expect("merging at least one layer").epoch,
+            bytes: trees.values().map(|t| t.bytes).sum(),
+            trees,
+        })
     }
 
     /// Write everything committed since the last checkpoint to a new table,
@@ -1693,43 +2051,124 @@ impl Store {
     /// merges them. Snapshots taken before a checkpoint keep their own
     /// layers alive until they are dropped.
     ///
-    /// Holds the writer lock throughout, so commits wait for it, and it
-    /// must not be called while this thread holds a write tx.
+    /// The maintenance thread checkpoints on its own when the WAL or the
+    /// memtable crosses its limit; this is for checkpointing sooner.
+    /// Commits continue while the table is written: it takes the writer
+    /// lock only to switch to a new WAL segment at the start, and to
+    /// install the table at the end.
+    ///
+    /// # Panics
+    ///
+    /// If this thread holds a write tx, which it would wait on forever.
     pub(crate) fn checkpoint(&self) -> Result<Option<u64>> {
-        let mut writer = self.lock_writer();
-        writer.check()?;
-        self.checkpoint_locked(&mut writer)
+        self.assert_no_tx_here("checkpoint");
+        let done = self.checkpoint_now();
+        if self.maintenance_due() {
+            self.request_maintenance();
+        }
+        done
     }
 
-    fn checkpoint_locked(&self, w: &mut StoreWriter) -> Result<Option<u64>> {
-        let Some(dir) = w.dir.clone() else {
-            return Ok(None);
-        };
-        let dir = &*dir;
-        // stable: commits need the writer lock we hold
-        let version = self.current.load_full();
-        if version.layers.is_empty() {
-            return Ok(None);
-        }
-        debug_assert!(
-            version
-                .layers
-                .iter()
-                .all(|l| l.epoch > w.manifest.checkpointed()),
-            "every layer is newer than every table"
-        );
+    fn checkpoint_now(&self) -> Result<Option<u64>> {
+        let _layers = self
+            .layer_work
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
 
-        // build the next manifest aside, so a failure leaves the writer's
-        // state matching the manifest on disk; files created before a
-        // failure are orphans the next open sweeps
-        let mut next = w.manifest.clone();
-        let ckpt = Checkpoint {
-            number: next.next_file,
-            epoch: version.epoch,
+        // freeze: everything committed so far goes in the table, and the
+        // WAL moves to a new segment, so the old ones hold only that
+        let (dir, version, ckpt, retired, frozen_wal) = {
+            let mut w = self.lock_writer();
+            w.check()?;
+            let Some(dir) = w.dir.clone() else {
+                return Ok(None);
+            };
+            // stable: commits need the writer lock we hold
+            let version = self.current.load_full();
+            if version.layers.is_empty() {
+                return Ok(None);
+            }
+            debug_assert!(
+                version
+                    .layers
+                    .iter()
+                    .all(|l| l.epoch > w.manifest.checkpointed()),
+                "every layer is newer than every table"
+            );
+            // reserve a file number; it reaches disk with a later manifest,
+            // and a crash before then leaves an orphan the next open sweeps
+            let ckpt = Checkpoint {
+                number: w.manifest.next_file,
+                epoch: version.epoch,
+            };
+            w.manifest.next_file += 1;
+            let retired: Vec<u64> = w.manifest.segments.iter().map(|s| s.number).collect();
+            if let Some(wal) = w.wal.as_mut() {
+                // sealing promises the bytes are there, so sync them first
+                let flushed = wal.flush(true, true).map(|()| wal.size as u64);
+                let len = match flushed {
+                    Ok(len) => len,
+                    Err(e) => return Err(w.poison(e)),
+                };
+                let mut next = w.manifest.clone();
+                next.segments
+                    .last_mut()
+                    .expect("the WAL has a segment")
+                    .sealed = Some(len);
+                let fresh = new_segment(&dir, &mut next)?;
+                w.install_manifest(&dir, next)?;
+                w.wal = Some(fresh);
+            }
+            (dir, version, ckpt, retired, self.wal_bytes.load(Relaxed))
         };
-        next.next_file += 1;
+
+        // write the table without locks; files left by a failure are
+        // orphans the next open sweeps
         let path = dir.join(ckpt.file_name());
-        let mut table = TableBuilder::create(&path, self.opts.block_size)?;
+        let table = self.write_checkpoint(&path, &version, ckpt)?;
+
+        // install: the table replaces the layers it holds, which are all
+        // at or below its epoch, since only this thread folds layers
+        let mut w = self.lock_writer();
+        w.check()?;
+        let mut next = w.manifest.clone();
+        next.checkpoints.push(ckpt);
+        next.segments.retain(|s| !retired.contains(&s.number));
+        next.prune_floors();
+        w.install_manifest(&dir, next)?;
+        let now = self.current.load_full();
+        let layers: Vec<Arc<Layer>> = now
+            .layers
+            .iter()
+            .filter(|l| l.epoch > ckpt.epoch)
+            .cloned()
+            .collect();
+        let mut tables = now.tables.clone();
+        tables.push(Arc::new(table));
+        self.current.store(Arc::new(Version {
+            epoch: now.epoch,
+            resident_bytes: layers.iter().map(|l| l.bytes).sum(),
+            layers,
+            tables,
+            floors: Arc::new(w.manifest.floors.clone()),
+        }));
+        self.wal_bytes.fetch_sub(frozen_wal, Relaxed);
+        drop(w);
+
+        for seg in retired {
+            let seg = Segment {
+                number: seg,
+                sealed: None,
+            };
+            // a failure leaves an orphan for the next open to sweep
+            let _ = fs::remove_file(dir.join(seg.file_name()));
+        }
+        Ok(Some(ckpt.epoch))
+    }
+
+    /// Write `version`'s layers to a checkpoint table at `path`.
+    fn write_checkpoint(&self, path: &Path, version: &Version, ckpt: Checkpoint) -> Result<Table> {
+        let mut table = TableBuilder::create(path, self.opts.block_size)?;
         let ids: BTreeSet<u64> = version
             .layers
             .iter()
@@ -1746,55 +2185,7 @@ impl Store {
             (self.keyspaces[&ks].write_run)(&trees, &mut |k, v| table.push(k, v))?;
         }
         table.finish(ckpt.epoch)?;
-        let table = Table::open(&path, ckpt.number)?;
-        next.checkpoints.push(ckpt);
-
-        // every segment holds only epochs the checkpoint now covers
-        let retired = std::mem::take(&mut next.segments);
-        let wal = match w.wal {
-            Some(_) => Some(new_segment(dir, &mut next)?),
-            None => None,
-        };
-        next.prune_floors();
-        let floors = Arc::new(next.floors.clone());
-        w.install_manifest(dir, next)?;
-
-        // the checkpoint is durable: swap its table in for the layers it
-        // covers, which is all of them
-        let mut tables = version.tables.clone();
-        tables.push(Arc::new(table));
-        self.current.store(Arc::new(Version {
-            epoch: version.epoch,
-            layers: Vec::new(),
-            tables,
-            resident_bytes: 0,
-            floors,
-        }));
-        self.wal_bytes.store(0, Relaxed);
-
-        // the old segment's buffered frames, if any, are covered too; its
-        // drop flushes them into a file that is about to be deleted
-        w.wal = wal;
-        for seg in retired {
-            // a failure leaves an orphan for the next open to sweep
-            let _ = fs::remove_file(dir.join(seg.file_name()));
-        }
-        Ok(Some(version.epoch))
-    }
-
-    /// Compact if there are more tables than `max_tables`, unless another
-    /// compaction is already running.
-    fn compact_if_due(&self) -> Result<()> {
-        if self.current.load().tables.len() <= self.opts.max_tables {
-            return Ok(());
-        }
-        let running = match self.compaction.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            // another thread is compacting; it will get there
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
-        };
-        self.compact_over(&running).map(|_| ())
+        Table::open(path, ckpt.number)
     }
 
     /// Merge windows of adjacent tables until no more than `max_tables`
@@ -1813,7 +2204,7 @@ impl Store {
         let mut merges = 0;
         loop {
             let tables = self.current.load().tables.clone();
-            if tables.len() <= self.opts.max_tables {
+            if tables.len() <= self.opts.max_tables || self.shutdown.load(Relaxed) {
                 return Ok(merges);
             }
             let window = cheapest_window(&tables, self.opts.compaction_width);
@@ -1826,9 +2217,13 @@ impl Store {
     /// whether there was anything to merge.
     ///
     /// Commits continue while it merges; it takes the writer lock only to
-    /// install the result, so it must not be called while this thread
-    /// holds a write tx.
+    /// install the result.
+    ///
+    /// # Panics
+    ///
+    /// If this thread holds a write tx, which it would wait on forever.
     pub(crate) fn compact(&self) -> Result<bool> {
+        self.assert_no_tx_here("compact");
         let _running = self
             .compaction
             .lock()
@@ -1873,6 +2268,13 @@ impl Store {
         // floors only rise, and a later one covers every table that exists
         // when it is set, so reading them once here is safe
         let floors = self.current.load().floors.clone();
+        #[cfg(test)]
+        if self.fail_merges.load(Relaxed) {
+            return Err(Error::io(
+                format!("creating {}", path.display()),
+                std::io::Error::other("injected merge failure"),
+            ));
+        }
         let mut out = TableBuilder::create(&path, self.opts.block_size)?;
         let ids: BTreeSet<u64> = inputs.iter().flat_map(|t| t.keyspaces()).collect();
         let (mut key, mut value) = (Vec::new(), Vec::new());
@@ -2612,23 +3014,21 @@ mod tests {
     fn crossing_the_wal_limit_checkpoints_automatically() {
         let dir = tmpdir("auto-wal");
         let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.wal_limit(200)).unwrap();
-        let mut epochs = Vec::new();
-        for i in 0..20u8 {
-            epochs.push(put(&store, &[(i, Some(i as i64))]).unwrap());
-            let stats = store.stats();
+        let n = 20u8;
+        for i in 0..n {
+            put(&store, &[(i, Some(i as i64))]).unwrap();
             assert!(
-                stats.wal_bytes < 200,
-                "checkpointed by the time finish returns"
+                store.stats().wal_bytes < 400,
+                "commits wait at twice the limit"
             );
-            if stats.tables > 0 {
-                break;
-            }
         }
+        store.quiesce().unwrap();
         let stats = store.stats();
-        assert_eq!(stats.tables, 1, "the limit was crossed");
-        assert_eq!((stats.wal_bytes, stats.memtable_bytes), (0, 0));
-        let n = epochs.len() as u8;
-        assert_eq!(manifest_of(&dir).checkpointed(), n as u64);
+        assert!(stats.tables >= 1, "the limit was crossed");
+        assert!(stats.wal_bytes < 200, "{stats:?}");
+        let m = manifest_of(&dir);
+        assert!(m.checkpointed() > 0);
+        assert!(m.segments.len() == 1, "covered segments are retired");
         for i in 0..n {
             assert_eq!(read(&store, i), Some(i as i64));
         }
@@ -2645,15 +3045,23 @@ mod tests {
         let store = open_with(&dir, DurabilityPolicy::NONE, |b| b.memtable_limit(512)).unwrap();
         for i in 0..50u8 {
             put(&store, &[(i, Some(i as i64))]);
-            assert!(store.stats().memtable_bytes < 512);
+            assert!(
+                store.stats().memtable_bytes < 1024,
+                "commits wait at twice the limit"
+            );
         }
-        assert!(store.stats().tables > 1, "{:?}", store.stats());
+        store.quiesce().unwrap();
+        let stats = store.stats();
+        assert!(stats.memtable_bytes < 512);
+        assert!(stats.tables >= 1, "{stats:?}");
         drop(store);
         let store = open(&dir, DurabilityPolicy::NONE).unwrap();
         let unlogged = (0..50u8).filter(|&i| read(&store, i).is_none()).count();
-        assert!(
-            unlogged < 50 && unlogged > 0,
-            "checkpointed data survives, the tail does not"
+        assert!(unlogged < 50, "checkpointed data survives");
+        assert_eq!(
+            unlogged > 0,
+            stats.memtable_bytes > 0,
+            "the tail does not: {unlogged}"
         );
         drop(store);
         fs::remove_dir_all(&dir).unwrap();
@@ -2669,6 +3077,7 @@ mod tests {
             assert_eq!(store.stats().tables, 0);
         }
         let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.wal_limit(10)).unwrap();
+        store.quiesce().unwrap();
         let stats = store.stats();
         assert_eq!(
             (stats.tables, stats.wal_bytes, stats.memtable_bytes),
@@ -2699,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_auto_checkpoint_reports_the_commit_and_retries() {
+    fn a_failed_auto_checkpoint_is_reported_to_a_waiting_commit_and_retried() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmpdir("auto-fail");
         let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| b.wal_limit(100)).unwrap();
@@ -2730,9 +3139,13 @@ mod tests {
         assert_eq!(store.snapshot().epoch(), epoch);
         assert_eq!(store.stats().tables, 0);
 
+        assert!(store.quiesce().is_err(), "still failing");
+
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         put(&store, &[(99, Some(99))]);
-        assert_eq!(store.stats().tables, 1, "the next commit retried it");
+        store.quiesce().unwrap();
+        assert_eq!(store.stats().tables, 1, "the next pass retried it");
+        assert_eq!(read(&store, 99), Some(99));
         drop(store);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2790,13 +3203,87 @@ mod tests {
                 None => model.remove(&k),
             };
             let layers = store.current.load().layers.len();
-            assert!(layers <= 16, "{layers} layers after {i} commits");
+            assert!(layers <= 32, "{layers} layers after {i} commits");
         }
+        store.quiesce().unwrap();
+        let layers = store.current.load().layers.len();
+        assert!(layers <= 12, "{layers} layers once maintenance catches up");
         for k in 0..=255u8 {
             assert_eq!(read(&store, k), model.get(&k).copied(), "key {k}");
         }
         let live: Vec<(u8, i64)> = model.into_iter().collect();
         assert_eq!(live_rows(&store), live);
+    }
+
+    #[test]
+    fn maintenance_races_commits_checkpoints_and_readers() {
+        let dir = tmpdir("maintenance-race");
+        let opts = |b: StoreBuilder| {
+            b.memtable_limit(4096).options_with(|o| {
+                o.max_tables = 3;
+                o.compaction_width = 2;
+                o.max_layers = 4;
+            })
+        };
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, opts).unwrap();
+        let mut model = BTreeMap::new();
+        let done = AtomicBool::new(false);
+        // stops the readers even if the writer below panics
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+        std::thread::scope(|scope| {
+            let _done = Done(&done);
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        // every key holds its epoch's commit number: within
+                        // one snapshot, each value is at most the epoch
+                        while !done.load(Relaxed) {
+                            let snap = store.snapshot();
+                            for r in snap.range(KS, ..) {
+                                let (_, v) = r.unwrap();
+                                assert!(*v as u64 <= snap.epoch(), "{v} past {}", snap.epoch());
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for i in 1..=3000u64 {
+                let k = (i * 37 % 200) as u8;
+                let v = (i % 5 != 0).then_some(i as i64);
+                // key 255 changes every commit, so each one spends an epoch
+                assert_eq!(put(&store, &[(k, v), (255, Some(i as i64))]), Some(i));
+                for (k, v) in [(k, v), (255, Some(i as i64))] {
+                    match v {
+                        Some(v) => model.insert(k, v),
+                        None => model.remove(&k),
+                    };
+                }
+                if i % 500 == 0 {
+                    store.checkpoint().unwrap();
+                }
+            }
+            done.store(true, Relaxed);
+            for r in readers {
+                r.join().unwrap();
+            }
+        });
+        store.quiesce().unwrap();
+        let v = store.current.load_full();
+        assert!(v.tables.len() <= 3, "{} tables", v.tables.len());
+        assert!(v.layers.len() <= 4, "{} layers", v.layers.len());
+        let live: Vec<(u8, i64)> = model.into_iter().collect();
+        assert_eq!(live_rows(&store), live);
+        drop(v);
+        drop(store);
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, opts).unwrap();
+        assert_eq!(live_rows(&store), live);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2808,6 +3295,7 @@ mod tests {
         for k in 0..100u8 {
             put(&store, &[(k, None)]);
         }
+        store.quiesce().unwrap();
         let v = store.current.load();
         let tombstones: usize = v
             .layers
@@ -2956,9 +3444,12 @@ mod tests {
             for round in 0..6u8 {
                 for i in 0..10u8 {
                     put(&store, &[(i, Some(round as i64 * 100 + i as i64))]);
-                    assert!(store.stats().tables <= 3, "{:?}", store.stats());
+                    // commits wait for compaction past twice the limit
+                    assert!(store.stats().tables <= 6, "{:?}", store.stats());
                 }
             }
+            store.quiesce().unwrap();
+            assert!(store.stats().tables <= 3, "{:?}", store.stats());
             put(&store, &[(3, None)]);
             assert_eq!(live_rows(&store).len(), 9);
             assert_eq!(read(&store, 4), Some(504));
@@ -2974,6 +3465,81 @@ mod tests {
         assert_eq!(read(&store, 9), Some(509));
         drop(store);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_compaction_is_reported_and_retried() {
+        let dir = tmpdir("compact-fail");
+        let store = open_with(&dir, DurabilityPolicy::RELAXED, |b| {
+            b.options_with(|o| {
+                o.max_tables = 2;
+                o.compaction_width = 2;
+            })
+        })
+        .unwrap();
+        // no tables yet, so nothing can have been merged before this
+        store.fail_merges.store(true, Relaxed);
+        for i in 0..5u8 {
+            put(&store, &[(i, Some(i as i64))]);
+            store.checkpoint().unwrap();
+        }
+        let err = store.quiesce().unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert!(store.stats().tables > 2, "nothing was merged");
+        // commits that wait on it hear about it too, but still commit
+        let mut tx = store.begin().unwrap();
+        tx.keyspace(KS).absorb(9, Change::Insert(9)).unwrap();
+        store.finish(tx).ok();
+        assert_eq!(read(&store, 9), Some(9));
+
+        store.fail_merges.store(false, Relaxed);
+        store.quiesce().unwrap();
+        assert!(store.stats().tables <= 2, "{:?}", store.stats());
+        let on_disk = files_in(&dir)
+            .into_iter()
+            .filter(|f| f.ends_with(".ckpt"))
+            .count();
+        assert_eq!(on_disk, store.stats().tables, "failed outputs are swept");
+        drop(store);
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(live_rows(&store).len(), 6);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "holds a write tx")]
+    fn checkpointing_under_ones_own_tx_panics_instead_of_deadlocking() {
+        let store = mem();
+        let _tx = store.begin().unwrap();
+        let _ = store.checkpoint();
+    }
+
+    #[test]
+    fn a_tx_on_another_thread_is_waited_for() {
+        let store = mem();
+        let tx = store.begin().unwrap();
+        thread::scope(|s| {
+            let waiter = s.spawn(|| store.checkpoint().unwrap());
+            store.finish(tx).unwrap();
+            assert_eq!(waiter.join().unwrap(), None, "in memory");
+        });
+        // the tx is gone, so this thread may checkpoint again
+        store.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn the_maintenance_thread_starts_when_first_needed() {
+        let store = mem();
+        put(&store, &[(1, Some(1))]);
+        assert!(
+            store.worker.lock().unwrap().is_none(),
+            "one layer needs no fold"
+        );
+        put(&store, &[(2, Some(2))]);
+        assert!(store.worker.lock().unwrap().is_some());
+        store.quiesce().unwrap();
+        assert_eq!(live_rows(&store).len(), 2);
     }
 
     #[test]
@@ -3017,8 +3583,8 @@ mod tests {
         store.checkpoint().unwrap();
         put(&store, &[(250, Some(250))]);
         store.checkpoint().unwrap();
-        // the explicit checkpoint path does not compact; a commit does
         put(&store, &[(251, Some(251))]);
+        store.quiesce().unwrap();
         let v = store.current.load_full();
         assert_eq!(v.tables.len(), 2);
         assert!(checkpoint_rows(v.tables[1].path()).contains(&(1, None)));

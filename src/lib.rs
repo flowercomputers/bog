@@ -436,6 +436,10 @@ where
 /// Rejects the tx when a value its input view is left holding fails
 /// `check`. Only the values an epoch ends with are checked, so a tx that
 /// passes through a bad state and recovers within itself is accepted.
+///
+/// A rebuild of derived state is not checked: it replays rows that were
+/// accepted when written, in chunks whose intermediate states they may
+/// never have passed through.
 pub struct Check<K, M, F>(F, PhantomData<fn() -> (K, M)>);
 
 impl<K, M, F> Check<K, M, F> {
@@ -457,6 +461,9 @@ where
     type Gives = Bag<()>;
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Register<K, M>], _out: &mut Bag<()>) {
+        if tx.rebuilding() {
+            return;
+        }
         for b in batches {
             for (k, change) in b.iter() {
                 if let Some(v) = change.new_value()
@@ -756,6 +763,27 @@ mod tests {
                 App { g, src, modulus }
             }
 
+            /// Like [`new`](Self::new), but rejecting negative totals.
+            fn checked(modulus: u8) -> Self {
+                let mut g = OpDag::new();
+                let src = g.source::<Bag<(u8, i64)>>();
+                let m = modulus;
+                let class = g.nary(
+                    &[src],
+                    FusedLinears(Map(move |&(k, v): &(u8, i64)| (k % m, v)), PhantomData),
+                );
+                let totals = g.nary(&[class], Sum::<u8, i64>::new(TOTALS));
+                g.nary(
+                    &[totals],
+                    Check::new(
+                        |_: &u8, &(_, sum): &(i64, i64)| {
+                            if sum < 0 { Err(Negative) } else { Ok(()) }
+                        },
+                    ),
+                );
+                App { g, src, modulus }
+            }
+
             fn fingerprint(&self) -> u64 {
                 let mut fp = crate::graph::Fingerprint::new();
                 fp.write_u64(self.g.fingerprint());
@@ -935,6 +963,41 @@ mod tests {
             assert_eq!(totals(&store), expected(&model, 3));
         }
 
+        #[derive(Debug)]
+        struct Negative;
+        impl std::fmt::Display for Negative {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("negative total")
+            }
+        }
+        impl std::error::Error for Negative {}
+
+        #[test]
+        fn a_rebuild_is_not_held_to_checks_its_chunks_cannot_meet() {
+            let dir = tmpdir("rebuild-check");
+            let mut v1 = App::checked(2);
+            let store = v1.builder(&dir).build().unwrap();
+            // each class sums to 5, but key 0 alone would be -5
+            v1.write(&store, &[(0, Some(-5)), (1, Some(5)), (2, Some(10))]);
+            let mut tx = store.begin().unwrap();
+            assert!(tx.rebuilding() == false);
+            let mut feed = Bag::new();
+            feed.push((4, -100), 1);
+            v1.g.give(v1.src, &mut feed);
+            v1.g.run(&mut tx);
+            assert!(
+                matches!(store.finish(tx), Err(Error::Rejected(_))),
+                "ordinary writes are checked"
+            );
+            drop(store);
+
+            // one class, fed a row at a time, starting with key 0
+            let mut v2 = App::checked(1);
+            let b = v2.builder(&dir);
+            let store = b.build_with(v2.replay(1, None)).unwrap();
+            assert_eq!(totals(&store), vec![(0, (3, 10))]);
+        }
+
         #[test]
         fn an_undeclared_derived_keyspace_is_dropped() {
             let dir = tmpdir("drop-derived");
@@ -975,6 +1038,11 @@ mod tests {
             h.nary(&[src], Sum::<u8, i64>::new(KeyspaceId::new(8)));
             assert_ne!(g.fingerprint(), h.fingerprint());
             assert_ne!(g.fingerprint(), App::new(2).g.fingerprint());
+            // closure bodies are invisible, so a version stands in for them
+            assert_eq!(App::new(2).g.fingerprint(), App::new(3).g.fingerprint());
+            let before = g.fingerprint();
+            g.version(1);
+            assert_ne!(g.fingerprint(), before);
         }
     }
 
