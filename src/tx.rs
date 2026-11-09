@@ -269,10 +269,14 @@ impl<'tx> WriteTx<'tx> {
         M: Merge,
         M::Value: Codec + Sync,
     {
+        let store = self.snapshot.store();
         let handle: &mut KeyspaceHandle<K, M> = self
             .overlay
             .entry(id.raw())
-            .or_insert_with(|| Box::new(KeyspaceHandle::<K, M>::default()))
+            .or_insert_with(|| {
+                store.assert_declared::<K, M>(id.raw());
+                Box::new(KeyspaceHandle::<K, M>::default())
+            })
             .as_any_mut()
             .downcast_mut()
             .expect("keyspace id reused with a different type");
@@ -293,7 +297,10 @@ mod tests {
 
     #[test]
     fn reads_fall_through_to_snapshot_and_overlay_shadows() {
-        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let store = StoreBuilder::new(DurabilityPolicy::NONE)
+            .keyspace(KS)
+            .build()
+            .unwrap();
         let mut tx = store.begin();
         let mut ks = tx.keyspace(KS);
         ks.absorb(1, Change::Insert(10));

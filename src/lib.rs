@@ -8,6 +8,7 @@ pub mod graph;
 pub mod merge;
 use crate::merge::*;
 mod codec;
+mod manifest;
 mod store;
 mod tx;
 
@@ -465,7 +466,10 @@ mod tests {
         const TOTALS: KeyspaceId<u8, (i64, i64)> = KeyspaceId::new(7);
         let sum = g.nary(&[src], Sum::<u8, i64>::new(TOTALS));
         let _ = sum;
-        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let store = StoreBuilder::new(DurabilityPolicy::NONE)
+            .keyspace(TOTALS)
+            .build()
+            .unwrap();
         let mut tx = store.begin();
 
         let mut b = Bag::new();

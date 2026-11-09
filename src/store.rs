@@ -1,10 +1,11 @@
 use std::{
-    any::Any,
+    any::{Any, type_name},
     borrow::Cow,
     collections::{BTreeMap, HashMap},
-    fs::{File, OpenOptions},
-    io::Write,
-    path::PathBuf,
+    fmt,
+    fs::{self, File, OpenOptions, TryLockError},
+    io::{self, Write},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -12,24 +13,84 @@ use std::{
 use arc_swap::ArcSwap;
 
 use crate::{
+    codec::{Codec, DecodeError, OrderedCodec},
+    manifest::{self, Manifest, Segment},
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
     tx::{KeyspaceId, WriteTx},
 };
 
-#[derive(Clone, Copy)]
-enum DurabilityPolicyCadence {
+/// Why a store could not be opened.
+#[derive(Debug)]
+pub enum OpenError {
+    Io(io::Error),
+    /// The durability policy is invalid, or needs a directory.
+    Policy(&'static str),
+    /// Another `Store` holds this directory.
+    Locked,
+    Manifest(String),
+    /// A keyspace is registered with different types than it was written with.
+    KeyspaceType {
+        id: u64,
+        recorded: (String, String),
+        registered: (&'static str, &'static str),
+    },
+    /// The WAL holds data for a keyspace that was not registered.
+    UnknownKeyspace(u64),
+    /// A logged frame is damaged somewhere it cannot be a torn tail.
+    Corrupt {
+        file: PathBuf,
+        offset: u64,
+        why: String,
+    },
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Policy(why) => write!(f, "durability policy: {why}"),
+            Self::Locked => f.write_str("store directory is locked by another open store"),
+            Self::Manifest(why) => write!(f, "bad manifest: {why}"),
+            Self::KeyspaceType {
+                id,
+                recorded,
+                registered,
+            } => write!(
+                f,
+                "keyspace {id} was written as {recorded:?} but is registered as {registered:?}"
+            ),
+            Self::UnknownKeyspace(id) => {
+                write!(f, "the WAL holds keyspace {id}, which is not registered")
+            }
+            Self::Corrupt { file, offset, why } => {
+                write!(f, "{} is corrupt at byte {offset}: {why}", file.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl From<io::Error> for OpenError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DurabilityPolicyCadence {
     Never,
     Always,
     Windowed(core::time::Duration),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DurabilityPolicy {
     // Write(), i.e. the os has the data, durable to process crash
-    write: DurabilityPolicyCadence,
+    pub(crate) write: DurabilityPolicyCadence,
     // Fsync/Fullsync; data is on the disk/durable to power loss
-    fsync: DurabilityPolicyCadence,
+    pub(crate) fsync: DurabilityPolicyCadence,
 }
 impl DurabilityPolicy {
     pub const NONE: Self = Self {
@@ -270,38 +331,159 @@ impl<'s> Snapshot<'s> {
     }
 }
 
+/// A keyspace's types, captured when it is registered with the builder.
+/// Replay uses it to decode WAL sections; transactions use it to refuse
+/// keyspaces nobody declared.
+struct KeyspaceDecl {
+    key: &'static str,
+    merge: &'static str,
+    /// Decode one WAL section and apply it over the keyspace's replayed
+    /// tree, creating the tree on first use.
+    replay: fn(&mut Option<Box<dyn Any + Send + Sync>>, &[u8]) -> Result<(), DecodeError>,
+}
+
+fn replay_section<K, V>(
+    tree: &mut Option<Box<dyn Any + Send + Sync>>,
+    mut body: &[u8],
+) -> Result<(), DecodeError>
+where
+    K: OrderedCodec + Send + Sync + 'static,
+    V: Codec + Send + Sync + 'static,
+{
+    let tree = tree
+        .get_or_insert_with(|| Box::new(Resident::<K, V>::new()))
+        .downcast_mut::<Resident<K, V>>()
+        .expect("replay tree has the registered type");
+    while !body.is_empty() {
+        let k = K::decode_ordered(&mut body)?;
+        let v = Option::<V>::decode(&mut body)?;
+        // keep tombstones: once disk runs exist they shadow older data
+        tree.insert(k, v);
+    }
+    Ok(())
+}
+
 pub(crate) struct StoreBuilder {
     durability_policy: DurabilityPolicy,
-    wal_path: PathBuf,
+    dir: Option<PathBuf>,
+    keyspaces: HashMap<u64, KeyspaceDecl>,
 }
 
 impl StoreBuilder {
+    /// An in-memory store unless [`dir`](Self::dir) is set. Policies that
+    /// write need a directory.
     pub(crate) fn new(durability_policy: DurabilityPolicy) -> Self {
         StoreBuilder {
             durability_policy,
-            wal_path: PathBuf::from("WAL"),
+            dir: None,
+            keyspaces: HashMap::new(),
         }
     }
-    pub(crate) fn wal_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.wal_path = path.into();
+
+    /// Keep the store in `dir`, creating it if needed.
+    pub(crate) fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.dir = Some(dir.into());
         self
     }
-    pub(crate) fn build(self) -> Result<Store, &'static str> {
-        let StoreBuilder {
-            durability_policy,
-            wal_path,
-        } = self;
 
-        durability_policy.validate()?;
-        let wal = if let Never = durability_policy.write {
+    /// Declare a keyspace. Every keyspace a transaction opens must be
+    /// declared, and every keyspace in the WAL must be declared with the
+    /// types it was written with.
+    pub(crate) fn keyspace<K, M>(mut self, id: KeyspaceId<K, M>) -> Self
+    where
+        K: OrderedCodec + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Sync,
+    {
+        let decl = KeyspaceDecl {
+            key: type_name::<K>(),
+            merge: type_name::<M>(),
+            replay: replay_section::<K, M::Value>,
+        };
+        if let Some(prev) = self.keyspaces.get(&id.raw()) {
+            assert!(
+                (prev.key, prev.merge) == (decl.key, decl.merge),
+                "keyspace {} declared twice with different types",
+                id.raw()
+            );
+        }
+        self.keyspaces.insert(id.raw(), decl);
+        self
+    }
+
+    pub(crate) fn build(self) -> Result<Store, OpenError> {
+        let StoreBuilder {
+            durability_policy: dp,
+            dir,
+            keyspaces,
+        } = self;
+        dp.validate().map_err(OpenError::Policy)?;
+
+        let Some(dir) = dir else {
+            if !matches!(dp.write, Never) {
+                return Err(OpenError::Policy("writing a WAL needs a directory"));
+            }
+            return Ok(Store::new(Replayed::default(), None, dp, keyspaces, None));
+        };
+
+        fs::create_dir_all(&dir)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("LOCK"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(OpenError::Locked),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+
+        // replay whatever is on disk even if this run will not write: the
+        // previous run's settings may have differed from these
+        let mut m = match manifest::read(&dir)? {
+            Some(text) => Manifest::parse(&text).map_err(OpenError::Manifest)?,
+            None => Manifest::new(dp),
+        };
+        for (id, decl) in &keyspaces {
+            if let Some((key, merge)) = m.keyspaces.get(id)
+                && (key.as_str(), merge.as_str()) != (decl.key, decl.merge)
+            {
+                return Err(OpenError::KeyspaceType {
+                    id: *id,
+                    recorded: (key.clone(), merge.clone()),
+                    registered: (decl.key, decl.merge),
+                });
+            }
+        }
+        let replayed = replay(&dir, &m.segments, &keyspaces)?;
+
+        // appending after a torn tail would hide every later frame from
+        // replay, so seal the segment at its last good frame instead
+        if let Some(valid) = replayed.torn_active {
+            m.segments.last_mut().expect("torn segment exists").sealed = Some(valid);
+        }
+        let wal = if matches!(dp.write, Never) {
             None
         } else {
+            let seg = match m.active() {
+                Some(seg) => seg,
+                None => {
+                    let seg = Segment {
+                        number: m.next_file,
+                        sealed: None,
+                    };
+                    m.next_file += 1;
+                    m.segments.push(seg);
+                    seg
+                }
+            };
+            // created before the manifest names it; the manifest write
+            // syncs the directory entry
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(wal_path)
-                .unwrap();
-            let size = file.metadata().unwrap().len() as usize;
+                .open(dir.join(seg.file_name()))?;
+            let size = file.metadata()?.len() as usize;
             Some(Wal {
                 file,
                 buffer: Vec::new(),
@@ -309,28 +491,130 @@ impl StoreBuilder {
             })
         };
 
-        // todo: replay the wal
-        // even if we're configured with no wal,
-        // we should try to find and replay it!
-        // this goes for any on disk-data;
-        // we can't assume the current settings
-        // were the previous run's settings
-        let version = Version {
-            epoch: 0,
-            layers: Vec::new(),
+        m.policy = dp;
+        m.keyspaces = keyspaces
+            .iter()
+            .map(|(id, d)| (*id, (d.key.to_string(), d.merge.to_string())))
+            .collect();
+        manifest::write(&dir, &m)?;
+
+        Ok(Store::new(replayed, wal, dp, keyspaces, Some(lock)))
+    }
+}
+
+/// Everything replay recovered.
+#[derive(Default)]
+struct Replayed {
+    epoch: u64,
+    trees: HashMap<u64, Box<dyn Any + Send + Sync>>,
+    /// Valid length of the active segment, if it ends in a torn frame.
+    torn_active: Option<u64>,
+}
+
+/// Replay every segment in order, folding all frames into one tree per
+/// keyspace. Nothing can hold a snapshot during open, so one base layer at
+/// the last epoch is equivalent to a layer per frame, and reads stay cheap.
+fn replay(
+    dir: &Path,
+    segments: &[Segment],
+    decls: &HashMap<u64, KeyspaceDecl>,
+) -> Result<Replayed, OpenError> {
+    let mut out = Replayed::default();
+    for seg in segments {
+        let path = dir.join(seg.file_name());
+        let bytes = fs::read(&path)?;
+        let corrupt = |offset: usize, why: String| OpenError::Corrupt {
+            file: path.clone(),
+            offset: offset as u64,
+            why,
+        };
+        let limit = match seg.sealed {
+            Some(len) if (len as usize) > bytes.len() => {
+                return Err(corrupt(bytes.len(), format!("sealed at {len} bytes but shorter")));
+            }
+            Some(len) => len as usize,
+            None => bytes.len(),
         };
 
-        Ok(Store {
-            current: ArcSwap::from_pointee(version),
-            writer: Mutex::new(Writer {
-                wal,
-                dp: durability_policy,
-                last_write: None,
-                last_fsync: None,
-            }),
-            active_snapshots: Mutex::new(BTreeMap::new()),
-        })
+        let mut at = 0;
+        while at < limit {
+            let (epoch, payload, used) = match parse_frame(&bytes[at..limit]) {
+                Ok(frame) => frame,
+                // a crash mid-append leaves a partial or unchecksummed frame
+                // at the end of the active segment; everything before it is good
+                Err(_) if seg.sealed.is_none() => {
+                    out.torn_active = Some(at as u64);
+                    break;
+                }
+                Err(why) => return Err(corrupt(at, why)),
+            };
+            if epoch != out.epoch + 1 {
+                return Err(corrupt(at, format!("epoch {epoch} follows epoch {}", out.epoch)));
+            }
+            apply_frame(payload, decls, &mut out.trees).map_err(|e| match e {
+                FrameError::Unknown(id) => OpenError::UnknownKeyspace(id),
+                FrameError::Decode(why) => corrupt(at, why),
+            })?;
+            out.epoch = epoch;
+            at += used;
+        }
     }
+    Ok(out)
+}
+
+/// Split one frame off the front of `b`: `(epoch, payload, bytes used)`.
+fn parse_frame(b: &[u8]) -> Result<(u64, &[u8], usize), String> {
+    const HEAD: usize = 4 + 8 + 8;
+    if b.len() < HEAD {
+        return Err("truncated frame header".into());
+    }
+    let crc = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let epoch = u64::from_le_bytes(b[4..12].try_into().unwrap());
+    let len = u64::from_le_bytes(b[12..20].try_into().unwrap());
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|len| HEAD.checked_add(len))
+        .filter(|&end| end <= b.len())
+        .ok_or("truncated frame payload")?;
+    if crc32fast::hash(&b[4..end]) != crc {
+        return Err("frame checksum mismatch".into());
+    }
+    Ok((epoch, &b[HEAD..end], end))
+}
+
+enum FrameError {
+    Unknown(u64),
+    Decode(String),
+}
+
+/// Apply one checksummed frame: repeated `keyspace u64 | len u64 | body`.
+fn apply_frame(
+    mut payload: &[u8],
+    decls: &HashMap<u64, KeyspaceDecl>,
+    trees: &mut HashMap<u64, Box<dyn Any + Send + Sync>>,
+) -> Result<(), FrameError> {
+    let bad = |why: &str| FrameError::Decode(why.to_string());
+    while !payload.is_empty() {
+        if payload.len() < 16 {
+            return Err(bad("truncated section header"));
+        }
+        let ks = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let len = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        let end = usize::try_from(len)
+            .ok()
+            .and_then(|len| 16usize.checked_add(len))
+            .filter(|&end| end <= payload.len())
+            .ok_or_else(|| bad("truncated section body"))?;
+        let decl = decls.get(&ks).ok_or(FrameError::Unknown(ks))?;
+        let mut tree = trees.remove(&ks);
+        let res = (decl.replay)(&mut tree, &payload[16..end]);
+        if let Some(tree) = tree {
+            trees.insert(ks, tree);
+        }
+        res.map_err(|e| FrameError::Decode(format!("keyspace {ks}: {e}")))?;
+        payload = &payload[end..];
+    }
+    Ok(())
 }
 
 pub struct Store {
@@ -341,9 +625,54 @@ pub struct Store {
     /// Live snapshot count per epoch; the minimum bounds which layers
     /// could be folded together.
     active_snapshots: Mutex<BTreeMap<u64, usize>>,
+    keyspaces: HashMap<u64, KeyspaceDecl>,
+    /// Held for the store's life; released when the file is dropped.
+    _lock: Option<File>,
 }
 
 impl Store {
+    fn new(
+        replayed: Replayed,
+        wal: Option<Wal>,
+        dp: DurabilityPolicy,
+        keyspaces: HashMap<u64, KeyspaceDecl>,
+        lock: Option<File>,
+    ) -> Self {
+        let Replayed { epoch, trees, .. } = replayed;
+        let layers = if trees.is_empty() {
+            Vec::new()
+        } else {
+            vec![Arc::new(Layer { epoch, trees })]
+        };
+        Store {
+            current: ArcSwap::from_pointee(Version { epoch, layers }),
+            writer: Mutex::new(Writer {
+                wal,
+                dp,
+                last_write: None,
+                last_fsync: None,
+            }),
+            active_snapshots: Mutex::new(BTreeMap::new()),
+            keyspaces,
+            _lock: lock,
+        }
+    }
+
+    /// Panics unless `id` was declared on the builder with these types.
+    pub(crate) fn assert_declared<K: 'static, M: Merge>(&self, id: u64) {
+        match self.keyspaces.get(&id) {
+            Some(d) if (d.key, d.merge) == (type_name::<K>(), type_name::<M>()) => {}
+            Some(d) => panic!(
+                "keyspace {id} declared as ({}, {}) but opened as ({}, {})",
+                d.key,
+                d.merge,
+                type_name::<K>(),
+                type_name::<M>()
+            ),
+            None => panic!("keyspace {id} not declared; register it with StoreBuilder::keyspace"),
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> Snapshot<'_> {
         let mut map = self.active_snapshots.lock().unwrap();
         let version = self.current.load_full();
@@ -429,6 +758,24 @@ mod tests {
 
     const KS: KeyspaceId<u8, i64> = KeyspaceId::new(3);
 
+    fn mem() -> Store {
+        StoreBuilder::new(DurabilityPolicy::NONE)
+            .keyspace(KS)
+            .build()
+            .unwrap()
+    }
+
+    /// A fresh, empty directory unique to this test.
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fold3-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn open(dir: &Path, dp: DurabilityPolicy) -> Result<Store, OpenError> {
+        StoreBuilder::new(dp).dir(dir).keyspace(KS).build()
+    }
+
     fn put(store: &Store, kvs: &[(u8, Option<i64>)]) -> Option<u64> {
         let mut tx = store.begin();
         let mut ks = tx.keyspace(KS);
@@ -448,9 +795,13 @@ mod tests {
         store.snapshot().get(KS, &k).map(|v| *v)
     }
 
+    fn manifest_of(dir: &Path) -> Manifest {
+        Manifest::parse(&manifest::read(dir).unwrap().unwrap()).unwrap()
+    }
+
     #[test]
     fn commits_are_visible_in_order_and_tombstones_shadow() {
-        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let store = mem();
         assert_eq!(put(&store, &[(1, Some(10)), (2, Some(20))]), Some(1));
         assert_eq!(put(&store, &[(2, None), (3, Some(30))]), Some(2));
         assert_eq!(put(&store, &[(1, Some(11))]), Some(3));
@@ -463,7 +814,7 @@ mod tests {
 
     #[test]
     fn snapshots_are_isolated_from_later_commits() {
-        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let store = mem();
         put(&store, &[(1, Some(10))]);
         let before = store.snapshot();
         put(&store, &[(1, Some(11))]);
@@ -474,7 +825,7 @@ mod tests {
 
     #[test]
     fn empty_and_aborted_txs_spend_no_epoch() {
-        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let store = mem();
         // read-only: the keyspace is opened but nothing is written
         let mut tx = store.begin();
         assert_eq!(tx.keyspace(KS).get(&1), None);
@@ -490,39 +841,42 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "keyspace 9 not declared")]
+    fn undeclared_keyspaces_are_refused() {
+        let store = mem();
+        let mut tx = store.begin();
+        tx.keyspace(KeyspaceId::<u8, i64>::new(9));
+    }
+
+    #[test]
+    fn writing_policies_need_a_directory() {
+        let err = StoreBuilder::new(DurabilityPolicy::RELAXED).build();
+        assert!(matches!(err, Err(OpenError::Policy(_))));
+    }
+
+    #[test]
     fn wal_gets_one_checksummed_frame_per_tx() {
-        let path = std::env::temp_dir().join(format!("fold3-wal-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = tmpdir("frames");
         {
-            let store = StoreBuilder::new(DurabilityPolicy::STRICT)
-                .wal_path(&path)
-                .build()
-                .unwrap();
+            let store = open(&dir, DurabilityPolicy::STRICT).unwrap();
             put(&store, &[(1, Some(10)), (2, Some(20))]);
             put(&store, &[(2, None)]);
             // deleting a key that never existed writes nothing: no frame
             assert_eq!(put(&store, &[(9, None)]), None);
         }
-        let bytes = std::fs::read(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let bytes = fs::read(dir.join("000001.wal")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
 
         let mut rest = &bytes[..];
         let mut frames = Vec::new();
         while !rest.is_empty() {
-            let crc = u32::from_le_bytes(rest[..4].try_into().unwrap());
-            let epoch = u64::from_le_bytes(rest[4..12].try_into().unwrap());
-            let len = u64::from_le_bytes(rest[12..20].try_into().unwrap()) as usize;
-            assert_eq!(crc, crc32fast::hash(&rest[4..20 + len]));
-            let payload = &rest[20..20 + len];
+            let (epoch, payload, used) = parse_frame(rest).unwrap();
             // one keyspace section: id, length, then (u8 key, Option<i64>)*
-            assert_eq!(
-                u64::from_le_bytes(payload[..8].try_into().unwrap()),
-                KS.raw()
-            );
+            assert_eq!(u64::from_le_bytes(payload[..8].try_into().unwrap()), KS.raw());
             let body_len = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
-            assert_eq!(16 + body_len, len);
+            assert_eq!(16 + body_len, payload.len());
             frames.push((epoch, payload[16..].to_vec()));
-            rest = &rest[20 + len..];
+            rest = &rest[used..];
         }
         // epoch 1: key 1 -> Some(10), key 2 -> Some(20)
         let mut one = vec![1u8, 1];
@@ -531,5 +885,125 @@ mod tests {
         one.extend(20i64.to_be_bytes());
         // epoch 2: key 2 -> None
         assert_eq!(frames, [(1, one), (2, vec![2u8, 0])]);
+    }
+
+    #[test]
+    fn reopen_replays_the_wal_and_continues_epochs() {
+        let dir = tmpdir("reopen");
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            put(&store, &[(1, Some(10)), (2, Some(20))]);
+            put(&store, &[(2, None), (3, Some(30))]);
+            put(&store, &[(1, Some(11))]);
+        }
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            assert_eq!(store.snapshot().epoch(), 3);
+            assert_eq!(read(&store, 1), Some(11));
+            assert_eq!(read(&store, 2), None);
+            assert_eq!(read(&store, 3), Some(30));
+            // a clean tail is reused, not replaced
+            assert_eq!(put(&store, &[(4, Some(40))]), Some(4));
+        }
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(read(&store, 4), Some(40));
+        let m = manifest_of(&dir);
+        assert_eq!(m.segments, [Segment { number: 1, sealed: None }]);
+        assert_eq!(m.keyspaces[&3], ("u8".to_string(), "i64".to_string()));
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn torn_tail_is_sealed_and_later_commits_survive() {
+        let dir = tmpdir("torn");
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            put(&store, &[(1, Some(10))]);
+            put(&store, &[(2, Some(20))]);
+        }
+        // a crash mid-append: chop the last frame in half
+        let wal = dir.join("000001.wal");
+        let full = fs::read(&wal).unwrap();
+        let (_, _, first) = parse_frame(&full).unwrap();
+        let torn = first + (full.len() - first) / 2;
+        fs::write(&wal, &full[..torn]).unwrap();
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            assert_eq!(read(&store, 1), Some(10));
+            assert_eq!(read(&store, 2), None, "torn frame is not replayed");
+            assert_eq!(put(&store, &[(3, Some(30))]), Some(2));
+        }
+        let m = manifest_of(&dir);
+        assert_eq!(
+            m.segments,
+            [
+                Segment { number: 1, sealed: Some(first as u64) },
+                Segment { number: 2, sealed: None },
+            ]
+        );
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            assert_eq!(read(&store, 1), Some(10));
+            assert_eq!(read(&store, 3), Some(30), "frames after the torn tail replay");
+        }
+        // the torn bytes are still on disk and still ignored
+        assert_eq!(fs::read(&wal).unwrap().len(), torn);
+
+        // damage inside a sealed segment is corruption, not a torn tail
+        let mut bytes = fs::read(&wal).unwrap();
+        bytes[first - 1] ^= 0xff;
+        fs::write(&wal, &bytes).unwrap();
+        let err = open(&dir, DurabilityPolicy::RELAXED).err().unwrap();
+        assert!(matches!(err, OpenError::Corrupt { offset: 0, .. }), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keyspaces_must_be_registered_with_their_written_types() {
+        let dir = tmpdir("types");
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            put(&store, &[(1, Some(10))]);
+        }
+        let other = StoreBuilder::new(DurabilityPolicy::RELAXED)
+            .dir(&dir)
+            .keyspace(KeyspaceId::<u8, (i64, i64)>::new(3))
+            .build();
+        assert!(matches!(other, Err(OpenError::KeyspaceType { id: 3, .. })));
+
+        let missing = StoreBuilder::new(DurabilityPolicy::RELAXED).dir(&dir).build();
+        assert!(matches!(missing, Err(OpenError::UnknownKeyspace(3))));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_directory_opens_once_at_a_time() {
+        let dir = tmpdir("lock");
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert!(matches!(open(&dir, DurabilityPolicy::RELAXED), Err(OpenError::Locked)));
+        drop(store);
+        assert!(open(&dir, DurabilityPolicy::RELAXED).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn non_writing_policy_still_replays_but_logs_nothing() {
+        let dir = tmpdir("none");
+        {
+            let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+            put(&store, &[(1, Some(10))]);
+        }
+        {
+            let store = open(&dir, DurabilityPolicy::NONE).unwrap();
+            assert_eq!(read(&store, 1), Some(10));
+            assert_eq!(put(&store, &[(1, Some(11))]), Some(2));
+        }
+        assert_eq!(manifest_of(&dir).policy, DurabilityPolicy::NONE);
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(read(&store, 1), Some(10), "unlogged commit is gone");
+        assert_eq!(put(&store, &[(1, Some(12))]), Some(2));
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
