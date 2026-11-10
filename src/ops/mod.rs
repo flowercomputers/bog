@@ -10,6 +10,7 @@
 //!   aggregate, and any other). Totals and counts are [`Sum`](crate::Sum).
 //! - [`foreign_key`]: references to keys the other side lacks, and
 //!   [`Reject`] to refuse a tx that has any.
+//! - [`DistinctRows`]: each keyed row once, its counts read by key.
 //! - [`Materialize`]: a register's rows, kept as a register.
 //! - [`Minus`] and [`Flatten`], small adapters.
 //!
@@ -30,6 +31,7 @@ use crate::{
     tx::{KeyspaceId, WriteTx},
 };
 
+pub mod distinct;
 pub mod foreign_key;
 pub mod join;
 pub mod linear;
@@ -37,6 +39,7 @@ pub mod materialize;
 pub mod reduce;
 pub mod semijoin;
 
+pub use distinct::{DistinctCounts, DistinctRows, Distinctly};
 pub use foreign_key::ForeignKey;
 pub use join::Join;
 pub use materialize::Materialize;

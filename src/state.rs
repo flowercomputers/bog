@@ -635,6 +635,21 @@ impl Declare {
         }
     }
 
+    /// A derived keyspace whose runs carry an `I`; see
+    /// [`RunIndex`](crate::index::RunIndex).
+    pub fn derived_indexed<K, M, I>(id: KeyspaceId<K, M>) -> Self
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Sync,
+        I: crate::index::RunIndex<K, M::Value>,
+    {
+        Declare {
+            id: id.raw(),
+            apply: Box::new(move |b| b.derived(id).indexed::<K, M, I>(id)),
+        }
+    }
+
     /// A base table, written by the application.
     pub(crate) fn base<K, M>(id: KeyspaceId<K, M>) -> Self
     where

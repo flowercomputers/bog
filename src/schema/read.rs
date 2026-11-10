@@ -20,6 +20,7 @@ use crate::{
     cursor::Cursor,
     error::Result,
     merge::Merge,
+    ops::DistinctCounts,
     state::{Arrangement, Edge},
     tx::{KeyspaceId, WriteTx},
 };
@@ -264,7 +265,7 @@ impl<K: Data, V: Data, W: Data> KeyedReader<K, W> for FilterMappedReader<K, V, W
 impl<'a> At<'a> {
     /// Read committed state with `snap`, or the transaction's with `tx`,
     /// after running the graph over its writes.
-    fn with<R>(
+    pub(crate) fn with<R>(
         self,
         snap: impl FnOnce(&Snapshot<'_>) -> Result<R>,
         tx: impl FnOnce(&mut WriteTx<'_>) -> Result<R>,
@@ -280,7 +281,7 @@ impl<'a> At<'a> {
         }
     }
 
-    fn store_and_epoch(self) -> (&'a Store, u64) {
+    pub(crate) fn store_and_epoch(self) -> (&'a Store, u64) {
         match self {
             At::Snapshot(s) => (s.store(), s.epoch()),
             At::Before(cell) | At::During(cell) => {
@@ -455,27 +456,56 @@ impl<K: Data, V: Data> Seek<'_, K, V> {
     }
 }
 
-/// Reads an arrangement as groups.
+/// Reads an arrangement, or a [`DistinctRows`] node's counts, as groups.
 pub(crate) struct GroupReader<K, V> {
-    id: Arrangement<K, V>,
-    totals: Option<KeyspaceId<K, Tally>>,
+    source: GroupSource<K, V>,
+}
+
+enum GroupSource<K, V> {
+    Arranged {
+        id: Arrangement<K, V>,
+        totals: Option<KeyspaceId<K, Tally>>,
+    },
+    Distinct {
+        id: DistinctCounts<K, V>,
+    },
 }
 
 fn group_span<K: Clone, V>(key: &K) -> std::ops::RangeInclusive<(K, Edge<V>)> {
     (key.clone(), Edge::Lo)..=(key.clone(), Edge::Hi)
 }
 
-fn row<K: Clone, V: Clone>(k: Cow<'_, (K, Edge<V>)>, d: Cow<'_, Delta>) -> (K, V, Delta) {
+fn row<K: Clone, V: Clone>(k: Cow<'_, (K, Edge<V>)>, d: Delta) -> (K, V, Delta) {
     let (k, v) = k.into_owned();
     let Edge::Val(v) = v else {
         unreachable!("arrangements hold values")
     };
-    (k, v, *d)
+    (k, v, d)
+}
+
+/// A distinct count as a row's multiplicity: once if positive.
+fn present(count: Delta) -> Option<Delta> {
+    (count > 0).then_some(1)
 }
 
 impl<K: Data, V: Data> GroupReader<K, V> {
-    pub(crate) fn new(id: Arrangement<K, V>, totals: Option<KeyspaceId<K, Tally>>) -> Self {
-        GroupReader { id, totals }
+    pub(crate) fn arranged(id: Arrangement<K, V>, totals: Option<KeyspaceId<K, Tally>>) -> Self {
+        GroupReader {
+            source: GroupSource::Arranged { id, totals },
+        }
+    }
+
+    pub(crate) fn distinct(id: DistinctCounts<K, V>) -> Self {
+        GroupReader {
+            source: GroupSource::Distinct { id },
+        }
+    }
+
+    fn bounds(key: Option<&K>) -> (Bound<(K, Edge<V>)>, Bound<(K, Edge<V>)>) {
+        match key {
+            Some(k) => clone_bounds(group_span::<K, V>(k)),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        }
     }
 
     fn scan<'s>(
@@ -484,16 +514,28 @@ impl<K: Data, V: Data> GroupReader<K, V> {
         key: Option<&K>,
         rev: bool,
     ) -> Box<dyn Iterator<Item = Result<(K, V, Delta)>> + 's> {
-        let (lo, hi) = match key {
-            Some(k) => clone_bounds(group_span::<K, V>(k)),
-            None => (Bound::Unbounded, Bound::Unbounded),
-        };
-        let rows = if rev {
-            snap.range_rev(self.id, (lo, hi))
-        } else {
-            snap.range(self.id, (lo, hi))
-        };
-        Box::new(rows.map(|r| r.map(|(k, d)| row(k, d))))
+        let (lo, hi) = Self::bounds(key);
+        match self.source {
+            GroupSource::Arranged { id, .. } => {
+                let rows = if rev {
+                    snap.range_rev(id, (lo, hi))
+                } else {
+                    snap.range(id, (lo, hi))
+                };
+                Box::new(rows.map(|r| r.map(|(k, d)| row(k, *d))))
+            }
+            GroupSource::Distinct { id } => {
+                let rows = if rev {
+                    snap.range_rev(id, (lo, hi))
+                } else {
+                    snap.range(id, (lo, hi))
+                };
+                Box::new(rows.filter_map(|r| match r {
+                    Ok((k, c)) => present(*c).map(|d| Ok(row(k, d))),
+                    Err(e) => Some(Err(e)),
+                }))
+            }
+        }
     }
 
     fn scan_tx(
@@ -503,42 +545,74 @@ impl<K: Data, V: Data> GroupReader<K, V> {
         rev: bool,
         out: &mut Vec<(K, V, Delta)>,
     ) -> Result<()> {
-        let (lo, hi) = match key {
-            Some(k) => clone_bounds(group_span::<K, V>(k)),
-            None => (Bound::Unbounded, Bound::Unbounded),
-        };
-        let mut ks = tx.keyspace(self.id);
-        let rows = if rev {
-            ks.range_rev((lo, hi))
-        } else {
-            ks.range((lo, hi))
-        };
-        for r in rows {
-            let (k, d) = r?;
-            out.push(row(k, d));
+        let (lo, hi) = Self::bounds(key);
+        match self.source {
+            GroupSource::Arranged { id, .. } => {
+                let mut ks = tx.keyspace(id);
+                let rows = if rev {
+                    ks.range_rev((lo, hi))
+                } else {
+                    ks.range((lo, hi))
+                };
+                for r in rows {
+                    let (k, d) = r?;
+                    out.push(row(k, *d));
+                }
+            }
+            GroupSource::Distinct { id } => {
+                let mut ks = tx.keyspace(id);
+                let rows = if rev {
+                    ks.range_rev((lo, hi))
+                } else {
+                    ks.range((lo, hi))
+                };
+                for r in rows {
+                    let (k, c) = r?;
+                    if let Some(d) = present(*c) {
+                        out.push(row(k, d));
+                    }
+                }
+            }
         }
         Ok(())
     }
 
     fn contains(&self, snap: &Snapshot<'_>, key: &K) -> Result<bool> {
-        match self.totals {
-            Some(totals) => Ok(snap.get(totals, key)?.is_some_and(|t| *t > 0)),
-            None => Ok(self
-                .scan(snap, Some(key), false)
-                .next()
-                .transpose()?
-                .is_some()),
+        if let GroupSource::Arranged {
+            totals: Some(totals),
+            ..
+        } = self.source
+        {
+            return Ok(snap.get(totals, key)?.is_some_and(|t| *t > 0));
         }
+        Ok(self
+            .scan(snap, Some(key), false)
+            .next()
+            .transpose()?
+            .is_some())
     }
 
     fn contains_tx(&self, tx: &mut WriteTx<'_>, key: &K) -> Result<bool> {
-        match self.totals {
-            Some(totals) => Ok(tx.keyspace(totals).get(key)?.is_some_and(|t| *t > 0)),
-            None => {
-                let mut out = Vec::new();
-                self.scan_tx(tx, Some(key), false, &mut out)?;
-                Ok(!out.is_empty())
-            }
+        if let GroupSource::Arranged {
+            totals: Some(totals),
+            ..
+        } = self.source
+        {
+            return Ok(tx.keyspace(totals).get(key)?.is_some_and(|t| *t > 0));
+        }
+        let mut out = Vec::new();
+        self.scan_tx(tx, Some(key), false, &mut out)?;
+        Ok(!out.is_empty())
+    }
+
+    fn subscribe(&self, store: &Store, after: u64) -> Subscription<(K, V, Delta)> {
+        match self.source {
+            GroupSource::Arranged { id, .. } => Subscription::new(subscribe::Arranged {
+                sub: store.subscribe_from(id, after),
+            }),
+            GroupSource::Distinct { id } => Subscription::new(subscribe::Distinct {
+                sub: store.subscribe_from(id, after),
+            }),
         }
     }
 }
@@ -616,9 +690,7 @@ impl<'a, K: Data, V: Data> GroupRead<'a, K, V> {
     /// change in multiplicity. See [`Read::subscribe`].
     pub fn subscribe(&self) -> Subscription<(K, V, Delta)> {
         let (store, epoch) = self.at.store_and_epoch();
-        Subscription::new(subscribe::Arranged {
-            sub: store.subscribe_from(self.reader.id, epoch),
-        })
+        self.reader.subscribe(store, epoch)
     }
 }
 

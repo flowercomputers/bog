@@ -34,7 +34,7 @@ use crate::{
     graph::{NodeRef, OpDag},
     merge::Merge,
     ops::{
-        Arrange, Flatten, Join, ReduceMany, Semijoin,
+        Arrange, DistinctCounts, DistinctRows, Distinctly, Flatten, Join, ReduceMany, Semijoin,
         linear::{
             ExplodeVal, FilterKV, FlatMapVal, KeyBy, Keys, MapVal, MapWith, ReKey, ReKeyWith,
             Reindex, Unkey, Values,
@@ -326,6 +326,8 @@ pub(crate) enum OriginKind<K: Data, V: Data> {
         id: Arrangement<K, V>,
         totals: Option<KeyspaceId<K, Tally>>,
     },
+    /// The counts a [`DistinctRows`] node keeps.
+    Distinct { id: DistinctCounts<K, V> },
 }
 
 impl<K: Data, V: Data> Clone for KeyedOrigin<K, V> {
@@ -346,6 +348,7 @@ impl<K: Data, V: Data> Clone for KeyedOrigin<K, V> {
                     id: *id,
                     totals: *totals,
                 },
+                OriginKind::Distinct { id } => OriginKind::Distinct { id: *id },
             },
         }
     }
@@ -449,6 +452,14 @@ impl<K: Data, V: Data> KeyedOrigin<K, V> {
         KeyedOrigin {
             state: DynState::new(Arranged::new(id, totals)),
             kind: OriginKind::Arranged { id, totals },
+        }
+    }
+
+    pub(crate) fn distinct(state: Distinctly<K, V>) -> Self {
+        let id = state.id();
+        KeyedOrigin {
+            state: DynState::new(state),
+            kind: OriginKind::Distinct { id },
         }
     }
 }
@@ -1011,19 +1022,22 @@ where
         )
     }
 
-    /// Each `(key, value)` once, however many times it occurs.
+    /// Each `(key, value)` once, however many times it occurs. The rows
+    /// are kept by key, so a grouped view defined from them, or a join
+    /// or reduction over them, reads them in place.
     pub fn distinct(&self) -> Grouped<K, V> {
         let inputs = self.flow.inputs();
         let name = self.flow.name("distinct", None);
         let mut b = self.flow.build.borrow_mut();
-        let id: KeyspaceId<(K, V), Tally> = b.id(&name);
-        let node = b.graph.nary(&inputs, Distinct::new(id));
+        let id: DistinctCounts<K, V> = b.id(&name);
+        let node = b.graph.nary(&inputs, DistinctRows::new(id));
+        let origin = KeyedOrigin::distinct(b.graph.state(node));
         drop(b);
         Rows::rooted(
             Root::at(node.rows()),
             self.flow.build.clone(),
             name.into(),
-            None,
+            Some(origin),
         )
     }
 

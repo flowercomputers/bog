@@ -34,7 +34,8 @@
 //! stream kinds and their combinators ([`Stream`], [`Keyed`],
 //! [`Grouped`]), the source kinds ([`Table`], [`Events`], [`Set`],
 //! [`Cell`], [`Multiset`]), the view kinds ([`MapView`], [`GroupView`],
-//! [`OrderedView`], [`ValueView`]), and the database ([`Db`]).
+//! [`OrderedView`], [`ValueView`], [`SearchView`]), and the database
+//! ([`Db`]).
 //!
 //! # How it maps onto the graph
 //!
@@ -109,12 +110,14 @@ use crate::{
 mod constraints;
 mod dynstate;
 mod read;
+mod search;
 mod source;
 mod stream;
 mod subscribe;
 mod view;
 
 pub use read::*;
+pub use search::*;
 pub use source::*;
 pub use stream::*;
 pub use subscribe::*;

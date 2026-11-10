@@ -5,7 +5,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    Change as RawChange, Delta, Tally,
+    Change as RawChange, Delta, Mergeless, Tally,
     codec::{Codec, OrderedCodec},
     merge::Merge,
     state::Edge,
@@ -221,6 +221,54 @@ impl<K: Clone, V: Clone> Arranged<K, V> {
 }
 
 impl<K, V> Recv<(K, V, Delta)> for Arranged<K, V>
+where
+    K: OrderedCodec + Clone + Send + Sync + 'static,
+    V: OrderedCodec + Clone + Send + Sync + 'static,
+{
+    fn recv(&self) -> Option<Commit<(K, V, Delta)>> {
+        self.sub.recv().map(|d| self.commit(d))
+    }
+    fn try_recv(&self) -> Result<Option<Commit<(K, V, Delta)>>, Closed> {
+        Ok(self.sub.try_recv()?.map(|d| self.commit(d)))
+    }
+    fn recv_timeout(&self, timeout: Duration) -> Result<Option<Commit<(K, V, Delta)>>, Closed> {
+        Ok(self.sub.recv_timeout(timeout)?.map(|d| self.commit(d)))
+    }
+}
+
+/// A [`DistinctRows`](crate::ops::DistinctRows) node's commits: each
+/// row whose count crossed zero, once.
+pub(crate) struct Distinct<K, V> {
+    pub sub: raw::Subscription<(K, Edge<V>), Mergeless<Delta>>,
+}
+
+impl<K: Clone, V: Clone> Distinct<K, V> {
+    fn commit(&self, d: raw::Delta<(K, Edge<V>), Mergeless<Delta>>) -> Commit<(K, V, Delta)> {
+        let changes = d
+            .changes
+            .iter()
+            .filter_map(|((k, v), c)| {
+                let Edge::Val(v) = v else {
+                    unreachable!("counts are kept by value")
+                };
+                let was = c.old_value().is_some_and(|o| *o > 0);
+                let is = c.new_value().is_some_and(|n| *n > 0);
+                let d = match (was, is) {
+                    (false, true) => 1,
+                    (true, false) => -1,
+                    _ => return None,
+                };
+                Some((k.clone(), v.clone(), d))
+            })
+            .collect();
+        Commit {
+            epoch: d.epoch,
+            changes,
+        }
+    }
+}
+
+impl<K, V> Recv<(K, V, Delta)> for Distinct<K, V>
 where
     K: OrderedCodec + Clone + Send + Sync + 'static,
     V: OrderedCodec + Clone + Send + Sync + 'static,

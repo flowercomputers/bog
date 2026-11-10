@@ -612,3 +612,62 @@ fn unique_keys_are_checked_at_the_write() {
         assert!(!r.adults.contains(&17).unwrap());
     });
 }
+
+#[derive(Schema)]
+struct Tagged {
+    tags: Multiset<(u64, String)>,
+    #[view]
+    by_item: GroupView<u64, String>,
+    #[view]
+    tag_count: MapView<u64, i64>,
+}
+
+impl Declare for Tagged {
+    fn declare(b: &mut TaggedBuilder) {
+        let distinct = b
+            .tags
+            .key_by(|&(item, _)| item)
+            .map(|(_, t)| t.clone())
+            .distinct();
+        b.by_item.define(&distinct);
+        b.tag_count.define(&b.by_item.count());
+    }
+}
+
+#[test]
+fn a_keyed_distinct_is_read_in_place_and_published_once() {
+    let db = Tagged::memory().build().unwrap();
+    let sub = db.read(|r| r.by_item.subscribe());
+    db.write(|tx| {
+        tx.tags.add((1, "jazz".into()), 2)?;
+        tx.tags.add((1, "blues".into()), 1)?;
+        tx.tags.add((2, "jazz".into()), 1)?;
+        Ok(())
+    })
+    .unwrap();
+    db.read(|r| {
+        assert_eq!(
+            r.by_item.get(&1).unwrap(),
+            vec![("blues".to_string(), 1), ("jazz".to_string(), 1)]
+        );
+        assert!(r.by_item.contains(&2).unwrap());
+        assert_eq!(r.tag_count.get(&1).unwrap(), Some(2));
+    });
+    let c = sub.try_recv().unwrap().unwrap();
+    assert_eq!(c.changes.len(), 3);
+    assert!(c.changes.iter().all(|(_, _, d)| *d == 1));
+
+    // a second copy changes nothing visible; taking both away does
+    db.write(|tx| tx.tags.add((1, "blues".into()), 1)).unwrap();
+    assert!(sub.try_recv().unwrap().unwrap().changes.is_empty());
+    db.write(|tx| tx.tags.remove((1, "jazz".into()), 2))
+        .unwrap();
+    assert_eq!(
+        sub.try_recv().unwrap().unwrap().changes,
+        vec![(1, "jazz".to_string(), -1)]
+    );
+    db.read(|r| {
+        assert_eq!(r.by_item.get(&1).unwrap(), vec![("blues".to_string(), 1)]);
+        assert_eq!(r.tag_count.get(&1).unwrap(), Some(1));
+    });
+}

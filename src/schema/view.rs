@@ -58,7 +58,7 @@ pub(crate) struct SlotCore<K: Data, V: Data> {
 }
 
 impl<K: Data, V: Data> SlotCore<K, V> {
-    fn new(name: Arc<str>, build: &Shared) -> Self {
+    pub(crate) fn new(name: Arc<str>, build: &Shared) -> Self {
         SlotCore {
             defined: build.borrow_mut().slot(name.clone()),
             name,
@@ -67,7 +67,7 @@ impl<K: Data, V: Data> SlotCore<K, V> {
         }
     }
 
-    fn defining(&self) {
+    pub(crate) fn defining(&self) {
         assert!(
             !self.defined.replace(true),
             "view `{}` is defined twice",
@@ -75,7 +75,7 @@ impl<K: Data, V: Data> SlotCore<K, V> {
         );
     }
 
-    fn undefined(&self) -> ! {
+    pub(crate) fn undefined(&self) -> ! {
         panic!(
             "view `{}` was used before it was defined; define it first",
             self.name
@@ -295,31 +295,40 @@ pub struct GroupSlot<K: Data, V: Data> {
 }
 
 impl<K: Data, V: Data> GroupSlot<K, V> {
-    /// Define the view as the rows of `from`.
+    /// Define the view as the rows of `from`. Rows an operator already
+    /// keeps by key (an arrangement, a keyed `distinct`) are read in
+    /// place; any others are arranged under the view's name.
     pub fn define(&self, from: &impl GroupedFeed<K, V>) {
         self.core.defining();
         let core = &self.core;
-        let input = from.attach();
+        let adopt = |origin: KeyedOrigin<K, V>, reader| {
+            let head = Rows::rooted(
+                Root::at(from.attach()),
+                core.build.clone(),
+                core.name.clone(),
+                Some(origin),
+            );
+            (head, reader)
+        };
         let (head, reader) = match from.origin() {
             Some(
                 origin @ KeyedOrigin {
                     kind: OriginKind::Arranged { id, totals },
                     ..
                 },
-            ) => (
-                Rows::rooted(
-                    Root::at(input),
-                    core.build.clone(),
-                    core.name.clone(),
-                    Some(origin.clone()),
-                ),
-                GroupReader::new(id, totals),
-            ),
+            ) => adopt(origin.clone(), GroupReader::arranged(id, totals)),
+            Some(
+                origin @ KeyedOrigin {
+                    kind: OriginKind::Distinct { id },
+                    ..
+                },
+            ) => adopt(origin.clone(), GroupReader::distinct(id)),
             _ => {
+                let inputs = from.inputs();
                 let mut b = core.build.borrow_mut();
                 let id = b.id(&core.name);
                 let totals = b.id(&format!("{}.totals", core.name));
-                let node = b.graph.nary(&[input], Arrange::new(id, totals));
+                let node = b.graph.nary(&inputs, Arrange::new(id, totals));
                 drop(b);
                 (
                     Rows::rooted(
@@ -328,7 +337,7 @@ impl<K: Data, V: Data> GroupSlot<K, V> {
                         core.name.clone(),
                         Some(KeyedOrigin::arranged(id, Some(totals))),
                     ),
-                    GroupReader::new(id, Some(totals)),
+                    GroupReader::arranged(id, Some(totals)),
                 )
             }
         };

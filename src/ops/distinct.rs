@@ -1,0 +1,193 @@
+//! [`DistinctRows`]: each `(key, value)` row once, with its counts kept
+//! by key, so what reads the rows by key reads the counts directly.
+
+use crate::{
+    Bag, Buffer, Change, Delta, Mergeless, Nary,
+    error::Result,
+    state::{Declare, Edge, State, When},
+    tx::{KeyspaceId, WriteTx},
+};
+
+use super::Key;
+
+/// Where [`DistinctRows`] keeps each row's count: `(k, Val(v)) -> count`,
+/// so a key's rows are the range `(k, Lo)..=(k, Hi)`. A count is a whole
+/// value, not a tally, so a subscriber sees it cross zero.
+pub type DistinctCounts<K, V> = KeyspaceId<(K, Edge<V>), Mergeless<Delta>>;
+
+/// Counts each `(key, value)` row's multiplicity in `counts` and emits
+/// the row when its presence changes, like [`Distinct`](crate::Distinct),
+/// but keyed: its [`Distinctly`] state is each key's present values,
+/// which joins, reductions and grouped views read in place.
+pub struct DistinctRows<K, V> {
+    counts: DistinctCounts<K, V>,
+    scratch: Bag<(K, V)>,
+}
+
+impl<K: Ord, V: Ord> DistinctRows<K, V> {
+    pub fn new(counts: DistinctCounts<K, V>) -> Self {
+        DistinctRows {
+            counts,
+            scratch: Bag::new(),
+        }
+    }
+}
+
+impl<K: Key, V: Key> DistinctRows<K, V> {
+    fn run(
+        &mut self,
+        tx: &mut WriteTx,
+        batches: &[&Bag<(K, V)>],
+        out: &mut Bag<(K, V)>,
+    ) -> Result<()> {
+        let single;
+        let rows: &Bag<(K, V)> = if let [only] = batches {
+            only
+        } else {
+            self.scratch.clear();
+            for b in batches {
+                for (t, d) in b.diffs() {
+                    self.scratch.push(t.clone(), d);
+                }
+            }
+            self.scratch.consolidate();
+            single = &self.scratch;
+            single
+        };
+        // each row's count as it was, read in order, then rewritten
+        let mut ks = tx.keyspace(self.counts);
+        let mut lookup = ks.lookup();
+        let mut olds = Vec::with_capacity(rows.len());
+        for ((k, v), _) in rows.diffs() {
+            olds.push(
+                lookup
+                    .get(&(k.clone(), Edge::Val(v.clone())))?
+                    .map_or(0, |c| *c),
+            );
+        }
+        drop(lookup);
+        for (((k, v), d), old) in rows.diffs().zip(olds) {
+            let new = old.checked_add(d).expect("multiplicity overflowed");
+            let key = (k.clone(), Edge::Val(v.clone()));
+            let change = match (old, new) {
+                (_, 0) => Change::Delete(old),
+                (0, _) => Change::Insert(new),
+                _ => Change::Replace(old, new),
+            };
+            ks.absorb(key, change)?;
+            match (old > 0, new > 0) {
+                (false, true) => out.push((k.clone(), v.clone()), 1),
+                (true, false) => out.push((k.clone(), v.clone()), -1),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<K: Key, V: Key> Nary for DistinctRows<K, V> {
+    type Takes = Bag<(K, V)>;
+    type Gives = Bag<(K, V)>;
+    type State = Distinctly<K, V>;
+
+    fn state(&self) -> Distinctly<K, V> {
+        Distinctly { id: self.counts }
+    }
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.counts)]
+    }
+
+    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+        fp.write_u64(self.counts.raw());
+    }
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<(K, V)>], out: &mut Bag<(K, V)>) {
+        if self.run(tx, batches, out).is_err() {
+            out.clear();
+        }
+    }
+}
+
+/// The state of a [`DistinctRows`] node: each key's values whose count
+/// is positive, each once.
+pub struct Distinctly<K, V> {
+    id: DistinctCounts<K, V>,
+}
+
+impl<K, V> Clone for Distinctly<K, V> {
+    fn clone(&self) -> Self {
+        Distinctly { id: self.id }
+    }
+}
+
+impl<K, V> Distinctly<K, V> {
+    pub fn id(&self) -> DistinctCounts<K, V> {
+        self.id
+    }
+}
+
+impl<K: Key, V: Key> Distinctly<K, V> {
+    fn scan(
+        &self,
+        tx: &mut WriteTx,
+        key: &K,
+        when: When,
+        rev: bool,
+        f: &mut dyn FnMut(&V, Delta) -> bool,
+    ) -> Result<()> {
+        let mut ks = tx.keyspace(self.id);
+        let span = (key.clone(), Edge::Lo)..=(key.clone(), Edge::Hi);
+        let rows = match (when, rev) {
+            (When::New, false) => ks.range(span),
+            (When::New, true) => ks.range_rev(span),
+            (When::Old, false) => ks.range_old(span),
+            (When::Old, true) => ks.range_old_rev(span),
+        };
+        for row in rows {
+            let (k, count) = row?;
+            if *count <= 0 {
+                continue;
+            }
+            let Edge::Val(v) = &k.1 else {
+                unreachable!("counts are kept by value")
+            };
+            if !f(v, 1) {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<K: Key, V: Key> State for Distinctly<K, V> {
+    type Key = K;
+    type Value = V;
+    type Delta = Bag<(K, V)>;
+
+    fn rows(delta: &Bag<(K, V)>, f: &mut dyn FnMut(&K, &V, Delta)) {
+        for ((k, v), d) in delta.diffs() {
+            f(k, v, d);
+        }
+    }
+
+    fn group(
+        &self,
+        tx: &mut WriteTx,
+        key: &K,
+        when: When,
+        f: &mut dyn FnMut(&V, Delta) -> bool,
+    ) -> Result<()> {
+        self.scan(tx, key, when, false, f)
+    }
+
+    fn group_rev(
+        &self,
+        tx: &mut WriteTx,
+        key: &K,
+        when: When,
+        f: &mut dyn FnMut(&V, Delta) -> bool,
+    ) -> Result<()> {
+        self.scan(tx, key, when, true, f)
+    }
+}
