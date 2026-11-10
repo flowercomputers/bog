@@ -1,5 +1,5 @@
 use crate::{
-    Bag, Binary, Buffer, Change, Delta, Mergeless, Nary, Node, Register, Unary, WriteTx,
+    Bag, Binary, Buffer, Change, Mergeless, Nary, Node, Register, Tally, Unary, WriteTx,
     codec::{Codec, OrderedCodec},
     error::Result,
     merge::Merge,
@@ -160,10 +160,10 @@ where
 
 /// A stored multiset as a source: its counts' changes as a bag.
 struct Counts<T> {
-    id: KeyspaceId<T, Delta>,
+    id: KeyspaceId<T, Tally>,
     after: Option<T>,
     /// Scratch, reused across runs.
-    changes: Register<T, Delta>,
+    changes: Register<T, Tally>,
 }
 
 impl<T> TableFeed for Counts<T>
@@ -174,11 +174,9 @@ where
         let out: &mut Bag<T> = out.downcast_mut().expect("multiset delta type");
         tx.keyspace(self.id).run_changes(&mut self.changes);
         for (row, change) in self.changes.drain() {
-            let by = match change {
-                Change::Insert(n) => n,
-                Change::Delete(o) => -o,
-                Change::Replace(o, n) => n - o,
-                Change::Modify(_) => unreachable!("resolved before absorbing"),
+            // a tally's change is the amount added
+            let Change::Insert(by) = change else {
+                unreachable!("a tally holds amounts")
             };
             out.push(row, by);
         }
@@ -319,7 +317,7 @@ impl OpDag {
 
     /// A stored multiset: the application writes each row's count to
     /// keyspace `id`, and the node gives each run's changes in count.
-    pub fn multiset<T>(&mut self, id: KeyspaceId<T, Delta>) -> NodeRef<Bag<T>>
+    pub fn multiset<T>(&mut self, id: KeyspaceId<T, Tally>) -> NodeRef<Bag<T>>
     where
         T: OrderedCodec + Clone + Send + Sync + 'static,
     {

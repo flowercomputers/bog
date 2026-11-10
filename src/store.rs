@@ -1,7 +1,7 @@
 use std::{
     any::{Any, type_name},
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
     fs::{self, File, OpenOptions, TryLockError},
     io::Write,
     marker::PhantomData,
@@ -579,7 +579,7 @@ impl<'s> Snapshot<'s> {
         M::Value: Codec,
     {
         let ks = keyspace.raw();
-        let hit = self
+        let mut hits = self
             .version
             .layers
             .iter()
@@ -590,25 +590,35 @@ impl<'s> Snapshot<'s> {
                     .downcast_ref::<Resident<K, M::Value>>()
                     .expect("keyspace id reused with a different type")
             })
-            .find_map(|tree| tree.get(key));
-        if let Some(slot) = hit {
+            .filter_map(|tree| tree.get(key));
+        // an additive keyspace's value is the sum of every source's
+        let mut sum: Option<Cow<'_, M::Value>> = None;
+        if M::ADDITIVE {
+            for amount in hits.flatten() {
+                add_amount::<M>(&mut sum, Cow::Borrowed(amount));
+            }
+        } else if let Some(slot) = hits.next() {
             return Ok(slot.as_ref().map(Cow::Borrowed));
         }
         let mut tables = self.version.tables_for(ks).peekable();
-        if tables.peek().is_none() {
-            return Ok(None);
-        }
-
-        let mut probe = Vec::with_capacity(key.encode_ordered_size());
-        key.encode_ordered(&mut probe);
-        for table in tables {
-            if let Some((block, range)) = table.get(ks, &probe, &self.store.cache)? {
-                let value = decode_all::<Option<M::Value>>(&block[range])
-                    .map_err(|e| Error::corrupt(table.path(), 0, format!("keyspace {ks}: {e}")))?;
-                return Ok(value.map(Cow::Owned));
+        if tables.peek().is_some() {
+            let mut probe = Vec::with_capacity(key.encode_ordered_size());
+            key.encode_ordered(&mut probe);
+            for table in tables {
+                if let Some((block, range)) = table.get(ks, &probe, &self.store.cache)? {
+                    let value = decode_all::<Option<M::Value>>(&block[range]).map_err(|e| {
+                        Error::corrupt(table.path(), 0, format!("keyspace {ks}: {e}"))
+                    })?;
+                    if !M::ADDITIVE {
+                        return Ok(value.map(Cow::Owned));
+                    }
+                    if let Some(amount) = value {
+                        add_amount::<M>(&mut sum, Cow::Owned(amount));
+                    }
+                }
             }
         }
-        Ok(None)
+        Ok(sum.filter(|s| !M::consider_delete(s)))
     }
 
     /// A reader of `keyspace`'s values for keys asked in ascending order:
@@ -777,6 +787,14 @@ impl<'s> Snapshot<'s> {
     }
 }
 
+/// Add `amount` to `sum`, which starts as nothing.
+fn add_amount<'a, M: Merge>(sum: &mut Option<Cow<'a, M::Value>>, amount: Cow<'a, M::Value>) {
+    match sum {
+        Some(s) => M::add(s.to_mut(), &amount),
+        None => *sum = Some(amount),
+    }
+}
+
 /// Point reads of one keyspace in ascending key order; see
 /// [`Snapshot::lookup`].
 pub(crate) struct Lookup<'a, K, V> {
@@ -838,17 +856,43 @@ struct KeyspaceDecl {
     fold: fn(&[&LayerTree], bool) -> LayerTree,
     /// Fold a newer tree into an older one in place; see [`fold_into`].
     fold_into: fn(&mut LayerTree, LayerTree, bool) -> Result<(), LayerTree>,
+    /// For an additive keyspace: add an encoded amount to another,
+    /// replacing it; false when they sum to nothing.
+    add_encoded: Option<fn(&mut Vec<u8>, &[u8]) -> Result<bool, DecodeError>>,
     /// Run indexes, in slot order.
     indexes: Vec<IndexKind>,
+}
+
+fn add_encoded<M: Merge>(sum: &mut Vec<u8>, amount: &[u8]) -> Result<bool, DecodeError>
+where
+    M::Value: Codec,
+{
+    let total = match (
+        decode_all::<Option<M::Value>>(sum)?,
+        decode_all::<Option<M::Value>>(amount)?,
+    ) {
+        (Some(mut a), Some(b)) => {
+            M::add(&mut a, &b);
+            Some(a)
+        }
+        (a, b) => a.or(b),
+    };
+    sum.clear();
+    total.encode(sum);
+    Ok(total.as_ref().is_some_and(|t| !M::consider_delete(t)))
 }
 
 /// One tree holding `trees`, oldest first, each overwriting the ones
 /// before it. With `drop_tombstones`, nothing lies beneath, so deletes are
 /// applied rather than kept.
-fn fold_trees<K, V>(trees: &[&LayerTree], drop_tombstones: bool) -> LayerTree
+///
+/// In an additive keyspace the trees add up instead, and a key whose
+/// amounts sum to nothing is dropped wherever it is.
+fn fold_trees<K, M>(trees: &[&LayerTree], drop_tombstones: bool) -> LayerTree
 where
     K: Ord + Clone + ResidentSize + Send + Sync + 'static,
-    V: Clone + ResidentSize + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Clone + ResidentSize + Send + Sync + 'static,
 {
     fn cast<K: 'static, V: 'static>(t: &LayerTree) -> &Resident<K, V> {
         t.tree
@@ -859,12 +903,12 @@ where
     // into a sorted run the map is then built from in one pass
     let mut its: Vec<_> = trees
         .iter()
-        .map(|t| cast::<K, V>(t).iter().peekable())
+        .map(|t| cast::<K, M::Value>(t).iter().peekable())
         .collect();
-    let mut merged: Vec<(K, Option<V>)> = Vec::with_capacity(
+    let mut merged: Vec<(K, Option<M::Value>)> = Vec::with_capacity(
         trees
             .iter()
-            .map(|t| cast::<K, V>(t).len())
+            .map(|t| cast::<K, M::Value>(t).len())
             .max()
             .unwrap_or(0),
     );
@@ -881,6 +925,20 @@ where
         }
         let Some((w, _)) = win else { break };
         let (k, v) = its[w].next().expect("the winner has a head");
+        if M::ADDITIVE {
+            let mut sum = v.clone().expect("an additive keyspace holds amounts");
+            for it in its.iter_mut() {
+                if let Some((_, amount)) = it.next_if(|(other, _)| *other == k) {
+                    M::add(&mut sum, amount.as_ref().expect("an amount"));
+                }
+            }
+            if !M::consider_delete(&sum) {
+                let sum = Some(sum);
+                bytes += resident_entry_bytes(k, &sum);
+                merged.push((k.clone(), sum));
+            }
+            continue;
+        }
         for it in its.iter_mut() {
             it.next_if(|(other, _)| *other == k);
         }
@@ -891,7 +949,7 @@ where
         merged.push((k.clone(), v.clone()));
     }
     LayerTree {
-        tree: Arc::new(merged.into_iter().collect::<Resident<K, V>>()),
+        tree: Arc::new(merged.into_iter().collect::<Resident<K, M::Value>>()),
         bytes,
         // the caller registers and builds them
         indexes: Arc::default(),
@@ -902,28 +960,49 @@ where
 /// keeping tombstones with `drop_tombstones`. Fails, handing `newer` back,
 /// if `base`'s tree is shared, so it cannot change. The caller resets
 /// `base`'s run indexes.
-fn fold_into<K, V>(
+fn fold_into<K, M>(
     base: &mut LayerTree,
     newer: LayerTree,
     drop_tombstones: bool,
 ) -> Result<(), LayerTree>
 where
     K: Ord + Clone + ResidentSize + Send + Sync + 'static,
-    V: Clone + ResidentSize + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Clone + ResidentSize + Send + Sync + 'static,
 {
     let Some(tree) = Arc::get_mut(&mut base.tree) else {
         return Err(newer);
     };
     let tree = tree
-        .downcast_mut::<Resident<K, V>>()
+        .downcast_mut::<Resident<K, M::Value>>()
         .expect("layer tree has the registered type");
     let newer = newer
         .tree
-        .downcast::<Resident<K, V>>()
+        .downcast::<Resident<K, M::Value>>()
         .expect("layer tree has the registered type");
     // moved out when nothing else holds it, else copied
     let newer = Arc::try_unwrap(newer).unwrap_or_else(|shared| (*shared).clone());
     let mut bytes = base.bytes;
+    if M::ADDITIVE {
+        for (k, amount) in newer {
+            match tree.entry(k) {
+                btree_map::Entry::Vacant(e) => {
+                    bytes += resident_entry_bytes(e.key(), &amount);
+                    e.insert(amount);
+                }
+                btree_map::Entry::Occupied(mut e) => {
+                    let sum = e.get_mut().as_mut().expect("an amount");
+                    M::add(sum, amount.as_ref().expect("an amount"));
+                    if M::consider_delete(sum) {
+                        bytes -= resident_entry_bytes(e.key(), e.get());
+                        e.remove();
+                    }
+                }
+            }
+        }
+        base.bytes = bytes;
+        return Ok(());
+    }
     for (k, v) in newer {
         if drop_tombstones && v.is_none() {
             if let Some(old) = tree.remove(&k) {
@@ -958,43 +1037,64 @@ where
         .sum()
 }
 
-fn replay_section<K, V>(
+fn replay_section<K, M>(
     tree: &mut Option<Box<dyn Any + Send + Sync>>,
     mut body: &[u8],
 ) -> Result<(), DecodeError>
 where
     K: OrderedCodec + Send + Sync + 'static,
-    V: Codec + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Codec + Send + Sync + 'static,
 {
     let tree = tree
-        .get_or_insert_with(|| Box::new(Resident::<K, V>::new()))
-        .downcast_mut::<Resident<K, V>>()
+        .get_or_insert_with(|| Box::new(Resident::<K, M::Value>::new()))
+        .downcast_mut::<Resident<K, M::Value>>()
         .expect("replay tree has the registered type");
     while !body.is_empty() {
         let k = K::decode_ordered(&mut body)?;
-        let v = Option::<V>::decode(&mut body)?;
-        // keep tombstones: once disk runs exist they shadow older data
-        tree.insert(k, v);
+        let v = Option::<M::Value>::decode(&mut body)?;
+        match tree.entry(k) {
+            // amounts add up, and are dropped when they cancel
+            btree_map::Entry::Occupied(mut e) if M::ADDITIVE => {
+                if let (Some(sum), Some(amount)) = (e.get_mut(), &v) {
+                    M::add(sum, amount);
+                    if M::consider_delete(sum) {
+                        e.remove();
+                    }
+                }
+            }
+            // keep tombstones: once disk runs exist they shadow older data
+            btree_map::Entry::Occupied(mut e) => {
+                e.insert(v);
+            }
+            btree_map::Entry::Vacant(e) => {
+                e.insert(v);
+            }
+        }
     }
     Ok(())
 }
 
 /// Feed `rows` the newest value of every key in `trees`, newest tree first,
 /// as encoded `(key, Option<value>)` in key order.
-fn write_run<K, V>(
+///
+/// In an additive keyspace a key's amounts are added, and it is left out
+/// if they sum to nothing.
+fn write_run<K, M>(
     trees: &[&(dyn Any + Send + Sync)],
     rows: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
 ) -> Result<()>
 where
     K: OrderedCodec + Send + Sync + 'static,
-    V: Codec + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Codec + Send + Sync + 'static,
 {
     // a k-way merge of the sorted trees, streamed out: nothing is built
     // first, so a checkpoint of a large layer costs no memory
     let mut its: Vec<_> = trees
         .iter()
         .map(|t| {
-            t.downcast_ref::<Resident<K, V>>()
+            t.downcast_ref::<Resident<K, M::Value>>()
                 .expect("layer tree has the registered type")
                 .iter()
                 .peekable()
@@ -1014,14 +1114,29 @@ where
         }
         let Some((w, _)) = win else { break };
         let (k, v) = its[w].next().expect("the winner has a head");
-        for it in its.iter_mut() {
-            it.next_if(|(other, _)| *other == k);
-        }
         key.clear();
         value.clear();
+        if M::ADDITIVE {
+            let mut sum = v.clone();
+            for it in its.iter_mut() {
+                if let Some((_, amount)) = it.next_if(|(other, _)| *other == k)
+                    && let (Some(sum), Some(amount)) = (&mut sum, amount)
+                {
+                    M::add(sum, amount);
+                }
+            }
+            if sum.as_ref().is_none_or(M::consider_delete) {
+                continue;
+            }
+            sum.encode(&mut value);
+        } else {
+            for it in its.iter_mut() {
+                it.next_if(|(other, _)| *other == k);
+            }
+            // tombstones stay: older checkpoints below still hold the key
+            v.encode(&mut value);
+        }
         k.encode_ordered(&mut key);
-        // tombstones stay: older checkpoints below still hold the key
-        v.encode(&mut value);
         rows(&key, &value)?;
     }
     Ok(())
@@ -1145,11 +1260,12 @@ impl StoreBuilder {
             key: type_name::<K>(),
             merge: type_name::<M>(),
             derived,
-            replay: replay_section::<K, M::Value>,
-            write_run: write_run::<K, M::Value>,
+            replay: replay_section::<K, M>,
+            write_run: write_run::<K, M>,
             measure: measure_tree::<K, M::Value>,
-            fold: fold_trees::<K, M::Value>,
-            fold_into: fold_into::<K, M::Value>,
+            fold: fold_trees::<K, M>,
+            fold_into: fold_into::<K, M>,
+            add_encoded: M::ADDITIVE.then_some(add_encoded::<M>),
             indexes: Vec::new(),
         };
         if let Some(prev) = self.keyspaces.get(&id.raw()) {
@@ -2904,6 +3020,7 @@ impl Shared {
                 continue;
             }
             let mut indexing = RunIndexing::start(ks, &self.keyspaces[&ks].indexes);
+            let add = self.keyspaces[&ks].add_encoded;
             out.begin_keyspace(ks)?;
             for c in &mut cursors {
                 c.start()?;
@@ -2923,10 +3040,22 @@ impl Shared {
                 key.extend_from_slice(k);
                 value.clear();
                 value.extend_from_slice(v);
+                cursors[w].advance()?;
+                // older tables holding the key are shadowed or, in an
+                // additive keyspace, add to it
+                let mut live = true;
                 for c in &mut cursors {
-                    if c.current().is_some_and(|(k, _)| k == &key[..]) {
+                    if let Some((_, amount)) = c.current().filter(|(k, _)| *k == &key[..]) {
+                        if let Some(add) = add {
+                            live = add(&mut value, amount).map_err(|e| {
+                                Error::corrupt(c.path(), 0, format!("keyspace {ks}: {e}"))
+                            })?;
+                        }
                         c.advance()?;
                     }
+                }
+                if !live {
+                    continue;
                 }
                 if !(drop_tombstones && value == TOMBSTONE) {
                     indexing.push(&key, &value, &path)?;
@@ -3047,7 +3176,7 @@ fn cheapest_window(tables: &[Arc<Table>], width: usize) -> Range<usize> {
 #[allow(clippy::drop_non_drop)] // drops mark where a borrow's use ends
 mod tests {
     use super::*;
-    use crate::{Change, Register};
+    use crate::{Change, Register, Tally};
 
     const KS: KeyspaceId<u8, i64> = KeyspaceId::new(3);
 
@@ -4501,6 +4630,163 @@ mod tests {
         store.quiesce().unwrap();
         base_tree(&store);
         assert_eq!(live_rows(&store).len(), 61);
+    }
+
+    const TALLY: KeyspaceId<u8, Tally> = KeyspaceId::new(4);
+
+    /// A tally keyspace's amounts are summed wherever they meet: within a
+    /// tx, across its runs, across layers and folds, through a WAL
+    /// replay, into checkpoints, and across tables when they are merged;
+    /// a key whose amounts sum to zero is absent at every one.
+    #[test]
+    fn tallies_sum_at_every_level() {
+        let dir = tmpdir("tally");
+        let open = || {
+            StoreBuilder::new(DurabilityPolicy::RELAXED)
+                .dir(&dir)
+                .keyspace(KS)
+                .keyspace(TALLY)
+                .options_with(|o| {
+                    o.max_tables = 2;
+                    o.compaction_width = 2;
+                })
+                .build()
+                .unwrap()
+        };
+        let add = |store: &Store, rows: &[(u8, i64)]| {
+            let mut tx = store.begin().unwrap();
+            let mut ks = tx.keyspace(TALLY);
+            for &(k, d) in rows {
+                ks.add(k, d).unwrap();
+            }
+            store.finish(tx).unwrap();
+        };
+        let get = |store: &Store, k: u8| store.snapshot().get(TALLY, &k).unwrap().map(|v| *v);
+        let rows = |store: &Store| {
+            store
+                .snapshot()
+                .range(TALLY, ..)
+                .map(|r| r.map(|(k, v)| (*k, *v)))
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+        };
+        let table_rows = |path: &Path| {
+            let table = Table::open(path, 0).unwrap();
+            let mut c = table.cursor(TALLY.raw(), None);
+            c.start().unwrap();
+            let mut rows = Vec::new();
+            while let Some((k, v)) = c.current() {
+                rows.push((
+                    crate::codec::decode_all_ordered::<u8>(k).unwrap(),
+                    decode_all::<Option<i64>>(v).unwrap(),
+                ));
+                c.advance().unwrap();
+            }
+            rows
+        };
+
+        let store = open();
+        // within a tx: adds to a key sum, and a sum of zero is nothing
+        let mut tx = store.begin().unwrap();
+        {
+            let mut ks = tx.keyspace(TALLY);
+            ks.add(1, 2).unwrap();
+            ks.add(2, 1).unwrap();
+            ks.add(1, 3).unwrap();
+            ks.add(2, -1).unwrap();
+            ks.add(9, 0).unwrap();
+            assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&5));
+            assert_eq!(ks.get(&2).unwrap().as_deref(), None, "cancelled");
+            assert_eq!(ks.get(&9).unwrap().as_deref(), None, "nothing added");
+            let seen: Vec<(u8, i64)> = ks
+                .range(..)
+                .map(|r| r.map(|(k, v)| (*k, *v)).unwrap())
+                .collect();
+            assert_eq!(seen, [(1, 5)]);
+        }
+        store.finish(tx).unwrap();
+        assert_eq!(rows(&store), [(1, 5)]);
+
+        // across a tx's runs: the overlay adds to the snapshot, and a run
+        // sees what the runs before it added
+        let mut tx = store.begin().unwrap();
+        {
+            let mut ks = tx.keyspace(TALLY);
+            ks.add(1, -5).unwrap();
+            ks.add(3, 7).unwrap();
+            assert_eq!(
+                ks.get(&1).unwrap().as_deref(),
+                None,
+                "overlay cancels the snapshot"
+            );
+            assert_eq!(ks.get_old(&1).unwrap().as_deref(), Some(&5));
+            let mut lookup = ks.lookup();
+            assert_eq!(lookup.get(&1).unwrap().as_deref(), None);
+            assert_eq!(lookup.get(&3).unwrap().as_deref(), Some(&7));
+        }
+        tx.end_run();
+        {
+            let mut ks = tx.keyspace(TALLY);
+            assert_eq!(ks.get_old(&1).unwrap().as_deref(), None);
+            ks.add(1, 1).unwrap();
+            assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&1));
+            let old: Vec<(u8, i64)> = ks
+                .range_old(..)
+                .map(|r| r.map(|(k, v)| (*k, *v)).unwrap())
+                .collect();
+            assert_eq!(old, [(3, 7)]);
+        }
+        store.finish(tx).unwrap();
+        assert_eq!(rows(&store), [(1, 1), (3, 7)]);
+
+        // across tables: a checkpoint sums the layers it writes, and a read
+        // sums the tables
+        store.checkpoint().unwrap();
+        add(&store, &[(1, -1), (3, 1), (4, 4)]);
+        store.checkpoint().unwrap();
+        let second = store.current.load().tables[1].path().to_path_buf();
+        assert_eq!(
+            table_rows(&second),
+            [(1, Some(-1)), (3, Some(1)), (4, Some(4))],
+            "a table holds what was added since the one before"
+        );
+        assert_eq!(get(&store, 1), None, "tables cancel");
+        assert_eq!(get(&store, 3), Some(8));
+        assert_eq!(rows(&store), [(3, 8), (4, 4)]);
+
+        // across layers and their folds, copying while a snapshot pins the
+        // layers and in place once it is gone
+        let pin = store.snapshot();
+        add(&store, &[(4, -4), (5, 5)]);
+        add(&store, &[(5, 5), (6, 1)]);
+        add(&store, &[(3, -8)]);
+        assert_eq!(rows(&store), [(5, 10), (6, 1)]);
+        drop(pin);
+        store.quiesce().unwrap();
+        add(&store, &[(6, -1), (7, 2)]);
+        add(&store, &[(7, 3)]);
+        store.quiesce().unwrap();
+        assert_eq!(rows(&store), [(5, 10), (7, 5)]);
+
+        // through a WAL replay
+        drop(store);
+        let store = open();
+        assert_eq!(rows(&store), [(5, 10), (7, 5)]);
+        assert_eq!(
+            get(&store, 3),
+            None,
+            "the replayed layer cancels the tables"
+        );
+
+        // across merged tables: a key whose tables cancel is dropped
+        store.checkpoint().unwrap();
+        assert!(store.compact().unwrap());
+        assert_eq!(store.stats().tables, 1);
+        let only = store.current.load().tables[0].path().to_path_buf();
+        assert_eq!(table_rows(&only), [(5, Some(10)), (7, Some(5))]);
+        assert_eq!(rows(&store), [(5, 10), (7, 5)]);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

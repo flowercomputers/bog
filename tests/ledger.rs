@@ -5,8 +5,8 @@
 use std::{borrow::Cow, collections::BTreeMap, path::PathBuf};
 
 use fold3::{
-    Db, Delta, DurabilityPolicy, Error, FlatMap, FusedLinears, KeyspaceId, Mergeless, OpDag,
-    StoreBuilder, Sum,
+    Db, DurabilityPolicy, Error, FlatMap, FusedLinears, KeyspaceId, Mergeless, OpDag, StoreBuilder,
+    Sum, Tally,
     ops::{Arrange, Flatten, ForeignKey, Join, Reject},
     state::{Arrangement, Edge},
 };
@@ -18,9 +18,9 @@ const ACCOUNTS: KeyspaceId<Account, Mergeless<String>> = KeyspaceId::new(1);
 const TRANSFERS: KeyspaceId<u64, Mergeless<Transfer>> = KeyspaceId::new(2);
 const BALANCES: KeyspaceId<Account, (i64, i64)> = KeyspaceId::new(10);
 const BY_ACCOUNT: Arrangement<Account, u64> = KeyspaceId::new(11);
-const BY_ACCOUNT_TOTALS: KeyspaceId<Account, Delta> = KeyspaceId::new(12);
+const BY_ACCOUNT_TOTALS: KeyspaceId<Account, Tally> = KeyspaceId::new(12);
 const NAMED: Arrangement<String, i64> = KeyspaceId::new(13);
-const NAMED_TOTALS: KeyspaceId<String, Delta> = KeyspaceId::new(14);
+const NAMED_TOTALS: KeyspaceId<String, Tally> = KeyspaceId::new(14);
 
 #[derive(Debug)]
 struct NoSuchAccount(Account);

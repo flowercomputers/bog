@@ -186,8 +186,8 @@ fn drive<O: Ord + Clone + Debug + Send + 'static>(
 
 const AL: Arrangement<u8, u8> = KeyspaceId::new(10);
 const AR: Arrangement<u8, u8> = KeyspaceId::new(11);
-const TL: KeyspaceId<u8, Delta> = KeyspaceId::new(16);
-const TR: KeyspaceId<u8, Delta> = KeyspaceId::new(17);
+const TL: KeyspaceId<u8, Tally> = KeyspaceId::new(16);
+const TR: KeyspaceId<u8, Tally> = KeyspaceId::new(17);
 
 fn arrange(
     g: &mut OpDag,
@@ -413,7 +413,7 @@ fn linear_operators_fuse_and_reshape_rows() {
 const L: KeyspaceId<u8, Mergeless<u8>> = KeyspaceId::new(1);
 const R: KeyspaceId<u8, Mergeless<u8>> = KeyspaceId::new(2);
 const BY_VALUE: Arrangement<u8, u8> = KeyspaceId::new(20);
-const BY_VALUE_TOTALS: KeyspaceId<u8, Delta> = KeyspaceId::new(23);
+const BY_VALUE_TOTALS: KeyspaceId<u8, Tally> = KeyspaceId::new(23);
 const MAX_KEY: KeyspaceId<u8, Mergeless<u8>> = KeyspaceId::new(21);
 const TOP: Arrangement<u8, u8> = KeyspaceId::new(22);
 
@@ -759,7 +759,7 @@ fn unstored_sources_need_the_application_to_replay_them() {
 
 #[test]
 fn matching_reads_a_distincts_state() {
-    const SEEN: KeyspaceId<u8, Delta> = KeyspaceId::new(18);
+    const SEEN: KeyspaceId<u8, Tally> = KeyspaceId::new(18);
     drive(
         "distinct-state",
         |g, l, r| {

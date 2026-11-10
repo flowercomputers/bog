@@ -18,7 +18,7 @@ use crate::{
     Bag, Buffer, Delta, Mergeless, Register,
     codec::{Codec, OrderedCodec},
     error::Result,
-    merge::Merge,
+    merge::{Merge, Tally},
     store::StoreBuilder,
     tx::{KeyspaceId, WriteTx},
 };
@@ -282,16 +282,17 @@ pub enum Edge<V> {
 /// Rows `(K, V)` at their multiplicity, grouped by `K`, as an
 /// [`Arrange`](crate::ops::Arrange) node keeps them: stored as
 /// `(k, Val(v)) -> count`, so a key's group is the range
-/// `(k, Lo)..=(k, Hi)`, read in either direction. A count that reaches
-/// zero removes the row.
-pub type Arrangement<K, V> = KeyspaceId<(K, Edge<V>), Delta>;
+/// `(k, Lo)..=(k, Hi)`, read in either direction. The counts are a
+/// [`Tally`]: rows are added and removed without reading them, and a row
+/// whose count is zero is absent.
+pub type Arrangement<K, V> = KeyspaceId<(K, Edge<V>), Tally>;
 
 /// The state of a node that keeps an [`Arrangement`], and maybe each
 /// key's total multiplicity beside it, which makes
 /// [`total`](State::total) and [`exists`](State::exists) one lookup.
 pub struct Arranged<K, V> {
     id: Arrangement<K, V>,
-    totals: Option<KeyspaceId<K, Delta>>,
+    totals: Option<KeyspaceId<K, Tally>>,
 }
 
 impl<K, V> Clone for Arranged<K, V> {
@@ -304,7 +305,7 @@ impl<K, V> Clone for Arranged<K, V> {
 }
 
 impl<K, V> Arranged<K, V> {
-    pub(crate) fn new(id: Arrangement<K, V>, totals: Option<KeyspaceId<K, Delta>>) -> Self {
+    pub(crate) fn new(id: Arrangement<K, V>, totals: Option<KeyspaceId<K, Tally>>) -> Self {
         Arranged { id, totals }
     }
 }
@@ -446,7 +447,7 @@ where
 /// The state of a [`Distinct`](crate::Distinct) node: every row whose
 /// count is positive, once, under its own key, with value `()`.
 pub struct Counted<T> {
-    id: KeyspaceId<T, Delta>,
+    id: KeyspaceId<T, Tally>,
 }
 
 impl<T> Clone for Counted<T> {
@@ -456,7 +457,7 @@ impl<T> Clone for Counted<T> {
 }
 
 impl<T> Counted<T> {
-    pub(crate) fn new(id: KeyspaceId<T, Delta>) -> Self {
+    pub(crate) fn new(id: KeyspaceId<T, Tally>) -> Self {
         Counted { id }
     }
 }

@@ -34,6 +34,8 @@ pub struct Delta<K, M: Merge> {
     pub epoch: u64,
     /// Every key it changed, in key order, with the value before and
     /// after: an `Insert`, a `Delete` of the old value, or a `Replace`.
+    /// In a [`Tally`](crate::Tally) keyspace, an `Insert` of the amount
+    /// added, which may be negative.
     pub changes: Arc<Vec<(K, Change<M>)>>,
 }
 

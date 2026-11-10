@@ -28,6 +28,63 @@ pub trait Merge: 'static {
     fn noop(_diff: &Self::Diff) -> bool {
         false
     }
+
+    /// Whether a keyspace of this type is additive: what is written to a
+    /// key is an amount, and the key's value is the sum of every amount
+    /// written, absent when [`consider_delete`](Self::consider_delete)
+    /// says so. Writes to an additive keyspace are blind: nothing is read
+    /// to make them, there are no deletes, and writes to a key in
+    /// different transactions are summed when they are read or folded
+    /// together. See [`Tally`].
+    const ADDITIVE: bool = false;
+
+    /// For an additive type, add `amount` to `sum`. The order amounts are
+    /// added in must not matter.
+    fn add(_sum: &mut Self::Value, _amount: &Self::Value) {
+        unreachable!("only additive keyspaces sum their values")
+    }
+}
+
+/// A count kept additively: each write is an amount to add, made without
+/// reading the count, and a count of zero is absent. What
+/// [arrangements](crate::state::Arrangement) and
+/// [multisets](crate::source::Multiset) are kept as.
+pub enum Tally {}
+
+impl Merge for Tally {
+    type Diff = Delta;
+    type Value = Delta;
+    const ADDITIVE: bool = true;
+    fn base() -> Delta {
+        0
+    }
+    #[inline]
+    fn merge<'a>(val: &mut Delta, diffs: impl Iterator<Item = Cow<'a, Delta>>) {
+        for d in diffs {
+            Self::add(val, &d);
+        }
+    }
+    #[inline]
+    fn combine<'a>(old: &mut Delta, new: impl Iterator<Item = Cow<'a, Delta>>) {
+        for d in new {
+            Self::add(old, &d);
+        }
+    }
+    fn scale(d: &mut Delta, n: Delta) {
+        *d = d.checked_mul(n).expect("multiplicity overflowed");
+    }
+    #[inline]
+    fn consider_delete(val: &Delta) -> bool {
+        *val == 0
+    }
+    #[inline]
+    fn noop(diff: &Delta) -> bool {
+        *diff == 0
+    }
+    #[inline]
+    fn add(sum: &mut Delta, amount: &Delta) {
+        *sum = sum.checked_add(*amount).expect("multiplicity overflowed");
+    }
 }
 
 impl Merge for () {

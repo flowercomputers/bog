@@ -24,6 +24,9 @@
 //!   memory. [`Snapshot`]s read a consistent version in either direction.
 //! - Keys and values are encoded with [`codec`]'s traits; keys keep their
 //!   order on disk.
+//! - A keyspace's values are whole ([`Mergeless`]) or, as a [`Tally`],
+//!   amounts added without reading: counts, arrangements and multisets
+//!   are tallies, so maintaining them costs no lookups.
 
 #![allow(clippy::type_complexity)]
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -34,6 +37,7 @@ use crate::codec::{Codec, OrderedCodec};
 use crate::graph::Fingerprint;
 pub mod graph;
 pub mod merge;
+pub use crate::merge::Tally;
 use crate::merge::*;
 pub mod codec;
 pub mod cursor;
@@ -582,17 +586,15 @@ where
 /// presence changes: `+1` when its count becomes positive, `-1` when it
 /// stops being positive. Downstream sees each row at most once.
 pub struct Distinct<T> {
-    counts: KeyspaceId<T, Delta>,
+    counts: KeyspaceId<T, Tally>,
     scratch: Bag<T>,
-    resolved: Vec<(T, Change<Delta>)>,
 }
 
 impl<T: Ord> Distinct<T> {
-    pub fn new(counts: KeyspaceId<T, Delta>) -> Self {
+    pub fn new(counts: KeyspaceId<T, Tally>) -> Self {
         Distinct {
             counts,
             scratch: Bag::new(),
-            resolved: Vec::new(),
         }
     }
 }
@@ -618,11 +620,10 @@ where
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], out: &mut Bag<T>) {
-        let mut ks = tx.keyspace(self.counts);
         // a single input is sorted already; several merge through the scratch
-        let resolved = if let [only] = batches {
-            let changes = only.diffs().map(|(t, d)| (t.clone(), Change::Modify(d)));
-            ks.resolve_sorted(changes, &mut self.resolved)
+        let single;
+        let rows: &Bag<T> = if let [only] = batches {
+            only
         } else {
             self.scratch.clear();
             for b in batches {
@@ -630,32 +631,30 @@ where
                     self.scratch.push(t.clone(), d);
                 }
             }
-            let scratch = self.scratch.drain().map(|(t, d)| (t, Change::Modify(d)));
-            ks.resolve_sorted(scratch, &mut self.resolved)
+            self.scratch.consolidate();
+            single = &self.scratch;
+            single
         };
-        if resolved.is_err() {
-            self.resolved.clear();
-            return;
+        // each row's count as it was, read in order, then the change added
+        // blind: the count decides nothing but whether the row crossed zero
+        let mut ks = tx.keyspace(self.counts);
+        let mut lookup = ks.lookup();
+        let mut counts = Vec::with_capacity(rows.len());
+        for (t, _) in rows.diffs() {
+            match lookup.get(t) {
+                Ok(c) => counts.push(c.map_or(0, |c| *c)),
+                Err(_) => return,
+            }
         }
-        for (t, change) in self.resolved.drain(..) {
-            let (old, new) = match &change {
-                Change::Insert(n) => (0, *n),
-                Change::Delete(o) => (*o, 0),
-                Change::Replace(o, n) => (*o, *n),
-                Change::Modify(_) => unreachable!("resolved"),
-            };
-            // a count of zero means the row is gone
-            let change = match change {
-                Change::Insert(0) => continue,
-                Change::Replace(o, 0) => Change::Delete(o),
-                c => c,
-            };
-            if ks.absorb(t.clone(), change).is_err() {
+        drop(lookup);
+        for ((t, d), old) in rows.diffs().zip(counts) {
+            let new = old.checked_add(d).expect("multiplicity overflowed");
+            if ks.add(t.clone(), d).is_err() {
                 return;
             }
             match (old > 0, new > 0) {
-                (false, true) => out.push(t, 1),
-                (true, false) => out.push(t, -1),
+                (false, true) => out.push(t.clone(), 1),
+                (true, false) => out.push(t.clone(), -1),
                 _ => {}
             }
         }

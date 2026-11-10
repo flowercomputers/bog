@@ -17,7 +17,7 @@
 use std::ops::Bound;
 
 use crate::{
-    Bag, Change, Delta, Mergeless, Register,
+    Bag, Change, Delta, Mergeless, Register, Tally,
     codec::{Codec, OrderedCodec},
     db::DbTx,
     error::Result,
@@ -197,8 +197,8 @@ impl<V: Value> Cell<V> {
 /// Rows with signed multiplicities, stored as each row's count; a row
 /// whose count returns to zero is gone. Its graph source gives the
 /// changes in count, as a [`Bag`].
-pub struct Multiset<T>(KeyspaceId<T, Delta>);
-handle!([T] Multiset[T], T, Delta);
+pub struct Multiset<T>(KeyspaceId<T, Tally>);
+handle!([T] Multiset[T], T, Tally);
 
 impl<T: Key> Multiset<T> {
     /// Add it to `graph` as a source.
@@ -211,15 +211,11 @@ impl<T: Key> Multiset<T> {
         Ok(tx.table(self.0).get(row)?.map_or(0, |n| *n))
     }
 
-    /// Add `times` of `row`; negative to take away.
+    /// Add `times` of `row`; negative to take away. Reads nothing: the
+    /// count is the sum of what was added, and a row whose count is zero
+    /// is not there.
     pub fn add(&self, tx: &mut DbTx<'_, '_>, row: T, times: Delta) -> Result<()> {
-        let mut ks = tx.table(self.0);
-        match ks.resolve(&row, Change::Modify(times))? {
-            // a row whose count is zero is not there
-            None | Some(Change::Insert(0)) => Ok(()),
-            Some(Change::Replace(old, 0)) => ks.absorb(row, Change::Delete(old)),
-            Some(change) => ks.absorb(row, change),
-        }
+        tx.table(self.0).add(row, times)
     }
 
     /// Take away `times` of `row`.
@@ -229,7 +225,11 @@ impl<T: Key> Multiset<T> {
 
     /// Take away every `row`.
     pub fn clear(&self, tx: &mut DbTx<'_, '_>, row: &T) -> Result<()> {
-        tx.table(self.0).set(row.clone(), None)
+        let mut ks = tx.table(self.0);
+        match ks.get(row)?.map(|n| *n) {
+            Some(n) => ks.add(row.clone(), n.checked_neg().expect("negate overflowed")),
+            None => Ok(()),
+        }
     }
 }
 

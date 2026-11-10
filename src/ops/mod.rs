@@ -21,7 +21,7 @@
 use std::{error::Error as StdError, marker::PhantomData};
 
 use crate::{
-    Bag, Binary, Buffer, Change, Delta, Merge, Nary, Register, Unary,
+    Bag, Binary, Buffer, Delta, Merge, Nary, Register, Tally, Unary,
     codec::OrderedCodec,
     error::Result,
     state::{Arranged, Arrangement, Declare, Edge, State, When},
@@ -42,9 +42,6 @@ pub use semijoin::Semijoin;
 /// What a key type must be to key an arrangement or counts.
 pub trait Key: OrderedCodec + Clone + Send + Sync + 'static {}
 impl<T: OrderedCodec + Clone + Send + Sync + 'static> Key for T {}
-
-/// Scratch for resolving changes to an [`Arrangement`].
-pub(crate) type Resolved<K, V> = Vec<((K, Edge<V>), Change<Delta>)>;
 
 /// Read `key`'s rows from state `s` into `out`, ascending by value, as
 /// `take` says.
@@ -139,27 +136,15 @@ impl<K: Clone + PartialEq, V: Clone> Groups<K, V> {
     }
 }
 
-/// Add `changes`, sorted and consolidated, to the counts in `ks`,
-/// removing counts that reach zero.
-pub(crate) fn update_counts<T: Key>(
+/// Add `rows`, sorted, to the arrangement `id`, reading nothing.
+pub(crate) fn arrange<K: Key, V: Key>(
     tx: &mut WriteTx,
-    ks: KeyspaceId<T, Delta>,
-    changes: impl IntoIterator<Item = (T, Delta)>,
-    resolved: &mut Vec<(T, Change<Delta>)>,
+    id: Arrangement<K, V>,
+    rows: impl IntoIterator<Item = ((K, V), Delta)>,
 ) -> Result<()> {
-    resolved.clear();
-    let mut view = tx.keyspace(ks);
-    view.resolve_sorted(
-        changes.into_iter().map(|(t, d)| (t, Change::Modify(d))),
-        resolved,
-    )?;
-    for (t, change) in resolved.drain(..) {
-        let change = match change {
-            Change::Insert(0) => continue,
-            Change::Replace(o, 0) => Change::Delete(o),
-            c => c,
-        };
-        view.absorb(t, change)?;
+    let mut view = tx.keyspace(id);
+    for ((k, v), d) in rows {
+        view.add((k, Edge::Val(v)), d)?;
     }
     Ok(())
 }
@@ -189,25 +174,20 @@ pub(crate) fn multiply(a: Delta, b: Delta) -> Delta {
 
 /// Keeps rows `(K, V)` grouped by key, at their multiplicity, in
 /// `arrangement`, and each key's total multiplicity in `totals`, and
-/// passes the rows on. Its [`Arranged`] state is what joins, semijoins,
+/// passes the rows on. Nothing is read: both are tallies. Its [`Arranged`] state is what joins, semijoins,
 /// foreign keys and reductions over rows read, and several of them can
 /// share one. The totals make "is this key present" one lookup, and are
 /// a count per key.
 pub struct Arrange<K, V> {
     id: Arrangement<K, V>,
-    totals: KeyspaceId<K, Delta>,
-    /// Scratch, reused across runs.
-    resolved: Resolved<K, V>,
-    resolved_totals: Vec<(K, Change<Delta>)>,
+    totals: KeyspaceId<K, Tally>,
 }
 
 impl<K: Ord, V: Ord> Arrange<K, V> {
-    pub fn new(arrangement: Arrangement<K, V>, totals: KeyspaceId<K, Delta>) -> Self {
+    pub fn new(arrangement: Arrangement<K, V>, totals: KeyspaceId<K, Tally>) -> Self {
         Arrange {
             id: arrangement,
             totals,
-            resolved: Vec::new(),
-            resolved_totals: Vec::new(),
         }
     }
 }
@@ -235,16 +215,13 @@ impl<K: Key, V: Key + Ord> Nary for Arrange<K, V> {
         }
         // linear when there is one input, which arrives sorted
         out.consolidate();
-        let rows = out
-            .diffs()
-            .map(|((k, v), d)| ((k.clone(), Edge::Val(v.clone())), d));
-        let done = update_counts(tx, self.id, rows, &mut self.resolved).and_then(|()| {
-            update_counts(
-                tx,
-                self.totals,
-                key_totals(out.diffs()),
-                &mut self.resolved_totals,
-            )
+        let rows = out.diffs().map(|(row, d)| (row.clone(), d));
+        let done = arrange(tx, self.id, rows).and_then(|()| {
+            let mut totals = tx.keyspace(self.totals);
+            for (k, d) in key_totals(out.diffs()) {
+                totals.add(k, d)?;
+            }
+            Ok(())
         });
         if done.is_err() {
             // the tx failed; the graph stops here

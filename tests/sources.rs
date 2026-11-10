@@ -13,8 +13,8 @@ use std::{
 };
 
 use fold3::{
-    Change, Db, Delta, Distinct, DurabilityPolicy, FlatMap, FusedLinears, Id, KeyspaceId, OpDag,
-    StoreBuilder, Sum,
+    Change, Db, Distinct, DurabilityPolicy, FlatMap, FusedLinears, Id, KeyspaceId, OpDag,
+    StoreBuilder, Sum, Tally,
     ops::Flatten,
     source::{Cell, Events, Multiset, Retain, Set, Table},
 };
@@ -31,7 +31,7 @@ const READINGS: Events<Reading> = Events::new(5);
 /// The sum and count of the readings kept, by sensor.
 const TOTALS: KeyspaceId<u8, (i64, i64)> = KeyspaceId::new(10);
 /// Each tag present, once.
-const TAG_COUNTS: KeyspaceId<String, Delta> = KeyspaceId::new(11);
+const TAG_COUNTS: KeyspaceId<String, Tally> = KeyspaceId::new(11);
 
 fn graph(version: u64) -> OpDag {
     let mut g = OpDag::new();

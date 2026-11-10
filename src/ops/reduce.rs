@@ -9,11 +9,11 @@ use crate::{
     Bag, Change, Delta, Mergeless, Nary, Register,
     codec::Codec,
     error::Result,
-    state::{Arranged, Arrangement, Declare, Edge, State, Stored, When},
+    state::{Arranged, Arrangement, Declare, State, Stored, When},
     tx::{KeyspaceId, WriteTx},
 };
 
-use super::{Key, Resolved, dirty_keys_into, read_group, update_counts};
+use super::{Key, arrange, dirty_keys_into, read_group};
 
 /// How much of a dirty key's group a reduction reads before calling its
 /// logic.
@@ -164,7 +164,6 @@ pub struct ReduceMany<S: State, O, F> {
     vals: Vec<(S::Value, Delta)>,
     fresh: Vec<(O, Delta)>,
     old: Vec<(O, Delta)>,
-    resolved: Resolved<S::Key, O>,
 }
 
 impl<S: State, O: Ord, F> ReduceMany<S, O, F> {
@@ -178,7 +177,6 @@ impl<S: State, O: Ord, F> ReduceMany<S, O, F> {
             vals: Vec::new(),
             fresh: Vec::new(),
             old: Vec::new(),
-            resolved: Vec::new(),
         }
     }
 
@@ -227,10 +225,11 @@ where
             }
         }
         out.consolidate();
-        let rows = out
-            .diffs()
-            .map(|((k, o), d)| ((k.clone(), Edge::Val(o.clone())), d));
-        update_counts(tx, self.output, rows, &mut self.resolved)
+        arrange(
+            tx,
+            self.output,
+            out.diffs().map(|(row, d)| (row.clone(), d)),
+        )
     }
 }
 

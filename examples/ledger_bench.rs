@@ -10,8 +10,8 @@
 use std::time::Instant;
 
 use fold3::{
-    Change, Check, Db, Delta, Distinct, DurabilityPolicy, FlatMap, FusedLinears, IndexBy,
-    KeyspaceId, Map, Mergeless, OpDag, StoreBuilder, Sum,
+    Change, Check, Db, Distinct, DurabilityPolicy, FlatMap, FusedLinears, IndexBy, KeyspaceId, Map,
+    Mergeless, OpDag, StoreBuilder, Sum, Tally,
     ops::{Arrange, Flatten, ForeignKey, Reject},
     state::Arrangement,
 };
@@ -26,9 +26,9 @@ const MINTS: KeyspaceId<u64, Mergeless<Mint>> = KeyspaceId::new(3);
 const BALANCES: KeyspaceId<User, (i64, i128)> = KeyspaceId::new(10);
 const SUPPLY: KeyspaceId<(), (i64, i128)> = KeyspaceId::new(11);
 const REFS: Arrangement<User, u64> = KeyspaceId::new(12);
-const REF_TOTALS: KeyspaceId<User, Delta> = KeyspaceId::new(13);
+const REF_TOTALS: KeyspaceId<User, Tally> = KeyspaceId::new(13);
 const LEADERBOARD: KeyspaceId<(i128, User), ()> = KeyspaceId::new(14);
-const COUNTERPARTIES: KeyspaceId<(User, User), Delta> = KeyspaceId::new(15);
+const COUNTERPARTIES: KeyspaceId<(User, User), Tally> = KeyspaceId::new(15);
 
 /// Mint ids share the reference arrangement with transfer ids.
 const MINT_BIT: u64 = 1 << 63;

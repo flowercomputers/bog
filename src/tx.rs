@@ -14,7 +14,7 @@ use crate::{
     cursor::Cursor,
     error::{Error, Result},
     merge::Merge,
-    store::{ENTRY_OVERHEAD, Resident, Snapshot, WriterGuard, resident_entry_bytes},
+    store::{ENTRY_OVERHEAD, Lookup, Resident, Snapshot, WriterGuard, resident_entry_bytes},
 };
 
 /// A write tx outgrew its memory limit and was killed. Its writes were
@@ -176,6 +176,22 @@ pub(crate) struct OverlayRun<K, M: Merge> {
     sorted: usize,
 }
 
+/// `next` applied after `prev`, both changes to one key; `None` when they
+/// cancel out. In an additive keyspace a change is `Insert(amount)`, and
+/// two of them add up.
+fn compose<M: Merge>(prev: Change<M>, next: Change<M>) -> Option<Change<M>> {
+    if !M::ADDITIVE {
+        return prev.compose(next);
+    }
+    match (prev, next) {
+        (Change::Insert(mut sum), Change::Insert(amount)) => {
+            M::add(&mut sum, &amount);
+            (!M::consider_delete(&sum)).then_some(Change::Insert(sum))
+        }
+        _ => unreachable!("an additive keyspace holds amounts"),
+    }
+}
+
 impl<K: Ord, M: Merge> OverlayRun<K, M> {
     fn new(run: u64) -> Self {
         OverlayRun {
@@ -221,7 +237,7 @@ impl<K: Ord, M: Merge> OverlayRun<K, M> {
             let mut alive = Some(change);
             while let Some((_, next)) = tail.next_if(|(t, _)| *t == k) {
                 alive = match alive {
-                    Some(prev) => prev.compose(next),
+                    Some(prev) => compose(prev, next),
                     None => Some(next),
                 };
             }
@@ -229,7 +245,7 @@ impl<K: Ord, M: Merge> OverlayRun<K, M> {
                 // a sorted entry for the key is older than the tail's
                 if let Some((_, older)) = head.next_if(|(h, _)| *h == k) {
                     alive = match alive {
-                        Some(newer) => older.compose(newer),
+                        Some(newer) => compose(older, newer),
                         None => Some(older),
                     };
                 }
@@ -410,7 +426,7 @@ fn composed<Q: Ord, M: Merge, I: Iterator<Item = (Q, Change<M>)>>(
         for it in &mut its[w + 1..] {
             if let Some((_, c)) = it.next_if(|(k, _)| *k == key) {
                 change = match change {
-                    Some(prev) => prev.compose(c),
+                    Some(prev) => compose(prev, c),
                     None => Some(c),
                 };
             }
@@ -573,6 +589,10 @@ where
             !matches!(change, Change::Modify(_)),
             "resolve before absorbing"
         );
+        debug_assert!(
+            !M::ADDITIVE || matches!(change, Change::Insert(_)),
+            "an additive keyspace takes amounts: use add"
+        );
         self.state.check()?;
         let run = self.current();
         let in_order = run.sorted == run.entries.len();
@@ -588,7 +608,7 @@ where
                 let (k, prev) = run.entries.pop().expect("a last entry");
                 run.sorted -= 1;
                 delta -= entry_bytes::<K, M>(&k, &prev) as isize;
-                if let Some(c) = prev.compose(change) {
+                if let Some(c) = compose(prev, change) {
                     delta += entry_bytes::<K, M>(&k, &c) as isize;
                     run.entries.push((k, c));
                     run.sorted += 1;
@@ -619,12 +639,38 @@ where
         Ok(())
     }
 
+    /// Add `amount` to `key` in an [additive](Merge::ADDITIVE) keyspace.
+    /// Reads nothing.
+    pub fn add(&mut self, key: K, amount: M::Value) -> Result<()> {
+        assert!(M::ADDITIVE, "add needs an additive keyspace");
+        if M::consider_delete(&amount) {
+            return self.state.check();
+        }
+        self.absorb(key, Change::Insert(amount))
+    }
+
+    /// The sum of what `runs`, oldest first and settled, and the snapshot
+    /// hold for `key` in an additive keyspace.
+    fn sum(&self, runs: &[OverlayRun<K, M>], key: &K) -> Result<Option<M::Value>> {
+        let (id, snap) = (self.id, self.snap);
+        let mut sum = self.state.read(|| snap.get(id, key))?.map(Cow::into_owned);
+        for amount in runs.iter().filter_map(|r| r.get(key)) {
+            let amount = amount.new_value().expect("an amount");
+            match &mut sum {
+                Some(s) => M::add(s, amount),
+                None => sum = Some(amount.clone()),
+            }
+        }
+        Ok(sum.filter(|s| !M::consider_delete(s)))
+    }
+
     /// Set `key` to `value`, or delete it with `None`: reads the old
     /// value to record the change.
     pub fn set(&mut self, key: K, value: Option<M::Value>) -> Result<()>
     where
         M::Value: PartialEq,
     {
+        assert!(!M::ADDITIVE, "an additive keyspace takes amounts: use add");
         let old = self.get(&key)?.map(Cow::into_owned);
         let change = match (old, value) {
             (None, None) => return Ok(()),
@@ -641,6 +687,9 @@ where
     /// Overlay hits borrow; snapshot hits are owned.
     pub fn get(&mut self, key: &K) -> Result<Option<Cow<'_, M::Value>>> {
         self.settle();
+        if M::ADDITIVE {
+            return Ok(self.sum(&self.runs[..], key)?.map(Cow::Owned));
+        }
         let (id, snap, state) = (self.id, self.snap, self.state);
         match Self::find(self.runs, key) {
             Some(c) => Ok(c.new_value().map(Cow::Borrowed)),
@@ -654,7 +703,19 @@ where
     where
         M::Value: PartialEq,
     {
+        assert!(!M::ADDITIVE, "an additive keyspace takes amounts: use add");
         Ok(materialize(self.get(key)?.as_deref(), change))
+    }
+
+    /// A reader of values for keys asked in ascending order: the batch
+    /// form of [`get`](Self::get), one pass over the snapshot's tables.
+    pub fn lookup(&mut self) -> TxLookup<'_, K, M> {
+        self.settle();
+        TxLookup {
+            runs: &self.runs[..],
+            snap: self.snap.lookup(self.id),
+            state: self.state,
+        }
     }
 
     /// [`resolve`](Self::resolve) for a whole batch. `changes` is sorted, so
@@ -670,6 +731,7 @@ where
         K: Clone,
         M::Value: PartialEq,
     {
+        assert!(!M::ADDITIVE, "an additive keyspace takes amounts: use add");
         self.state.check()?;
         self.settle();
         let mut lookup = self.snap.lookup(self.id);
@@ -707,6 +769,9 @@ where
     /// The value of `key` as of the start of this graph run: what
     /// [`get`](Self::get) returned before anything this run wrote.
     pub fn get_old(&mut self, key: &K) -> Result<Option<Cow<'_, M::Value>>> {
+        if M::ADDITIVE {
+            return Ok(self.sum(self.older(), key)?.map(Cow::Owned));
+        }
         let (id, snap, state) = (self.id, self.snap, self.state);
         match Self::find(self.older(), key) {
             Some(c) => Ok(c.new_value().map(Cow::Borrowed)),
@@ -773,6 +838,44 @@ where
             rev,
             Some(self.state),
         )
+    }
+}
+
+/// Point reads of a tx's keyspace in ascending key order; see
+/// [`Keyspace::lookup`].
+pub struct TxLookup<'a, K, M: Merge> {
+    runs: &'a [OverlayRun<K, M>],
+    snap: Lookup<'a, K, M::Value>,
+    state: &'a TxState,
+}
+
+impl<'a, K, M> TxLookup<'a, K, M>
+where
+    K: OrderedCodec + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Codec + Sync,
+{
+    /// The value of `key`, which must not be less than the last key asked.
+    pub fn get(&mut self, key: &K) -> Result<Option<Cow<'a, M::Value>>> {
+        if !M::ADDITIVE {
+            return match Keyspace::<K, M>::find(self.runs, key) {
+                Some(c) => Ok(c.new_value().map(Cow::Borrowed)),
+                None => self.snap.get(key).inspect_err(|e| self.state.fail(e)),
+            };
+        }
+        let mut sum = self
+            .snap
+            .get(key)
+            .inspect_err(|e| self.state.fail(e))?
+            .map(Cow::into_owned);
+        for amount in self.runs.iter().filter_map(|r| r.get(key)) {
+            let amount = amount.new_value().expect("an amount");
+            match &mut sum {
+                Some(s) => M::add(s, amount),
+                None => sum = Some(amount.clone()),
+            }
+        }
+        Ok(sum.filter(|s| !M::consider_delete(s)).map(Cow::Owned))
     }
 }
 

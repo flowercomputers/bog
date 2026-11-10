@@ -456,16 +456,40 @@ where
             self.done = true;
             return Ok(None);
         }
-        // older sources holding the same key are shadowed
+        // older sources holding the same key are shadowed or, in an
+        // additive keyspace, add to it
+        let mut sum: Option<M::Value> = None;
         for i in w + 1..self.sources.len() {
             let same = self.sources[i].head_key().is_some()
                 && self.sources[i].head_key() == self.sources[w].head_key();
             if same {
+                if M::ADDITIVE
+                    && let Some(Some(amount)) = self.sources[i].peek_value()
+                {
+                    match &mut sum {
+                        Some(s) => M::add(s, &amount),
+                        None => sum = Some(amount.into_owned()),
+                    }
+                }
                 self.sources[i].advance()?;
             }
         }
-        let entry = self.sources[w].take_head();
+        let mut entry = self.sources[w].take_head();
         self.sources[w].advance()?;
+        if M::ADDITIVE
+            && let Some((_, value)) = &mut entry
+        {
+            if let Some(mut s) = sum {
+                if let Some(amount) = value.as_deref() {
+                    M::add(&mut s, amount);
+                }
+                *value = Some(Cow::Owned(s));
+            }
+            // a sum of nothing is absent
+            if value.as_deref().is_some_and(M::consider_delete) {
+                *value = None;
+            }
+        }
         Ok(entry)
     }
 
@@ -491,12 +515,18 @@ where
     /// the cursor's order.
     pub fn seek_get(&mut self, key: &K) -> Result<Option<Cow<'a, M::Value>>> {
         self.seek(key)?;
-        Ok(self
-            .sources
-            .iter()
-            .find(|s| s.head_key() == Some(key))
-            .and_then(|s| s.peek_value())
-            .flatten())
+        let mut at = self.sources.iter().filter(|s| s.head_key() == Some(key));
+        if !M::ADDITIVE {
+            return Ok(at.next().and_then(|s| s.peek_value()).flatten());
+        }
+        let mut sum: Option<M::Value> = None;
+        for amount in at.filter_map(|s| s.peek_value().flatten()) {
+            match &mut sum {
+                Some(s) => M::add(s, &amount),
+                None => sum = Some(amount.into_owned()),
+            }
+        }
+        Ok(sum.filter(|s| !M::consider_delete(s)).map(Cow::Owned))
     }
 }
 
