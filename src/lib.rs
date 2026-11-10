@@ -4,6 +4,11 @@
 //! (sums, joins, indexes, aggregates, constraint checks) up to date with
 //! every commit, and stores it beside the tables.
 //!
+//! The [`schema`] module is the front door: declare sources and views as
+//! the fields of one struct, define the views as dataflow over typed
+//! streams, and write and read through the struct's generated faces.
+//! Everything below it is the raw layer it is built on:
+//!
 //! - [`Db`] owns a [`Store`] and the [`OpDag`] computing its derived state.
 //!   [`Db::write`] runs a transaction, then the graph over what it wrote,
 //!   then commits. When the graph changes, opening rebuilds derived state
@@ -55,6 +60,7 @@ pub use tx::{Keyspace, KeyspaceId, WriteTx};
 pub mod index;
 mod manifest;
 pub mod ops;
+pub mod schema;
 pub mod source;
 pub mod state;
 pub mod subscribe;
@@ -791,6 +797,17 @@ where
 
 pub struct FusedLinears<In, X>(X, PhantomData<fn() -> In>);
 
+/// The stage that changes nothing: an empty chain.
+#[derive(Clone, Copy)]
+pub struct Ident;
+impl<In: Clone + 'static> Emit<In> for Ident {
+    type Emits = In;
+    #[inline]
+    fn emit<S: FnMut(Cow<In>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
+        sink(data, diff)
+    }
+}
+
 impl<In, X> FusedLinears<In, X> {
     /// One node running the chain of linear stages `x` over each row.
     pub fn new(x: X) -> Self {
@@ -826,6 +843,7 @@ pub trait Emit<In: Clone>: 'static + Send {
     fn emit<S: FnMut(Cow<Self::Emits>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S);
 }
 
+#[derive(Clone)]
 pub struct Then<A, B>(pub A, pub B);
 impl<In, Mid, Out, A, B> Emit<In> for Then<A, B>
 where
@@ -843,6 +861,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct Filter<F>(pub F);
 impl<In, F> Emit<In> for Filter<F>
 where
@@ -858,6 +877,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct Map<F>(pub F);
 impl<In, Out, F> Emit<In> for Map<F>
 where
@@ -872,6 +892,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct FilterMap<F>(pub F);
 impl<In, Out, F> Emit<In> for FilterMap<F>
 where
@@ -888,6 +909,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct FlatMap<F>(pub F);
 impl<In, Out, I, F> Emit<In> for FlatMap<F>
 where
@@ -905,6 +927,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct Explode<F>(pub F);
 impl<In, Out, I, F> Emit<In> for Explode<F>
 where
@@ -927,6 +950,7 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Negate;
 impl<In> Emit<In> for Negate
 where

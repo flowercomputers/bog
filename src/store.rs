@@ -1207,6 +1207,12 @@ impl StoreBuilder {
         self
     }
 
+    /// Replace the durability policy.
+    pub fn durability(mut self, policy: DurabilityPolicy) -> Self {
+        self.durability_policy = policy;
+        self
+    }
+
     /// Keep the store in `dir`, creating it if needed.
     pub fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.dir = Some(dir.into());
@@ -2067,6 +2073,46 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner);
         // taken under the lock: a commit not in it has yet to send
         let snapshot = self.snapshot();
+        let after = snapshot.epoch();
+        let sub = Self::subscribe_locked(&mut subscribers, keyspace, after);
+        (snapshot, sub)
+    }
+
+    /// Subscribe to `keyspace` from a snapshot already held, at epoch
+    /// `after`: every commit after it that has not yet been published.
+    /// A commit between the snapshot and this call is published only if
+    /// its publishing has not yet happened, so take the snapshot and
+    /// subscribe close together.
+    pub(crate) fn subscribe_from<K, M>(
+        &self,
+        keyspace: KeyspaceId<K, M>,
+        after: u64,
+    ) -> Subscription<K, M>
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Send + Sync,
+        M::Diff: Send + Sync,
+    {
+        self.assert_declared::<K, M>(keyspace.raw());
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Self::subscribe_locked(&mut subscribers, keyspace, after)
+    }
+
+    fn subscribe_locked<K, M>(
+        subscribers: &mut HashMap<u64, Box<dyn Publish>>,
+        keyspace: KeyspaceId<K, M>,
+        after: u64,
+    ) -> Subscription<K, M>
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Send + Sync,
+        M::Diff: Send + Sync,
+    {
         let (tx, rx) = std::sync::mpsc::channel();
         subscribers
             .entry(keyspace.raw())
@@ -2076,8 +2122,7 @@ impl Store {
             .expect("keyspace id reused with a different type")
             .0
             .push(tx);
-        let after = snapshot.epoch();
-        (snapshot, Subscription { rx, after })
+        Subscription { rx, after }
     }
 
     /// Call `hook` after every checkpoint, with the epoch it covers

@@ -13,7 +13,10 @@
 //! [`subscribe`](Db::subscribe) follows any keyspace's committed changes,
 //! base or derived.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use crate::{
     Buffer,
@@ -36,12 +39,16 @@ pub const REBUILD_CHUNK: usize = 4096;
 pub type ReplayGiven<'r> = dyn FnMut(&mut WriteTx<'_>, &mut OpDag) -> Result<bool> + 'r;
 
 /// A store and its graph. See the module docs.
+///
+/// Writes take `&self`: the graph is behind a mutex and the store has its
+/// own writer lock, so a `Db` is shared between threads as it is, and
+/// one writes while others read snapshots.
 pub struct Db {
     store: Store,
-    graph: OpDag,
+    graph: Mutex<OpDag>,
     /// What each event log keeps, applied at every commit.
-    retention: Vec<Box<dyn Retention>>,
-    commit_hooks: Vec<Box<dyn FnMut(&Snapshot<'_>) + Send>>,
+    retention: Mutex<Vec<Box<dyn Retention>>>,
+    commit_hooks: Mutex<Vec<Box<dyn FnMut(&Snapshot<'_>) + Send>>>,
 }
 
 impl Db {
@@ -97,37 +104,50 @@ impl Db {
         })?;
         Ok(Db {
             store,
-            graph,
-            retention: Vec::new(),
-            commit_hooks: Vec::new(),
+            graph: Mutex::new(graph),
+            retention: Mutex::new(Vec::new()),
+            commit_hooks: Mutex::new(Vec::new()),
         })
     }
 
     /// Run `f` in a write transaction, then the graph over what it wrote,
     /// then commit. If `f` fails, nothing commits and its error is
-    /// returned.
-    pub fn write<R>(&mut self, f: impl FnOnce(&mut DbTx<'_, '_>) -> Result<R>) -> Result<R> {
-        let Db {
-            store,
+    /// returned. Blocks while another write is in progress.
+    pub fn write<R>(&self, f: impl FnOnce(&mut DbTx<'_>) -> Result<R>) -> Result<R> {
+        let mut tx = self.begin()?;
+        match f(&mut tx) {
+            Ok(r) => self.commit(tx).map(|()| r),
+            Err(e) => {
+                self.abort(tx);
+                Err(e)
+            }
+        }
+    }
+
+    /// Open a write transaction: [`write`](Self::write) in parts, for a
+    /// caller that keeps the transaction somewhere a closure cannot.
+    /// Blocks while another write is in progress; finish with
+    /// [`commit`](Self::commit) or [`abort`](Self::abort).
+    pub fn begin(&self) -> Result<DbTx<'_>> {
+        let graph = self.graph.lock().unwrap_or_else(PoisonError::into_inner);
+        let retention = self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(DbTx {
+            tx: self.store.begin()?,
             graph,
             retention,
-            commit_hooks,
-        } = self;
-        let mut tx = DbTx {
-            tx: store.begin()?,
-            graph,
             minted: HashMap::new(),
-        };
-        let r = match f(&mut tx) {
-            Ok(r) => r,
-            Err(e) => {
-                tx.graph.abort();
-                return Err(e);
-            }
-        };
+        })
+    }
+
+    /// Run the graph over what `tx` wrote, then commit it.
+    pub fn commit(&self, tx: DbTx<'_>) -> Result<()> {
         let DbTx {
             mut tx,
-            graph,
+            mut graph,
+            mut retention,
             minted,
         } = tx;
         // evictions are part of the transaction that caused them
@@ -138,14 +158,14 @@ impl Db {
         }
         graph.run(&mut tx);
         let committed = match evicted.and_then(|()| tx.failure().map_or(Ok(()), Err)) {
-            Ok(()) => store.finish(tx),
+            Ok(()) => self.store.finish(tx),
             Err(e) => Err(e),
         };
         let epoch = match committed {
             Ok(epoch) => epoch,
             // committed, though something after it failed
             Err(e @ Error::AfterCommit { .. }) => {
-                run_hooks(store, commit_hooks);
+                self.run_hooks();
                 return Err(e);
             }
             Err(e) => {
@@ -157,15 +177,40 @@ impl Db {
             }
         };
         if epoch.is_some() {
-            run_hooks(store, commit_hooks);
+            self.run_hooks();
         }
-        Ok(r)
+        Ok(())
+    }
+
+    /// Drop `tx` without committing it.
+    pub fn abort(&self, mut tx: DbTx<'_>) {
+        tx.graph.abort();
+        for policy in tx.retention.iter_mut() {
+            policy.reset();
+        }
+    }
+
+    fn run_hooks(&self) {
+        let mut hooks = self
+            .commit_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if hooks.is_empty() {
+            return;
+        }
+        let snapshot = self.store.snapshot();
+        for hook in hooks.iter_mut() {
+            hook(&snapshot);
+        }
     }
 
     /// Call `hook` after every commit, on the committing thread, with a
     /// snapshot that includes it.
-    pub fn on_commit(&mut self, hook: impl FnMut(&Snapshot<'_>) + Send + 'static) {
-        self.commit_hooks.push(Box::new(hook));
+    pub fn on_commit(&self, hook: impl FnMut(&Snapshot<'_>) + Send + 'static) {
+        self.commit_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Box::new(hook));
     }
 
     /// Call `hook` after every checkpoint, with the epoch it covers
@@ -193,11 +238,15 @@ impl Db {
     /// [`Retain::Count`] counts the rows pushed through the
     /// [`Events`] handle; rows written to its keyspace any other way are
     /// not counted until the next open.
-    pub fn retain<V: Value>(&mut self, events: Events<V>, retain: Retain) {
+    pub fn retain<V: Value>(&self, events: Events<V>, retain: Retain) {
         let id = events.id();
-        self.retention.retain(|p| p.keyspace() != id.raw());
+        let mut retention = self
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        retention.retain(|p| p.keyspace() != id.raw());
         if retain != Retain::Forever {
-            self.retention.push(Box::new(EventsRetention {
+            retention.push(Box::new(EventsRetention {
                 id,
                 retain,
                 live: None,
@@ -216,32 +265,23 @@ impl Db {
     }
 }
 
-fn run_hooks(store: &Store, hooks: &mut [Box<dyn FnMut(&Snapshot<'_>) + Send>]) {
-    if hooks.is_empty() {
-        return;
-    }
-    let snapshot = store.snapshot();
-    for hook in hooks {
-        hook(&snapshot);
-    }
-}
-
 /// A write transaction on a [`Db`].
-pub struct DbTx<'d, 's> {
-    tx: WriteTx<'s>,
-    graph: &'d mut OpDag,
+pub struct DbTx<'t> {
+    tx: WriteTx<'t>,
+    graph: MutexGuard<'t, OpDag>,
+    retention: MutexGuard<'t, Vec<Box<dyn Retention>>>,
     /// Ids minted so far, by the keyspace they were minted for.
     minted: HashMap<u64, u32>,
 }
 
-impl<'s> DbTx<'_, 's> {
+impl<'t> DbTx<'t> {
     /// Base table `id`, to read and write. Writes reach the graph at the
     /// next run: at commit, or at [`run`](Self::run).
     ///
     /// # Panics
     ///
     /// If a graph operator writes `id`: derived state is the graph's.
-    pub fn table<K, M>(&mut self, id: KeyspaceId<K, M>) -> Keyspace<'_, 's, K, M>
+    pub fn table<K, M>(&mut self, id: KeyspaceId<K, M>) -> Keyspace<'_, 't, K, M>
     where
         K: OrderedCodec + Send + Sync + 'static,
         M: Merge,
@@ -257,7 +297,7 @@ impl<'s> DbTx<'_, 's> {
 
     /// Keyspace `id`, to read, typically derived state. Run the graph
     /// first to see this transaction's writes reflected in it.
-    pub fn read<K, M>(&mut self, id: KeyspaceId<K, M>) -> Keyspace<'_, 's, K, M>
+    pub fn read<K, M>(&mut self, id: KeyspaceId<K, M>) -> Keyspace<'_, 't, K, M>
     where
         K: OrderedCodec + Send + Sync + 'static,
         M: Merge,
@@ -278,6 +318,16 @@ impl<'s> DbTx<'_, 's> {
     /// The epoch this transaction commits as, if it writes anything.
     pub fn epoch(&self) -> u64 {
         self.tx.epoch()
+    }
+
+    /// The committed state this transaction started from.
+    pub fn snapshot(&self) -> &Snapshot<'t> {
+        self.tx.snapshot()
+    }
+
+    /// The transaction itself, for raw keyspace access.
+    pub fn raw(&mut self) -> &mut WriteTx<'t> {
+        &mut self.tx
     }
 
     /// Stage rows at an unstored source.

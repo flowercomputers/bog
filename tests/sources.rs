@@ -89,7 +89,7 @@ fn readings(db: &Db) -> Vec<Reading> {
 #[test]
 fn tables_sets_cells_and_multisets_write_through_a_tx() {
     let dir = dir("shapes");
-    let mut db = open(&dir, 0);
+    let db = open(&dir, 0);
     let (first, second) = db
         .write(|tx| {
             let a = NOTES.insert(tx, "one".into())?;
@@ -152,7 +152,7 @@ fn tables_sets_cells_and_multisets_write_through_a_tx() {
 #[test]
 fn an_event_log_keeps_what_its_policy_says() {
     let dir = dir("events");
-    let mut db = open(&dir, 0);
+    let db = open(&dir, 0);
     db.retain(READINGS, Retain::Count(3));
     for i in 0..5i64 {
         db.write(|tx| READINGS.push(tx, (1, i)).map(|_| ()))
@@ -185,7 +185,7 @@ fn an_event_log_keeps_what_its_policy_says() {
     drop(db);
 
     // the policy is not stored; the log is, and the count is recovered
-    let mut db = open(&dir, 0);
+    let db = open(&dir, 0);
     db.retain(READINGS, Retain::Count(2));
     db.write(|tx| READINGS.push(tx, (4, 1)).map(|_| ()))
         .unwrap();
@@ -210,7 +210,7 @@ fn an_event_log_keeps_what_its_policy_says() {
 #[test]
 fn a_subscription_follows_a_keyspace_from_its_snapshot() {
     let dir = dir("subscribe");
-    let mut db = open(&dir, 0);
+    let db = open(&dir, 0);
     db.write(|tx| READINGS.push(tx, (1, 5)).map(|_| ()))
         .unwrap();
 

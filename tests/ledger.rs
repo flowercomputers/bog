@@ -107,7 +107,7 @@ fn balances(db: &Db) -> BTreeMap<Account, i64> {
 #[test]
 fn a_ledger_keeps_balances_and_refuses_unknown_accounts() {
     let dir = dir();
-    let mut db = open(&dir, 0);
+    let db = open(&dir, 0);
     db.write(|tx| {
         let mut accounts = tx.table(ACCOUNTS);
         accounts.set(1, Some("alice".into()))?;

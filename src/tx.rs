@@ -322,6 +322,16 @@ impl<'tx> WriteTx<'tx> {
     pub fn reject(&self, err: impl std::error::Error + Send + Sync + 'static) {
         self.state.fail(&Error::Rejected(std::sync::Arc::new(err)));
     }
+
+    /// [`reject`](Self::reject) with an error already shared.
+    pub fn reject_with(&self, err: std::sync::Arc<dyn std::error::Error + Send + Sync>) {
+        self.state.fail(&Error::Rejected(err));
+    }
+
+    /// The committed state this transaction started from.
+    pub fn snapshot(&self) -> &Snapshot<'tx> {
+        &self.snapshot
+    }
     pub(crate) fn into_parts(
         self,
     ) -> (

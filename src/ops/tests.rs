@@ -132,7 +132,7 @@ fn drive<O: Ord + Clone + Debug + Send + 'static>(
         let (l, r) = (g.source(), g.source());
         let out = build(&mut g, l, r);
         g.nary(&[out], sink.clone());
-        let mut db = Db::open(builder(&dir), g).unwrap();
+        let db = Db::open(builder(&dir), g).unwrap();
 
         for step in 0..60 {
             let (mut nl, mut nr) = (left.clone(), right.clone());
@@ -566,7 +566,7 @@ fn operators_read_tables_views_and_shared_arrangements() {
         if rebuilds {
             sinks.reset();
         }
-        let mut db = Db::open_inner(builder(&dir), table_graph(version, &sinks), 2, None).unwrap();
+        let db = Db::open_inner(builder(&dir), table_graph(version, &sinks), 2, None).unwrap();
         sinks.commit();
         sinks.check(&l, &r, &format!("after opening session {session}"));
         for step in 0..50 {
@@ -613,7 +613,7 @@ fn operators_read_tables_views_and_shared_arrangements() {
 fn derived_keyspaces_are_the_graphs_to_write() {
     let dir = tmpdir("derived-writes");
     let sinks = Sinks::new();
-    let mut db = Db::open(builder(&dir), table_graph(0, &sinks)).unwrap();
+    let db = Db::open(builder(&dir), table_graph(0, &sinks)).unwrap();
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         db.write(|tx| {
             tx.table(MAX_KEY).set(1, Some(1))?;
@@ -659,9 +659,9 @@ fn foreign_keys_report_dangling_references_and_reject() {
     let sink = Sink::new();
     g.nary(&[dangling], sink.clone());
     g.nary(&[dangling], Reject::new(|k: &u8| Dangling(*k)));
-    let mut db = Db::open(StoreBuilder::new(DurabilityPolicy::NONE), g).unwrap();
+    let db = Db::open(StoreBuilder::new(DurabilityPolicy::NONE), g).unwrap();
 
-    let mut write = |c: &[(u8, Option<u8>)], p: &[(u8, bool)]| {
+    let write = |c: &[(u8, Option<u8>)], p: &[(u8, bool)]| {
         let res = db.write(|tx| {
             for &(child, parent) in c {
                 tx.table(CHILDREN).set(child, parent)?;
@@ -711,7 +711,7 @@ fn unstored_sources_need_the_application_to_replay_them() {
     let rows = [(1u8, 2u8), (1, 3), (4, 5)];
     {
         let (g, src) = graph(0);
-        let mut db = Db::open(builder(&dir), g).unwrap();
+        let db = Db::open(builder(&dir), g).unwrap();
         db.write(|tx| {
             let mut b = Bag::new();
             for r in rows {
@@ -782,8 +782,8 @@ fn a_key_is_present_while_its_rows_total_positive() {
     let m = g.binary_with(l, r, Semijoin::matching);
     let sink = Sink::new();
     g.nary(&[m], sink.clone());
-    let mut db = Db::open(builder(&dir), g).unwrap();
-    let mut step = |left: &[((u8, u8), Delta)], right: &[((u8, u8), Delta)]| {
+    let db = Db::open(builder(&dir), g).unwrap();
+    let step = |left: &[((u8, u8), Delta)], right: &[((u8, u8), Delta)]| {
         db.write(|tx| {
             let (mut bl, mut br) = (Bag::new(), Bag::new());
             for &(row, d) in left {

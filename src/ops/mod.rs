@@ -2,13 +2,15 @@
 //! ported from fold2 and reworked to read their parents' state:
 //!
 //! - [`linear`]: per-row operators over keyed rows, fused like the rest.
-//! - [`Arrange`]: rows grouped by key, as a state other operators read.
+//! - [`Arrange`]: rows grouped by key, as a state other operators read;
+//!   [`CountRows`]: just which rows are present.
 //! - [`join`]: the inner join, reactive on both sides.
 //! - [`semijoin`]: rows whose key the other side does (or does not) have.
 //! - [`reduce`]: per-key reductions in data position (min, max, top-k,
 //!   aggregate, and any other). Totals and counts are [`Sum`](crate::Sum).
 //! - [`foreign_key`]: references to keys the other side lacks, and
 //!   [`Reject`] to refuse a tx that has any.
+//! - [`Materialize`]: a register's rows, kept as a register.
 //! - [`Minus`] and [`Flatten`], small adapters.
 //!
 //! An operator that needs a parent's whole output reads the parent's
@@ -24,19 +26,22 @@ use crate::{
     Bag, Binary, Buffer, Delta, Merge, Nary, Register, Tally, Unary,
     codec::OrderedCodec,
     error::Result,
-    state::{Arranged, Arrangement, Declare, Edge, State, When},
+    state::{Arranged, Arrangement, Counted, Declare, Edge, State, When},
     tx::{KeyspaceId, WriteTx},
 };
 
 pub mod foreign_key;
 pub mod join;
 pub mod linear;
+pub mod materialize;
 pub mod reduce;
 pub mod semijoin;
 
 pub use foreign_key::ForeignKey;
 pub use join::Join;
+pub use materialize::Materialize;
 pub use reduce::{Aggregate, ReduceMany, Take};
+
 pub use semijoin::Semijoin;
 
 /// What a key type must be to key an arrangement or counts.
@@ -226,6 +231,51 @@ impl<K: Key, V: Key + Ord> Nary for Arrange<K, V> {
         if done.is_err() {
             // the tx failed; the graph stops here
             out.clear();
+        }
+    }
+}
+
+/// Keeps each row's count in `counts`, a tally, reading nothing, and
+/// passes the rows on. Its [`Counted`] state says which rows are
+/// present: what a foreign key reads of the keys its children
+/// reference, at the cost of one count per distinct key.
+pub struct CountRows<T> {
+    counts: KeyspaceId<T, Tally>,
+}
+
+impl<T> CountRows<T> {
+    pub fn new(counts: KeyspaceId<T, Tally>) -> Self {
+        CountRows { counts }
+    }
+}
+
+impl<T: Key> Nary for CountRows<T> {
+    type Takes = Bag<T>;
+    type Gives = Bag<T>;
+    type State = Counted<T>;
+
+    fn state(&self) -> Counted<T> {
+        Counted::new(self.counts)
+    }
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.counts)]
+    }
+
+    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+        fp.write_u64(self.counts.raw());
+    }
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], out: &mut Bag<T>) {
+        let mut counts = tx.keyspace(self.counts);
+        for b in batches {
+            for (t, d) in b.diffs() {
+                if counts.add(t.clone(), d).is_err() {
+                    out.clear();
+                    return;
+                }
+                out.push(t.clone(), d);
+            }
         }
     }
 }

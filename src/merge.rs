@@ -96,51 +96,33 @@ impl Merge for () {
     fn scale(_: &mut Self::Diff, _: Delta) {}
 }
 
-impl Merge for i128 {
-    type Diff = i128;
-    type Value = i128;
-    fn base() -> i128 {
-        0
-    }
-    #[inline]
-    fn merge<'a>(val: &mut i128, diffs: impl Iterator<Item = Cow<'a, i128>>) {
-        *val += diffs.map(|d| *d).sum::<i128>();
-    }
-    #[inline]
-    fn combine<'a>(old: &mut i128, new: impl Iterator<Item = Cow<'a, i128>>) {
-        *old += new.map(|d| *d).sum::<i128>();
-    }
-    #[inline]
-    fn noop(diff: &Self::Diff) -> bool {
-        *diff == 0
-    }
-    fn scale(d: &mut i128, n: Delta) {
-        *d *= n as i128;
-    }
+macro_rules! impl_int_merge {
+    ($($t:ty),* $(,)?) => {$(
+        impl Merge for $t {
+            type Diff = $t;
+            type Value = $t;
+            fn base() -> $t {
+                0
+            }
+            #[inline]
+            fn merge<'a>(val: &mut $t, diffs: impl Iterator<Item = Cow<'a, $t>>) {
+                *val += diffs.map(|d| *d).sum::<$t>();
+            }
+            #[inline]
+            fn combine<'a>(old: &mut $t, new: impl Iterator<Item = Cow<'a, $t>>) {
+                *old += new.map(|d| *d).sum::<$t>();
+            }
+            #[inline]
+            fn noop(diff: &Self::Diff) -> bool {
+                *diff == 0
+            }
+            fn scale(d: &mut $t, n: Delta) {
+                *d *= n as $t;
+            }
+        }
+    )*};
 }
-
-impl Merge for i64 {
-    type Diff = i64;
-    type Value = i64;
-    fn base() -> i64 {
-        0
-    }
-    #[inline]
-    fn merge<'a>(val: &mut i64, diffs: impl Iterator<Item = Cow<'a, i64>>) {
-        *val += diffs.map(|d| *d).sum::<i64>();
-    }
-    #[inline]
-    fn combine<'a>(old: &mut i64, new: impl Iterator<Item = Cow<'a, i64>>) {
-        *old += new.map(|d| *d).sum::<i64>();
-    }
-    #[inline]
-    fn noop(diff: &Self::Diff) -> bool {
-        *diff == 0
-    }
-    fn scale(d: &mut i64, n: Delta) {
-        *d *= n;
-    }
-}
+impl_int_merge!(i8, i16, i32, i64, i128);
 
 impl<A: Merge, B: Merge> Merge for (A, B) {
     type Diff = (A::Diff, B::Diff);

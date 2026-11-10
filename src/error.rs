@@ -65,6 +65,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// An application error refusing a transaction: what a constraint
+    /// returns, and what a write closure returns to abort with its own
+    /// error. Recover it with [`rejected`](Self::rejected).
+    pub fn reject(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Error::Rejected(Arc::new(err))
+    }
+
+    /// The application error this is, if it is a rejection by an `E`.
+    pub fn rejected<E: std::error::Error + 'static>(&self) -> Option<&E> {
+        match self {
+            Error::Rejected(e) => e.downcast_ref::<E>(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn io(context: impl Into<String>, source: io::Error) -> Self {
         Error::Io {
             context: context.into(),

@@ -72,17 +72,17 @@ impl<K: Key, V: Value> Table<K, V> {
     }
 
     /// The value of `key`, with this transaction's writes.
-    pub fn get(&self, tx: &mut DbTx<'_, '_>, key: &K) -> Result<Option<V>> {
+    pub fn get(&self, tx: &mut DbTx<'_>, key: &K) -> Result<Option<V>> {
         Ok(tx.table(self.0).get(key)?.map(|v| v.into_owned()))
     }
 
     /// Set `key` to `value`, replacing what was there.
-    pub fn upsert(&self, tx: &mut DbTx<'_, '_>, key: K, value: V) -> Result<()> {
+    pub fn upsert(&self, tx: &mut DbTx<'_>, key: K, value: V) -> Result<()> {
         tx.table(self.0).set(key, Some(value))
     }
 
     /// Delete `key`. Returns whether it was there.
-    pub fn remove(&self, tx: &mut DbTx<'_, '_>, key: &K) -> Result<bool> {
+    pub fn remove(&self, tx: &mut DbTx<'_>, key: &K) -> Result<bool> {
         let mut ks = tx.table(self.0);
         let Some(old) = ks.get(key)?.map(|v| v.into_owned()) else {
             return Ok(false);
@@ -92,7 +92,7 @@ impl<K: Key, V: Value> Table<K, V> {
     }
 
     /// Change `key`'s value in place. Returns whether it was there.
-    pub fn update(&self, tx: &mut DbTx<'_, '_>, key: &K, f: impl FnOnce(&mut V)) -> Result<bool> {
+    pub fn update(&self, tx: &mut DbTx<'_>, key: &K, f: impl FnOnce(&mut V)) -> Result<bool> {
         let mut ks = tx.table(self.0);
         let Some(old) = ks.get(key)?.map(|v| v.into_owned()) else {
             return Ok(false);
@@ -106,11 +106,7 @@ impl<K: Key, V: Value> Table<K, V> {
     }
 
     /// [`upsert`](Self::upsert) every row.
-    pub fn extend(
-        &self,
-        tx: &mut DbTx<'_, '_>,
-        rows: impl IntoIterator<Item = (K, V)>,
-    ) -> Result<()> {
+    pub fn extend(&self, tx: &mut DbTx<'_>, rows: impl IntoIterator<Item = (K, V)>) -> Result<()> {
         let mut ks = tx.table(self.0);
         for (k, v) in rows {
             ks.set(k, Some(v))?;
@@ -121,7 +117,7 @@ impl<K: Key, V: Value> Table<K, V> {
 
 impl<V: Value> Table<Id<V>, V> {
     /// Add `value` under a freshly minted id.
-    pub fn insert(&self, tx: &mut DbTx<'_, '_>, value: V) -> Result<Id<V>> {
+    pub fn insert(&self, tx: &mut DbTx<'_>, value: V) -> Result<Id<V>> {
         let id = tx.mint(self.0.raw());
         tx.table(self.0).absorb(id, Change::Insert(value))?;
         Ok(id)
@@ -138,12 +134,12 @@ impl<T: Key> Set<T> {
         graph.table(self.0)
     }
 
-    pub fn contains(&self, tx: &mut DbTx<'_, '_>, value: &T) -> Result<bool> {
+    pub fn contains(&self, tx: &mut DbTx<'_>, value: &T) -> Result<bool> {
         Ok(tx.table(self.0).get(value)?.is_some())
     }
 
     /// Add `value`. Returns whether it was new.
-    pub fn insert(&self, tx: &mut DbTx<'_, '_>, value: T) -> Result<bool> {
+    pub fn insert(&self, tx: &mut DbTx<'_>, value: T) -> Result<bool> {
         let mut ks = tx.table(self.0);
         if ks.get(&value)?.is_some() {
             return Ok(false);
@@ -153,7 +149,7 @@ impl<T: Key> Set<T> {
     }
 
     /// Remove `value`. Returns whether it was there.
-    pub fn remove(&self, tx: &mut DbTx<'_, '_>, value: &T) -> Result<bool> {
+    pub fn remove(&self, tx: &mut DbTx<'_>, value: &T) -> Result<bool> {
         let mut ks = tx.table(self.0);
         if ks.get(value)?.is_none() {
             return Ok(false);
@@ -163,7 +159,7 @@ impl<T: Key> Set<T> {
     }
 
     /// [`insert`](Self::insert) every value.
-    pub fn extend(&self, tx: &mut DbTx<'_, '_>, values: impl IntoIterator<Item = T>) -> Result<()> {
+    pub fn extend(&self, tx: &mut DbTx<'_>, values: impl IntoIterator<Item = T>) -> Result<()> {
         for v in values {
             self.insert(tx, v)?;
         }
@@ -181,15 +177,15 @@ impl<V: Value> Cell<V> {
         graph.table(self.0)
     }
 
-    pub fn get(&self, tx: &mut DbTx<'_, '_>) -> Result<Option<V>> {
+    pub fn get(&self, tx: &mut DbTx<'_>) -> Result<Option<V>> {
         Ok(tx.table(self.0).get(&())?.map(|v| v.into_owned()))
     }
 
-    pub fn set(&self, tx: &mut DbTx<'_, '_>, value: V) -> Result<()> {
+    pub fn set(&self, tx: &mut DbTx<'_>, value: V) -> Result<()> {
         tx.table(self.0).set((), Some(value))
     }
 
-    pub fn clear(&self, tx: &mut DbTx<'_, '_>) -> Result<()> {
+    pub fn clear(&self, tx: &mut DbTx<'_>) -> Result<()> {
         tx.table(self.0).set((), None)
     }
 }
@@ -207,24 +203,24 @@ impl<T: Key> Multiset<T> {
     }
 
     /// How many of `row` there are.
-    pub fn get(&self, tx: &mut DbTx<'_, '_>, row: &T) -> Result<Delta> {
+    pub fn get(&self, tx: &mut DbTx<'_>, row: &T) -> Result<Delta> {
         Ok(tx.table(self.0).get(row)?.map_or(0, |n| *n))
     }
 
     /// Add `times` of `row`; negative to take away. Reads nothing: the
     /// count is the sum of what was added, and a row whose count is zero
     /// is not there.
-    pub fn add(&self, tx: &mut DbTx<'_, '_>, row: T, times: Delta) -> Result<()> {
+    pub fn add(&self, tx: &mut DbTx<'_>, row: T, times: Delta) -> Result<()> {
         tx.table(self.0).add(row, times)
     }
 
     /// Take away `times` of `row`.
-    pub fn remove(&self, tx: &mut DbTx<'_, '_>, row: T, times: Delta) -> Result<()> {
+    pub fn remove(&self, tx: &mut DbTx<'_>, row: T, times: Delta) -> Result<()> {
         self.add(tx, row, -times)
     }
 
     /// Take away every `row`.
-    pub fn clear(&self, tx: &mut DbTx<'_, '_>, row: &T) -> Result<()> {
+    pub fn clear(&self, tx: &mut DbTx<'_>, row: &T) -> Result<()> {
         let mut ks = tx.table(self.0);
         match ks.get(row)?.map(|n| *n) {
             Some(n) => ks.add(row.clone(), n.checked_neg().expect("negate overflowed")),
@@ -247,13 +243,13 @@ impl<V: Value> Events<V> {
     }
 
     /// Append `value`, returning its id.
-    pub fn push(&self, tx: &mut DbTx<'_, '_>, value: V) -> Result<Id<V>> {
+    pub fn push(&self, tx: &mut DbTx<'_>, value: V) -> Result<Id<V>> {
         let id = tx.mint(self.0.raw());
         tx.table(self.0).absorb(id, Change::Insert(value))?;
         Ok(id)
     }
 
-    pub fn get(&self, tx: &mut DbTx<'_, '_>, id: Id<V>) -> Result<Option<V>> {
+    pub fn get(&self, tx: &mut DbTx<'_>, id: Id<V>) -> Result<Option<V>> {
         Ok(tx.table(self.0).get(&id)?.map(|v| v.into_owned()))
     }
 }

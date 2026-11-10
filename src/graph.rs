@@ -364,7 +364,7 @@ impl OpDag {
         input: NodeRef<U::Takes, S>,
         make: impl FnOnce(S) -> U,
     ) -> NodeRef<U::Gives, U::State> {
-        let op = make(self.state_of(input));
+        let op = make(self.state(input));
         self.unary(input, op)
     }
 
@@ -393,7 +393,7 @@ impl OpDag {
         r: NodeRef<B::Right, RS>,
         make: impl FnOnce(LS, RS) -> B,
     ) -> NodeRef<B::Gives, B::State> {
-        let op = make(self.state_of(l), self.state_of(r));
+        let op = make(self.state(l), self.state(r));
         self.binary(l, r, op)
     }
 
@@ -424,7 +424,7 @@ impl OpDag {
         inputs: &[NodeRef<N::Takes, S>],
         make: impl FnOnce(Vec<S>) -> N,
     ) -> NodeRef<N::Gives, N::State> {
-        let states = inputs.iter().map(|&i| self.state_of(i)).collect();
+        let states = inputs.iter().map(|&i| self.state(i)).collect();
         let op = make(states);
         self.nary(inputs, op)
     }
@@ -456,7 +456,8 @@ impl OpDag {
         self.unary_with(input, |parent| FilterValues::new(parent, Arc::new(p)))
     }
 
-    fn state_of<B, S: Clone + 'static>(&self, r: NodeRef<B, S>) -> S {
+    /// The state handle of `r`'s node, as children read it.
+    pub fn state<B, S: Clone + 'static>(&self, r: NodeRef<B, S>) -> S {
         self.nodes[r.0]
             .state
             .downcast_ref::<S>()

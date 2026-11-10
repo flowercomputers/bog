@@ -197,7 +197,7 @@ fn main() {
             o.max_layers = n;
         }
     });
-    let mut db = Db::open(builder, ledger()).unwrap();
+    let db = Db::open(builder, ledger()).unwrap();
 
     let seed_start = Instant::now();
     db.write(|tx| {
