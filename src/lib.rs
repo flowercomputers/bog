@@ -12,6 +12,10 @@
 //!   ([`OpDag::source`]), and operators: [`Sum`], [`Distinct`],
 //!   [`IndexBy`], [`Check`], the linear stages fused by [`FusedLinears`],
 //!   and those in [`ops`]: joins, semijoins, reductions, foreign keys.
+//! - The [`source`] handles write tables with the usual shapes: tables,
+//!   sets, cells, multisets, and event logs with minted [`Id`]s and
+//!   retention. [`Db::subscribe`] follows any keyspace's committed
+//!   changes from a snapshot on; see [`subscribe`].
 //! - A node's [state] is its whole output, which its children read
 //!   rather than copy: a join of two tables keyed alike stores nothing.
 //! - The [`Store`] underneath is a log-structured store: a write-ahead log,
@@ -34,18 +38,22 @@ use crate::merge::*;
 pub mod codec;
 pub mod cursor;
 pub mod error;
+pub mod id;
 
 pub mod db;
 
 pub use db::{Db, DbTx};
 pub use error::{Error, Result};
 pub use graph::{NodeRef, OpDag};
+pub use id::Id;
 pub use store::{DurabilityPolicy, MemoryStats, Snapshot, Store, StoreBuilder, StoreOptions};
 pub use tx::{Keyspace, KeyspaceId, WriteTx};
 pub mod index;
 mod manifest;
 pub mod ops;
+pub mod source;
 pub mod state;
+pub mod subscribe;
 use crate::state::{Counted, Declare, Stored};
 pub mod store;
 mod table;

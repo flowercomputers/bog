@@ -27,6 +27,7 @@ use crate::{
     manifest::{self, Checkpoint, InstallError, MANIFEST_TMP, Manifest, Segment},
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
+    subscribe::{Publish, Senders, Subscription},
     table::{BlockCache, DEFAULT_BLOCK_SIZE, TOMBSTONE, Table, TableBuilder, TableCursor},
     tx::{KeyspaceId, OverlayRun, TxState, WriteTx},
 };
@@ -1700,6 +1701,13 @@ pub struct Shared {
     /// WAL bytes the next open would replay. Written under the writer
     /// lock; atomic so stats can read it while a tx is open.
     wal_bytes: AtomicU64,
+    /// Subscribers by keyspace id. Held from before a commit is
+    /// published until its deltas are sent, and while a subscriber takes
+    /// its snapshot, so each sees exactly the commits after its snapshot.
+    /// Taken after the writer lock, never before.
+    subscribers: Mutex<HashMap<u64, Box<dyn Publish>>>,
+    /// Called with the epoch each checkpoint covers through.
+    checkpoint_hooks: Mutex<Vec<Box<dyn FnMut(u64) + Send>>>,
     /// Held while compacting, so one compaction runs at a time.
     compaction: Mutex<()>,
     /// Held while folding or checkpointing. A checkpoint drops the layers
@@ -1812,6 +1820,8 @@ impl Store {
             cache: BlockCache::new(opts.cache_size),
             opts,
             wal_bytes: AtomicU64::new(wal_bytes),
+            subscribers: Mutex::new(HashMap::new()),
+            checkpoint_hooks: Mutex::new(Vec::new()),
             compaction: Mutex::new(()),
             layer_work: Mutex::new(()),
             maintenance: Maintenance::default(),
@@ -1924,6 +1934,46 @@ impl Store {
     /// Open a write transaction over the latest committed state. Blocks
     /// while another write transaction is open. Dropping the tx without
     /// [`finish`](Self::finish) aborts it. Fails if the store is poisoned.
+    /// Subscribe to `keyspace`: the latest snapshot, and every commit's
+    /// net change to the keyspace after it, in order. See
+    /// [`subscribe`](crate::subscribe).
+    pub fn subscribe<K, M>(&self, keyspace: KeyspaceId<K, M>) -> (Snapshot<'_>, Subscription<K, M>)
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Send + Sync,
+        M::Diff: Send + Sync,
+    {
+        self.assert_declared::<K, M>(keyspace.raw());
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // taken under the lock: a commit not in it has yet to send
+        let snapshot = self.snapshot();
+        let (tx, rx) = std::sync::mpsc::channel();
+        subscribers
+            .entry(keyspace.raw())
+            .or_insert_with(|| Box::new(Senders::<K, M>(Vec::new())))
+            .as_any_mut()
+            .downcast_mut::<Senders<K, M>>()
+            .expect("keyspace id reused with a different type")
+            .0
+            .push(tx);
+        let after = snapshot.epoch();
+        (snapshot, Subscription { rx, after })
+    }
+
+    /// Call `hook` after every checkpoint, with the epoch it covers
+    /// through, on whichever thread wrote it: usually the maintenance
+    /// thread. It must not start a transaction or a checkpoint.
+    pub fn on_checkpoint(&self, hook: impl FnMut(u64) + Send + 'static) {
+        self.checkpoint_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Box::new(hook));
+    }
+
     pub fn begin(&self) -> Result<WriteTx<'_>> {
         self.assert_no_tx_here("begin");
         // lock first: the snapshot must not be older than the last commit
@@ -1970,6 +2020,17 @@ impl Store {
         // deterministic WAL bytes for the same tx
         sections.sort_unstable_by_key(|(ks, _)| *ks);
 
+        // subscribed keyspaces' changes are copied before sealing consumes
+        // them, and sent once the commit is visible
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let staged: Vec<_> = sections
+            .iter()
+            .filter_map(|(ks, u)| subscribers.get(ks).map(|p| (*ks, p.stage(&**u))))
+            .collect();
+
         // payload: repeated `keyspace u64 | len u64 | (ordered key, Option<value>)*`
         let mut trees = HashMap::with_capacity(sections.len());
         let mut bytes = 0;
@@ -2010,6 +2071,15 @@ impl Store {
             floors: current.floors.clone(),
             frozen: current.frozen,
         }));
+        for (ks, changes) in staged {
+            let live = subscribers
+                .get_mut(&ks)
+                .is_some_and(|p| p.publish(epoch, changes));
+            if !live {
+                subscribers.remove(&ks);
+            }
+        }
+        drop(subscribers);
 
         // the tx's snapshot and our hold on the old version go first, so
         // nothing may see the new layer: then it folds straight into the
@@ -2660,6 +2730,14 @@ impl Shared {
         }));
         self.wal_bytes.fetch_sub(frozen_wal, Relaxed);
         drop(w);
+        for hook in self
+            .checkpoint_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter_mut()
+        {
+            hook(ckpt.epoch);
+        }
 
         for seg in retired {
             let seg = Segment {

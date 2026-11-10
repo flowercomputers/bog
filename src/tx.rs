@@ -357,6 +357,33 @@ impl<K: Ord, M: Merge> Default for KeyspaceHandle<K, M> {
     }
 }
 
+/// The net changes the tx behind `handle` makes to its keyspace, in key
+/// order. The handle must be settled, as it is once the tx is finishing.
+pub(crate) fn net_changes<K, M>(handle: &dyn ErasedUnderlay) -> Vec<(K, Change<M>)>
+where
+    K: OrderedCodec + Clone + Send + Sync + 'static,
+    M: Merge,
+    M::Value: Codec + Sync,
+{
+    let handle = handle
+        .as_any()
+        .downcast_ref::<KeyspaceHandle<K, M>>()
+        .expect("keyspace id reused with a different type");
+    let mut out = Vec::new();
+    composed(
+        handle
+            .runs
+            .iter()
+            .map(|r| r.entries.iter().map(|(k, c)| (k, c.clone()))),
+        |k, change| {
+            if let Some(change) = change {
+                out.push((k.clone(), change));
+            }
+        },
+    );
+    out
+}
+
 /// Walk `runs`' changes, oldest run first, composing each key's changes
 /// across runs: `f` gets every key in order with what the tx does to it,
 /// `None` where its changes cancelled out. The runs must be settled.

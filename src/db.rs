@@ -7,14 +7,24 @@
 //! graph changes, opening rebuilds derived state by reading the tables
 //! back in chunks. Sources fed by [`give`](DbTx::give), whose rows the
 //! store does not keep, need the application to replay them.
+//!
+//! The [`source`](crate::source) handles write tables through a `DbTx`
+//! with the usual shapes: tables, sets, cells, multisets and event logs.
+//! [`subscribe`](Db::subscribe) follows any keyspace's committed changes,
+//! base or derived.
+
+use std::collections::HashMap;
 
 use crate::{
     Buffer,
     codec::{Codec, OrderedCodec},
     error::{Error, Result},
     graph::{NodeRef, OpDag},
+    id::Id,
     merge::Merge,
+    source::{Events, EventsRetention, Retain, Retention, Value},
     store::{Snapshot, Store, StoreBuilder},
+    subscribe::Subscription,
     tx::{Keyspace, KeyspaceId, WriteTx},
 };
 
@@ -29,6 +39,9 @@ pub type ReplayGiven<'r> = dyn FnMut(&mut WriteTx<'_>, &mut OpDag) -> Result<boo
 pub struct Db {
     store: Store,
     graph: OpDag,
+    /// What each event log keeps, applied at every commit.
+    retention: Vec<Box<dyn Retention>>,
+    commit_hooks: Vec<Box<dyn FnMut(&Snapshot<'_>) + Send>>,
 }
 
 impl Db {
@@ -82,16 +95,28 @@ impl Db {
             let more = replay(tx, &mut graph)?;
             tx.failure().map_or(Ok(more), Err)
         })?;
-        Ok(Db { store, graph })
+        Ok(Db {
+            store,
+            graph,
+            retention: Vec::new(),
+            commit_hooks: Vec::new(),
+        })
     }
 
     /// Run `f` in a write transaction, then the graph over what it wrote,
     /// then commit. If `f` fails, nothing commits and its error is
     /// returned.
     pub fn write<R>(&mut self, f: impl FnOnce(&mut DbTx<'_, '_>) -> Result<R>) -> Result<R> {
+        let Db {
+            store,
+            graph,
+            retention,
+            commit_hooks,
+        } = self;
         let mut tx = DbTx {
-            tx: self.store.begin()?,
-            graph: &mut self.graph,
+            tx: store.begin()?,
+            graph,
+            minted: HashMap::new(),
         };
         let r = match f(&mut tx) {
             Ok(r) => r,
@@ -100,13 +125,85 @@ impl Db {
                 return Err(e);
             }
         };
-        tx.graph.run(&mut tx.tx);
-        let DbTx { tx, graph } = tx;
-        if tx.failure().is_some() {
-            graph.abort();
+        let DbTx {
+            mut tx,
+            graph,
+            minted,
+        } = tx;
+        // evictions are part of the transaction that caused them
+        let mut evicted = Ok(());
+        for policy in retention.iter_mut() {
+            let pushed = minted.get(&policy.keyspace()).copied().unwrap_or(0);
+            evicted = evicted.and_then(|()| policy.apply(&mut tx, pushed));
         }
-        self.store.finish(tx)?;
+        graph.run(&mut tx);
+        let committed = match evicted.and_then(|()| tx.failure().map_or(Ok(()), Err)) {
+            Ok(()) => store.finish(tx),
+            Err(e) => Err(e),
+        };
+        let epoch = match committed {
+            Ok(epoch) => epoch,
+            // committed, though something after it failed
+            Err(e @ Error::AfterCommit { .. }) => {
+                run_hooks(store, commit_hooks);
+                return Err(e);
+            }
+            Err(e) => {
+                graph.abort();
+                for policy in retention.iter_mut() {
+                    policy.reset();
+                }
+                return Err(e);
+            }
+        };
+        if epoch.is_some() {
+            run_hooks(store, commit_hooks);
+        }
         Ok(r)
+    }
+
+    /// Call `hook` after every commit, on the committing thread, with a
+    /// snapshot that includes it.
+    pub fn on_commit(&mut self, hook: impl FnMut(&Snapshot<'_>) + Send + 'static) {
+        self.commit_hooks.push(Box::new(hook));
+    }
+
+    /// Call `hook` after every checkpoint, with the epoch it covers
+    /// through; see [`Store::on_checkpoint`].
+    pub fn on_checkpoint(&self, hook: impl FnMut(u64) + Send + 'static) {
+        self.store.on_checkpoint(hook);
+    }
+
+    /// Follow keyspace `id`, base or derived: the latest snapshot, and
+    /// every commit's net change after it; see [`Store::subscribe`].
+    pub fn subscribe<K, M>(&self, id: KeyspaceId<K, M>) -> (Snapshot<'_>, Subscription<K, M>)
+    where
+        K: OrderedCodec + Clone + Send + Sync + 'static,
+        M: Merge,
+        M::Value: Codec + Send + Sync,
+        M::Diff: Send + Sync,
+    {
+        self.store.subscribe(id)
+    }
+
+    /// Set what `events` keeps, from the next commit on: each commit then
+    /// evicts what the policy no longer keeps, as deletes the graph sees.
+    /// It is not stored: set it again after opening.
+    ///
+    /// [`Retain::Count`] counts the rows pushed through the
+    /// [`Events`] handle; rows written to its keyspace any other way are
+    /// not counted until the next open.
+    pub fn retain<V: Value>(&mut self, events: Events<V>, retain: Retain) {
+        let id = events.id();
+        self.retention.retain(|p| p.keyspace() != id.raw());
+        if retain != Retain::Forever {
+            self.retention.push(Box::new(EventsRetention {
+                id,
+                retain,
+                live: None,
+                settled: false,
+            }));
+        }
     }
 
     /// The latest committed state.
@@ -119,10 +216,22 @@ impl Db {
     }
 }
 
+fn run_hooks(store: &Store, hooks: &mut [Box<dyn FnMut(&Snapshot<'_>) + Send>]) {
+    if hooks.is_empty() {
+        return;
+    }
+    let snapshot = store.snapshot();
+    for hook in hooks {
+        hook(&snapshot);
+    }
+}
+
 /// A write transaction on a [`Db`].
 pub struct DbTx<'d, 's> {
     tx: WriteTx<'s>,
     graph: &'d mut OpDag,
+    /// Ids minted so far, by the keyspace they were minted for.
+    minted: HashMap<u64, u32>,
 }
 
 impl<'s> DbTx<'_, 's> {
@@ -155,6 +264,20 @@ impl<'s> DbTx<'_, 's> {
         M::Value: Codec + Sync,
     {
         self.tx.keyspace(id)
+    }
+
+    /// The next id for `keyspace` in this transaction: its epoch, and one
+    /// more than the last minted for that keyspace.
+    pub(crate) fn mint<T>(&mut self, keyspace: u64) -> Id<T> {
+        let seq = self.minted.entry(keyspace).or_insert(0);
+        let id = Id::minted(self.tx.epoch(), *seq);
+        *seq += 1;
+        id
+    }
+
+    /// The epoch this transaction commits as, if it writes anything.
+    pub fn epoch(&self) -> u64 {
+        self.tx.epoch()
     }
 
     /// Stage rows at an unstored source.

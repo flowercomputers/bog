@@ -1,5 +1,5 @@
 use crate::{
-    Binary, Buffer, Change, Mergeless, Nary, Node, Register, Unary, WriteTx,
+    Bag, Binary, Buffer, Change, Delta, Mergeless, Nary, Node, Register, Unary, WriteTx,
     codec::{Codec, OrderedCodec},
     error::Result,
     merge::Merge,
@@ -158,6 +158,60 @@ where
     }
 }
 
+/// A stored multiset as a source: its counts' changes as a bag.
+struct Counts<T> {
+    id: KeyspaceId<T, Delta>,
+    after: Option<T>,
+    /// Scratch, reused across runs.
+    changes: Register<T, Delta>,
+}
+
+impl<T> TableFeed for Counts<T>
+where
+    T: OrderedCodec + Clone + Send + Sync + 'static,
+{
+    fn pull(&mut self, tx: &mut WriteTx, out: &mut dyn Any) {
+        let out: &mut Bag<T> = out.downcast_mut().expect("multiset delta type");
+        tx.keyspace(self.id).run_changes(&mut self.changes);
+        for (row, change) in self.changes.drain() {
+            let by = match change {
+                Change::Insert(n) => n,
+                Change::Delete(o) => -o,
+                Change::Replace(o, n) => n - o,
+                Change::Modify(_) => unreachable!("resolved before absorbing"),
+            };
+            out.push(row, by);
+        }
+    }
+
+    // nothing reads a multiset's state through the graph
+    fn hide(&mut self) {
+        self.after = None;
+    }
+
+    fn deliver(&mut self, tx: &mut WriteTx, n: usize, out: &mut dyn Any) -> Result<bool> {
+        let out: &mut Bag<T> = out.downcast_mut().expect("multiset delta type");
+        let lower = match &self.after {
+            Some(k) => Bound::Excluded(k.clone()),
+            None => Bound::Unbounded,
+        };
+        let mut rows = 0;
+        for row in tx
+            .keyspace(self.id)
+            .range((lower, Bound::Unbounded))
+            .take(n)
+        {
+            let (k, count) = row?;
+            out.push(k.clone().into_owned(), *count);
+            self.after = Some(k.into_owned());
+            rows += 1;
+        }
+        Ok(rows == n)
+    }
+
+    fn show(&mut self) {}
+}
+
 enum Kind {
     /// Fed by `give`, or by a table's changes; `staging` accumulates
     /// between runs and is swapped into `out` when the source runs.
@@ -257,6 +311,32 @@ impl OpDag {
             &[],
             Box::new(Register::<K, M>::empty()),
             Box::new(Stored::table(id, delivered)),
+            vec![Declare::base(id)],
+        );
+        self.tables.push(node.0);
+        node
+    }
+
+    /// A stored multiset: the application writes each row's count to
+    /// keyspace `id`, and the node gives each run's changes in count.
+    pub fn multiset<T>(&mut self, id: KeyspaceId<T, Delta>) -> NodeRef<Bag<T>>
+    where
+        T: OrderedCodec + Clone + Send + Sync + 'static,
+    {
+        let feed = Counts {
+            id,
+            after: None,
+            changes: Register::new(),
+        };
+        let node = self.push(
+            Kind::Source {
+                staging: Box::new(Bag::<T>::empty()),
+                table: Some(Box::new(feed)),
+            },
+            type_name::<Bag<T>>(),
+            &[],
+            Box::new(Bag::<T>::empty()),
+            Box::new(()),
             vec![Declare::base(id)],
         );
         self.tables.push(node.0);
