@@ -28,7 +28,7 @@ use crate::{
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
     table::{BlockCache, DEFAULT_BLOCK_SIZE, TOMBSTONE, Table, TableBuilder, TableCursor},
-    tx::{KeyspaceId, Overlay, TxState, WriteTx},
+    tx::{KeyspaceId, OverlayRun, TxState, WriteTx},
 };
 
 /// Size limits. Memory use is estimated with [`ResidentSize`].
@@ -654,7 +654,7 @@ impl<'s> Snapshot<'s> {
         M::Value: Codec,
     {
         let (lower, upper) = (range.start_bound().cloned(), range.end_bound().cloned());
-        self.cursor(keyspace, None, lower, upper, false, None)
+        self.cursor(keyspace, &[], lower, upper, false, None)
     }
 
     /// [`range`](Self::range), in reverse key order.
@@ -669,7 +669,7 @@ impl<'s> Snapshot<'s> {
         M::Value: Codec,
     {
         let (lower, upper) = (range.start_bound().cloned(), range.end_bound().cloned());
-        self.cursor(keyspace, None, lower, upper, true, None)
+        self.cursor(keyspace, &[], lower, upper, true, None)
     }
 
     /// Every run of `keyspace`, newest first, each with its index of type
@@ -731,45 +731,13 @@ impl<'s> Snapshot<'s> {
         Ok(runs)
     }
 
-    /// A merged cursor over `keyspace` with a write tx's changes as of the
-    /// start of a graph run on top; see [`Source::overlay_as_of`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cursor_as_of<'a, K, M>(
-        &'a self,
-        keyspace: KeyspaceId<K, M>,
-        overlay: &'a Overlay<K, M>,
-        run: u64,
-        lower: Bound<K>,
-        upper: Bound<K>,
-        rev: bool,
-        tx: Option<&'a TxState>,
-    ) -> Cursor<'a, K, M>
-    where
-        K: OrderedCodec + Clone + 'static,
-        M: Merge,
-        M::Value: Codec,
-    {
-        let empty = empty_bounds(lower.as_ref(), upper.as_ref());
-        let mut cursor = self.cursor(keyspace, None, lower.clone(), upper.clone(), rev, tx);
-        if !empty {
-            cursor.push_newest(Source::overlay_as_of(
-                overlay,
-                run,
-                lower.as_ref(),
-                upper.as_ref(),
-                rev,
-            ));
-        }
-        cursor
-    }
-
     /// A merged cursor over `keyspace` within the bounds, forward or, with
-    /// `rev`, backward, with `overlay`, a write tx's own changes, on top
-    /// when given.
+    /// `rev`, backward, with `overlay`, a write tx's own runs of changes,
+    /// oldest first, on top.
     pub(crate) fn cursor<'a, K, M>(
         &'a self,
         keyspace: KeyspaceId<K, M>,
-        overlay: Option<&'a Overlay<K, M>>,
+        overlay: &'a [OverlayRun<K, M>],
         lower: Bound<K>,
         upper: Bound<K>,
         rev: bool,
@@ -784,8 +752,8 @@ impl<'s> Snapshot<'s> {
         let mut sources = Vec::new();
         if !empty_bounds(lower.as_ref(), upper.as_ref()) {
             let (lo, up) = (lower.as_ref(), upper.as_ref());
-            if let Some(overlay) = overlay {
-                sources.push(Source::overlay(overlay, lo, up, rev));
+            for run in overlay.iter().rev() {
+                sources.push(Source::overlay(&run.entries, lo, up, rev));
             }
             for layer in self.version.layers.iter().rev() {
                 if let Some(t) = layer.trees.get(&ks) {
@@ -3613,8 +3581,6 @@ mod tests {
     fn tx_memory_tracks_entries_that_change_and_cancel() {
         let store = mem();
         let mut tx = store.begin().unwrap();
-        // what a graph run remembers about the keys it wrote is counted
-        // until the run ends
         let settle = |tx: &mut WriteTx<'_>| {
             tx.end_run();
             drop(tx.keyspace(KS));
@@ -3624,18 +3590,31 @@ mod tests {
         ks.absorb(1, Change::Insert(10)).unwrap();
         ks.absorb(2, Change::Insert(20)).unwrap();
         drop(ks);
-        let in_run = tx.memory_used();
         let two = settle(&mut tx);
-        assert!(two > 0 && in_run > two, "{in_run} {two}");
+        assert!(two > 0);
+        let one = two / 2;
+        // a later run's change to a key is one more entry: each run keeps
+        // its own, so the run's old and new values stay readable
         let mut ks = tx.keyspace(KS);
-        // insert then delete cancels: the entry is gone, and so are its bytes
         ks.absorb(2, Change::Delete(20)).unwrap();
         drop(ks);
-        assert_eq!(settle(&mut tx), two / 2);
+        assert_eq!(settle(&mut tx), one * 3);
+        // within a run, insert then delete cancels: the entry is gone,
+        // and so are its bytes
         let mut ks = tx.keyspace(KS);
-        ks.absorb(1, Change::Delete(10)).unwrap();
+        ks.absorb(5, Change::Insert(50)).unwrap();
+        ks.absorb(5, Change::Delete(50)).unwrap();
         drop(ks);
-        assert_eq!(settle(&mut tx), 0);
+        assert_eq!(settle(&mut tx), one * 3);
+        // and so does an out-of-order write, once settled
+        let mut ks = tx.keyspace(KS);
+        ks.absorb(7, Change::Insert(70)).unwrap();
+        ks.absorb(6, Change::Insert(60)).unwrap();
+        ks.absorb(7, Change::Delete(70)).unwrap();
+        assert_eq!(ks.get(&7).unwrap().as_deref(), None);
+        assert_eq!(ks.get(&6).unwrap().as_deref(), Some(&60));
+        drop(ks);
+        assert_eq!(settle(&mut tx), one * 4);
     }
 
     #[test]
@@ -4045,7 +4024,7 @@ mod tests {
         }
         changes.absorb_one(30_000, Change::Modify(1));
         let mut tx = store.begin().unwrap();
-        let ks = tx.keyspace(BIG);
+        let mut ks = tx.keyspace(BIG);
         let mut out = Vec::new();
         ks.resolve_sorted(changes, &mut out).unwrap();
         let loads = store.cache.stats().1 - loads_before;
@@ -4386,17 +4365,20 @@ mod tests {
                 assert_eq!(collect(ks.range_old_rev(range)), fwd, "old {range:?}");
             }
             // seeks follow the cursor's direction
+            let want: Vec<Option<i64>> =
+                (0..64u8).map(|k| ks.get(&k).unwrap().map(|v| *v)).collect();
             let mut down = ks.range_rev(..);
-            let mut up = ks.range(..);
             for k in (0..64u8).rev() {
-                let want = ks.get(&k).unwrap().map(|v| *v);
-                assert_eq!(down.seek_get(&k).unwrap().map(|v| *v), want, "rev seek {k}");
+                let got = down.seek_get(&k).unwrap().map(|v| *v);
+                assert_eq!(got, want[k as usize], "rev seek {k}");
             }
+            drop(down);
+            let mut up = ks.range(..);
             for k in 0..64u8 {
-                let want = ks.get(&k).unwrap().map(|v| *v);
-                assert_eq!(up.seek_get(&k).unwrap().map(|v| *v), want, "seek {k}");
+                let got = up.seek_get(&k).unwrap().map(|v| *v);
+                assert_eq!(got, want[k as usize], "seek {k}");
             }
-            drop((down, up));
+            drop(up);
             drop(ks);
             drop(tx);
         }

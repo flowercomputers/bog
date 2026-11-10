@@ -956,21 +956,21 @@ mod tests {
         b.push((1, 5), 1);
         g.give(src, &mut b);
         g.run(&mut tx);
-        let ks = tx.keyspace(TOTALS);
+        let mut ks = tx.keyspace(TOTALS);
         assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&(2, 15)));
 
         let mut b = Bag::new();
         b.push((1, 10), -1);
         g.give(src, &mut b);
         g.run(&mut tx);
-        let ks = tx.keyspace(TOTALS);
+        let mut ks = tx.keyspace(TOTALS);
         assert_eq!(ks.get(&1).unwrap().as_deref(), Some(&(1, 5)));
 
         let mut b = Bag::new();
         b.push((1, 5), -1);
         g.give(src, &mut b);
         g.run(&mut tx);
-        let ks = tx.keyspace(TOTALS);
+        let mut ks = tx.keyspace(TOTALS);
         assert_eq!(ks.get(&1).unwrap().as_deref(), None);
         // insert then delete within one tx cancels out entirely
         assert!(ks.inner_is_empty());

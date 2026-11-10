@@ -17,12 +17,13 @@ use std::{
 };
 
 use crate::{
+    Change,
     codec::{Codec, OrderedCodec, decode_all, decode_all_ordered},
     error::{Error, Result},
     merge::Merge,
     store::Resident,
     table::TableCursor,
-    tx::{Overlay, Slot, TxState},
+    tx::TxState,
 };
 
 type Entry<'a, K, V> = (Cow<'a, K>, Option<Cow<'a, V>>);
@@ -77,15 +78,12 @@ pub(crate) fn empty_bounds<K: Ord>(lower: Bound<&K>, upper: Bound<&K>) -> bool {
 }
 
 pub(crate) enum Source<'a, K, M: Merge> {
-    /// A write tx's own changes, now or, with `as_of`, as of the start
-    /// of graph run `run`; a Delete is a tombstone. A key whose writes
-    /// cancelled, or that had no entry when the run began, is skipped, so
-    /// the snapshot below decides it.
+    /// One run of a write tx's own changes, sorted; a Delete is a
+    /// tombstone. `entries[lo..hi]` is what remains within the bounds.
     Overlay {
-        map: &'a Overlay<K, M>,
-        it: Pairs<'a, K, Slot<M>>,
-        head: Option<(&'a K, Option<&'a M::Value>)>,
-        as_of: Option<u64>,
+        entries: &'a [(K, Change<M>)],
+        lo: usize,
+        hi: usize,
         rev: bool,
     },
     /// A committed layer in memory.
@@ -110,58 +108,28 @@ where
     M: Merge,
     M::Value: Codec,
 {
-    pub fn overlay(map: &'a Overlay<K, M>, lower: Bound<&K>, upper: Bound<&K>, rev: bool) -> Self {
-        Self::overlay_source(map, None, lower, upper, rev)
-    }
-
-    pub fn overlay_as_of(
-        map: &'a Overlay<K, M>,
-        run: u64,
+    pub fn overlay(
+        entries: &'a [(K, Change<M>)],
         lower: Bound<&K>,
         upper: Bound<&K>,
         rev: bool,
     ) -> Self {
-        Self::overlay_source(map, Some(run), lower, upper, rev)
-    }
-
-    fn overlay_source(
-        map: &'a Overlay<K, M>,
-        as_of: Option<u64>,
-        lower: Bound<&K>,
-        upper: Bound<&K>,
-        rev: bool,
-    ) -> Self {
-        let mut s = Source::Overlay {
-            map,
-            it: pairs(map, lower, upper, rev),
-            head: None,
-            as_of,
+        let lo = match lower {
+            Bound::Unbounded => 0,
+            Bound::Included(k) => entries.partition_point(|(e, _)| e < k),
+            Bound::Excluded(k) => entries.partition_point(|(e, _)| e <= k),
+        };
+        let hi = match upper {
+            Bound::Unbounded => entries.len(),
+            Bound::Included(k) => entries.partition_point(|(e, _)| e <= k),
+            Bound::Excluded(k) => entries.partition_point(|(e, _)| e < k),
+        };
+        Source::Overlay {
+            entries,
+            lo,
+            hi: hi.max(lo),
             rev,
-        };
-        s.next_overlay();
-        s
-    }
-
-    /// Move an overlay source to its next entry the overlay decides.
-    fn next_overlay(&mut self) {
-        let Source::Overlay {
-            it, head, as_of, ..
-        } = self
-        else {
-            unreachable!("only for overlays")
-        };
-        *head = loop {
-            let Some((k, slot)) = it.next() else {
-                break None;
-            };
-            let v = match as_of {
-                Some(run) => slot.value_as_of(*run),
-                None => slot.value(),
-            };
-            if let Some(v) = v {
-                break Some((k, v));
-            }
-        };
+        }
     }
 
     pub fn layer(
@@ -186,7 +154,12 @@ where
 
     fn head_key(&self) -> Option<&K> {
         match self {
-            Source::Overlay { head, .. } => head.map(|(k, _)| k),
+            Source::Overlay {
+                entries,
+                lo,
+                hi,
+                rev,
+            } => (lo < hi).then(|| &entries[if *rev { hi - 1 } else { *lo }].0),
             Source::Layer { head, .. } => head.map(|(k, _)| k),
             Source::Table { head, .. } => head.as_ref().map(|(k, _)| k),
         }
@@ -195,7 +168,17 @@ where
     /// The head's value without consuming it; `Some(None)` is a tombstone.
     fn peek_value(&self) -> Option<Option<Cow<'a, M::Value>>> {
         match self {
-            Source::Overlay { head, .. } => head.map(|(_, v)| v.map(Cow::Borrowed)),
+            Source::Overlay {
+                entries,
+                lo,
+                hi,
+                rev,
+            } => (lo < hi).then(|| {
+                entries[if *rev { hi - 1 } else { *lo }]
+                    .1
+                    .new_value()
+                    .map(Cow::Borrowed)
+            }),
             Source::Layer { head, .. } => head.map(|(_, v)| v.as_ref().map(Cow::Borrowed)),
             Source::Table { head, .. } => head
                 .as_ref()
@@ -206,9 +189,15 @@ where
     /// Consume the head; the source must then [`advance`](Self::advance).
     fn take_head(&mut self) -> Option<Entry<'a, K, M::Value>> {
         match self {
-            Source::Overlay { head, .. } => head
-                .take()
-                .map(|(k, v)| (Cow::Borrowed(k), v.map(Cow::Borrowed))),
+            Source::Overlay {
+                entries,
+                lo,
+                hi,
+                rev,
+            } => (lo < hi).then(|| {
+                let (k, c) = &entries[if *rev { *hi - 1 } else { *lo }];
+                (Cow::Borrowed(k), c.new_value().map(Cow::Borrowed))
+            }),
             Source::Layer { head, .. } => head
                 .take()
                 .map(|(k, v)| (Cow::Borrowed(k), v.as_ref().map(Cow::Borrowed))),
@@ -252,7 +241,15 @@ where
 
     fn advance(&mut self) -> Result<()> {
         match self {
-            Source::Overlay { .. } => self.next_overlay(),
+            Source::Overlay { lo, hi, rev, .. } => {
+                if lo < hi {
+                    if *rev {
+                        *hi -= 1;
+                    } else {
+                        *lo += 1;
+                    }
+                }
+            }
             Source::Layer { it, head, .. } => *head = it.next(),
             Source::Table { cursor, rev, .. } => {
                 if *rev {
@@ -295,9 +292,14 @@ where
             (Bound::Included(key), Bound::Unbounded)
         };
         match self {
-            Source::Overlay { map, it, .. } => {
-                *it = pairs(map, lower, upper, rev);
-                self.next_overlay();
+            Source::Overlay {
+                entries, lo, hi, ..
+            } => {
+                if rev {
+                    *hi = entries[..*hi].partition_point(|(e, _)| e <= key).max(*lo);
+                } else {
+                    *lo = (*lo + entries[*lo..*hi].partition_point(|(e, _)| e < key)).min(*hi);
+                }
             }
             Source::Layer { map, it, head, .. } => {
                 *it = pairs(map, lower, upper, rev);
@@ -391,12 +393,6 @@ where
             probe: Vec::new(),
             tx,
         }
-    }
-
-    /// Put `source` above every other, before the cursor starts.
-    pub(crate) fn push_newest(&mut self, source: Source<'a, K, M>) {
-        debug_assert!(!self.started, "sources are fixed once started");
-        self.sources.insert(0, source);
     }
 
     fn start(&mut self) -> Result<()> {

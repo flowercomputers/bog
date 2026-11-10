@@ -254,7 +254,7 @@ where
         {
             return Ok(None);
         }
-        let ks = tx.keyspace(self.id);
+        let mut ks = tx.keyspace(self.id);
         let v = match when {
             When::New => ks.get(key)?,
             When::Old => ks.get_old(key)?,
@@ -361,7 +361,7 @@ where
         let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
             return Ok(());
         };
-        let ks = tx.keyspace(self.id);
+        let mut ks = tx.keyspace(self.id);
         let span = (first.clone(), Edge::Lo)..=(last.clone(), Edge::Hi);
         let mut rows = match when {
             When::New => ks.range(span),
@@ -403,7 +403,7 @@ where
             })?;
             return Ok(total);
         };
-        let ks = tx.keyspace(totals);
+        let mut ks = tx.keyspace(totals);
         let t = match when {
             When::New => ks.get(key)?,
             When::Old => ks.get_old(key)?,
@@ -425,7 +425,7 @@ where
         rev: bool,
         f: &mut dyn FnMut(&V, Delta) -> bool,
     ) -> Result<()> {
-        let ks = tx.keyspace(self.id);
+        let mut ks = tx.keyspace(self.id);
         let span = (key.clone(), Edge::Lo)..=(key.clone(), Edge::Hi);
         let rows = match (when, rev) {
             (When::New, false) => ks.range(span),
@@ -482,7 +482,7 @@ where
         when: When,
         f: &mut dyn FnMut(&(), Delta) -> bool,
     ) -> Result<()> {
-        let ks = tx.keyspace(self.id);
+        let mut ks = tx.keyspace(self.id);
         let count = match when {
             When::New => ks.get(key)?,
             When::Old => ks.get_old(key)?,
