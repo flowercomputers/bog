@@ -19,7 +19,6 @@ use std::{
 use arc_swap::ArcSwap;
 
 use crate::{
-    Change,
     codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
     cursor::{Cursor, Source, empty_bounds},
     error::{Error, IoContext, Result},
@@ -29,7 +28,7 @@ use crate::{
     merge::Merge,
     store::DurabilityPolicyCadence::Never,
     table::{BlockCache, DEFAULT_BLOCK_SIZE, TOMBSTONE, Table, TableBuilder, TableCursor},
-    tx::{KeyspaceId, TxState, WriteTx},
+    tx::{KeyspaceId, Overlay, TxState, WriteTx},
 };
 
 /// Size limits. Memory use is estimated with [`ResidentSize`].
@@ -273,6 +272,12 @@ struct Layer {
     /// Estimated resident bytes of `trees`.
     bytes: usize,
 }
+
+/// A commit folds its layer into the oldest itself, rather than leaving
+/// it to the maintenance thread, while the layers above the oldest hold
+/// no more than this: a backlog left by a long-lived snapshot is the
+/// thread's to clear.
+const INLINE_FOLD_LIMIT: usize = 4 << 20;
 
 /// A layer should be more than this many times the size of every newer
 /// layer together. Layer sizes then grow geometrically from newest to
@@ -719,8 +724,8 @@ impl<'s> Snapshot<'s> {
     pub(crate) fn cursor_as_of<'a, K, M>(
         &'a self,
         keyspace: KeyspaceId<K, M>,
-        overlay: &'a BTreeMap<K, Change<M>>,
-        prior: &'a BTreeMap<K, Option<Change<M>>>,
+        overlay: &'a Overlay<K, M>,
+        run: u64,
         lower: Bound<K>,
         upper: Bound<K>,
         rev: bool,
@@ -736,7 +741,7 @@ impl<'s> Snapshot<'s> {
         if !empty {
             cursor.push_newest(Source::overlay_as_of(
                 overlay,
-                prior,
+                run,
                 lower.as_ref(),
                 upper.as_ref(),
                 rev,
@@ -751,7 +756,7 @@ impl<'s> Snapshot<'s> {
     pub(crate) fn cursor<'a, K, M>(
         &'a self,
         keyspace: KeyspaceId<K, M>,
-        overlay: Option<&'a BTreeMap<K, Change<M>>>,
+        overlay: Option<&'a Overlay<K, M>>,
         lower: Bound<K>,
         upper: Bound<K>,
         rev: bool,
@@ -1872,9 +1877,10 @@ impl Shared {
     /// there is somewhere to checkpoint to. At 1 a checkpoint is due; at 2
     /// commits wait for one.
     fn over_limits(&self, factor: u64) -> bool {
+        // WAL bytes imply layers to checkpoint, and are read without the
+        // version, which a fold in place briefly replaces with an empty one
         let version = self.current.load();
         self.durable
-            && !version.layers.is_empty()
             && (self.wal_bytes.load(Relaxed) >= self.opts.wal_limit.saturating_mul(factor)
                 || version.resident_bytes as u64
                     >= (self.opts.memtable_limit as u64).saturating_mul(factor))
@@ -2006,11 +2012,14 @@ impl Store {
             floors: current.floors.clone(),
         }));
 
-        // the tx's snapshot goes first, so maintenance waiting on the
-        // writer finds no snapshot and can fold in place; the writer is
+        // the tx's snapshot and our hold on the old version go first, so
+        // nothing may see the new layer: then it folds straight into the
+        // oldest, and no maintenance is needed for it. The writer is
         // released only after publishing, so the next tx's snapshot
-        // includes this one
+        // includes this one.
+        drop(current);
         drop(snapshot);
+        self.fold_in_place_held(&self.snapshots(), INLINE_FOLD_LIMIT);
         drop(writer);
         if self.maintenance_due() {
             self.request_maintenance();
@@ -2303,13 +2312,15 @@ impl Shared {
     /// no tables, nothing lies beneath the oldest layer, so a fold that
     /// reaches it applies deletes instead of keeping tombstones.
     fn fold_once(&self) -> bool {
+        // folding in place needs no coordination with a checkpoint: one in
+        // flight holds the version, so the fold finds it shared and stops
+        if let Some(folded) = self.fold_in_place() {
+            return folded;
+        }
         let _layers = self
             .layer_work
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(folded) = self.fold_in_place() {
-            return folded;
-        }
         let before = self.current.load_full();
         let Some(start) = fold_plan(&before.layers, self.opts.max_layers) else {
             return false;
@@ -2354,12 +2365,28 @@ impl Shared {
     fn fold_in_place(&self) -> Option<bool> {
         let w = self.lock_writer();
         let snapshots = self.snapshots();
+        let folded = self.fold_in_place_held(&snapshots, usize::MAX);
+        drop(snapshots);
+        drop(w);
+        if folded == Some(true) {
+            self.progress();
+        }
+        folded
+    }
+
+    /// [`fold_in_place`](Self::fold_in_place) with the writer lock and the
+    /// snapshot registry already held, folding only if the layers above
+    /// the oldest hold no more than `limit` bytes.
+    fn fold_in_place_held(&self, snapshots: &BTreeMap<u64, usize>, limit: usize) -> Option<bool> {
         if !snapshots.is_empty() {
             return None;
         }
         let current = self.current.load_full();
         if current.layers.len() < 2 {
             return Some(false);
+        }
+        if current.layers[1..].iter().map(|l| l.bytes).sum::<usize>() > limit {
+            return None;
         }
         // what readers of stats see for the moment: nobody else can read
         // layers while the registry is held
@@ -2442,9 +2469,6 @@ impl Shared {
             tables,
             floors,
         }));
-        drop(snapshots);
-        drop(w);
-        self.progress();
         Some(true)
     }
 
@@ -4045,14 +4069,19 @@ mod tests {
     fn the_maintenance_thread_starts_when_first_needed() {
         let store = mem();
         put(&store, &[(1, Some(1))]);
+        put(&store, &[(2, Some(2))]);
         assert!(
             store.worker.lock().unwrap().is_none(),
-            "one layer needs no fold"
+            "commits nobody can see fold their own layers"
         );
-        put(&store, &[(2, Some(2))]);
+        // a snapshot keeps the layers apart, so folding them is left to
+        // the thread
+        let snap = store.snapshot();
+        put(&store, &[(3, Some(3))]);
         assert!(store.worker.lock().unwrap().is_some());
+        drop(snap);
         store.quiesce().unwrap();
-        assert_eq!(live_rows(&store).len(), 2);
+        assert_eq!(live_rows(&store).len(), 3);
     }
 
     /// The live keys of a run: how many, and the least and greatest.

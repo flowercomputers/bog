@@ -214,6 +214,7 @@ where
                 corrections.push((k.clone(), Edge::Val(o)), -d);
             }
         }
+        corrections.consolidate();
         for ((k, o), d) in corrections.diffs() {
             let Edge::Val(o) = o else {
                 unreachable!("corrections are values")

@@ -600,6 +600,7 @@ impl OpDag {
                     op.eval(tx, &inputs, node.out.as_any_mut());
                 }
             }
+            node.out.consolidate();
 
             // a failed tx will not commit, so nothing downstream needs to run
             if tx.failure().is_some() {

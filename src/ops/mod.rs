@@ -106,7 +106,10 @@ pub(crate) fn update_counts<T: Key>(
         return Ok(());
     }
     let mut view = tx.keyspace(ks);
-    view.resolve_sorted(changes, resolved)?;
+    view.resolve_sorted(
+        changes.into_iter().map(|(t, d)| (t, Change::Modify(d))),
+        resolved,
+    )?;
     for (t, change) in resolved.drain(..) {
         let change = match change {
             Change::Insert(0) => continue,

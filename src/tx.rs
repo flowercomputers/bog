@@ -2,7 +2,7 @@ use std::{
     any::Any,
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, btree_map::Entry},
     fmt,
     marker::PhantomData,
     ops::{Bound, RangeBounds},
@@ -86,18 +86,33 @@ impl TxState {
     }
 }
 
-/// Estimated resident bytes of one overlay entry.
-fn change_bytes<K: ResidentSize, M: Merge>(key: &K, change: &Change<M>) -> usize
+/// Estimated bytes a run's memory of a key's prior value holds.
+fn prior_bytes<M: Merge>(prior: &Prior<M::Value>) -> usize
 where
     M::Value: ResidentSize,
 {
-    let values = match change {
+    match prior {
+        Prior::Was(Some(v)) => heap_size(v),
+        _ => 0,
+    }
+}
+
+/// Estimated bytes a change's values hold beyond the change itself.
+fn value_bytes<M: Merge>(change: &Change<M>) -> usize
+where
+    M::Value: ResidentSize,
+{
+    match change {
         Change::Insert(v) | Change::Delete(v) => heap_size(v),
         Change::Replace(old, new) => heap_size(old) + heap_size(new),
         // never stored in an overlay: resolve materializes it first
         Change::Modify(_) => 0,
-    };
-    key.resident_size() + size_of::<Change<M>>() + values + ENTRY_OVERHEAD
+    }
+}
+
+/// Estimated resident bytes of one overlay entry, besides its values.
+fn slot_bytes<K: ResidentSize, M: Merge>(key: &K) -> usize {
+    key.resident_size() + size_of::<Slot<M>>() + ENTRY_OVERHEAD
 }
 
 /// Typed, copyable name of a keyspace. The key and merge types travel
@@ -127,6 +142,9 @@ pub trait ErasedUnderlay: Any {
 
     fn absorb_erased(&mut self, other: Box<dyn ErasedUnderlay>);
     fn is_empty(&self) -> bool;
+    /// Forget what this run's writes remember of before it, returning
+    /// the bytes that frees.
+    fn end_run(&mut self) -> usize;
     /// Turn this tx's changes into the committed form, a
     /// `Resident` of new values and tombstones, encoding each entry
     /// into `wal` on the way when there is one. Also returns the tree's
@@ -161,6 +179,53 @@ pub struct WriteTx<'tx> {
     run: u64,
 }
 
+/// One key's entry in a tx's overlay.
+pub(crate) struct Slot<M: Merge> {
+    /// The change since the tx began: `None` once writes cancelled it
+    /// out, kept so the run that did so still remembers what it was.
+    pub change: Option<Change<M>>,
+    /// The graph run that last wrote the key.
+    pub run: u64,
+    /// The key's value when that run began, while the run lasts.
+    pub prior: Prior<M::Value>,
+}
+
+/// What a key held when the run that last wrote it began.
+pub(crate) enum Prior<V> {
+    /// Not written this run, or the run has ended: `change` is current.
+    Stale,
+    /// No overlay entry: whatever the snapshot holds.
+    Absent,
+    /// The overlay's value then, `None` for a tombstone.
+    Was(Option<V>),
+}
+
+/// A tx's changes to one keyspace, by key.
+pub(crate) type Overlay<K, M> = BTreeMap<K, Slot<M>>;
+
+impl<M: Merge> Slot<M> {
+    /// The value the key has now, if the overlay decides it: `None` for
+    /// a tombstone, and `Err(())` when cancelled writes leave the snapshot
+    /// to decide.
+    #[inline]
+    pub fn value(&self) -> Option<Option<&M::Value>> {
+        self.change.as_ref().map(Change::new_value)
+    }
+
+    /// The value as of the start of `run`, if the overlay decides it.
+    pub fn value_as_of(&self, run: u64) -> Option<Option<&M::Value>> {
+        if self.run == run {
+            match &self.prior {
+                Prior::Stale => unreachable!("a run's writes keep their prior"),
+                Prior::Absent => None,
+                Prior::Was(v) => Some(v.as_ref()),
+            }
+        } else {
+            self.value()
+        }
+    }
+}
+
 impl<'tx> WriteTx<'tx> {
     pub(crate) fn new(
         snapshot: Snapshot<'tx>,
@@ -186,6 +251,11 @@ impl<'tx> WriteTx<'tx> {
     /// of the next run, and nothing counts as changed in it yet. See
     /// [`Keyspace::get_old`] and [`Keyspace::run_changes`].
     pub(crate) fn end_run(&mut self) {
+        let mut freed = 0;
+        for handle in self.overlay.values_mut() {
+            freed += handle.end_run();
+        }
+        self.state.grow(-(freed as isize));
         self.run += 1;
     }
 
@@ -247,22 +317,18 @@ impl<'tx> WriteTx<'tx> {
 /// the overlay. Every entry is an Insert/Delete/Replace; `resolve` on the
 /// [`Keyspace`] view turns incoming Modifies into those.
 pub struct KeyspaceHandle<K, M: Merge> {
-    inner: Register<K, M>,
-    /// Keys written in run `run`, each with its overlay entry from before
-    /// that run: `None` if it had none.
-    touched: BTreeMap<K, Option<Change<M>>>,
-    run: u64,
-    /// Estimated bytes `touched` holds.
-    touched_bytes: usize,
+    inner: Overlay<K, M>,
+    /// Keys written in the current run, each once.
+    touched: Vec<K>,
 }
 
 /// A transaction's view of one keyspace: its own writes plus the
 /// snapshot underneath. Borrowed from the tx for a few calls at a time.
 pub struct Keyspace<'a, 'tx, K, M: Merge> {
     id: KeyspaceId<K, M>,
-    writes: &'a mut Register<K, M>,
-    touched: &'a mut BTreeMap<K, Option<Change<M>>>,
-    touched_bytes: &'a mut usize,
+    writes: &'a mut Overlay<K, M>,
+    touched: &'a mut Vec<K>,
+    run: u64,
     state: &'a TxState,
     snap: &'a Snapshot<'tx>,
 }
@@ -270,10 +336,8 @@ pub struct Keyspace<'a, 'tx, K, M: Merge> {
 impl<K: Ord, M: Merge> Default for KeyspaceHandle<K, M> {
     fn default() -> Self {
         Self {
-            inner: Register::new(),
-            touched: BTreeMap::new(),
-            run: 0,
-            touched_bytes: 0,
+            inner: Overlay::new(),
+            touched: Vec::new(),
         }
     }
 }
@@ -298,12 +362,35 @@ where
             .into_any()
             .downcast::<KeyspaceHandle<K, M>>()
             .expect("absorb: keyspace id collision — two KS types share an id");
-        for (k, c) in other.inner {
-            self.inner.absorb_one(k, c);
+        for (k, slot) in other.inner {
+            if let Some(c) = slot.change {
+                self.inner.insert(
+                    k,
+                    Slot {
+                        change: Some(c),
+                        run: 0,
+                        prior: Prior::Stale,
+                    },
+                );
+            }
         }
     }
     fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.values().all(|s| s.change.is_none())
+    }
+    fn end_run(&mut self) -> usize {
+        let mut freed = 0;
+        for k in self.touched.drain(..) {
+            let slot = self.inner.get_mut(&k).expect("touched keys have slots");
+            freed += prior_bytes::<M>(&slot.prior) + k.resident_size() + ENTRY_OVERHEAD;
+            slot.prior = Prior::Stale;
+            // writes that cancelled out were kept only for the run's sake
+            if slot.change.is_none() {
+                self.inner.remove(&k);
+                freed += slot_bytes::<K, M>(&k);
+            }
+        }
+        freed
     }
     fn seal(self: Box<Self>, mut wal: Option<&mut Vec<u8>>) -> (Box<dyn Any + Send + Sync>, usize) {
         let mut bytes = 0;
@@ -311,6 +398,7 @@ where
         let tree: Resident<K, M::Value> = self
             .inner
             .into_iter()
+            .filter_map(|(k, slot)| Some((k, slot.change?)))
             .map(|(k, change)| {
                 let v = match change {
                     Change::Insert(v) | Change::Replace(_, v) => Some(v),
@@ -338,7 +426,7 @@ where
 {
     #[cfg(test)]
     pub(crate) fn inner_is_empty(&self) -> bool {
-        self.writes.is_empty()
+        self.writes.values().all(|s| s.change.is_none())
     }
 
     /// Record a materialized change. Fails if the tx has failed, including
@@ -352,26 +440,51 @@ where
             "resolve before absorbing"
         );
         self.state.check()?;
-        let mut delta = 0;
-        if !self.touched.contains_key(&key) {
-            // remember the key's entry from before this run
-            let prior = self.writes.get(&key).cloned();
-            let bytes = key.resident_size()
-                + prior.as_ref().map_or(0, |c| change_bytes::<K, M>(&key, c))
-                + ENTRY_OVERHEAD;
-            *self.touched_bytes += bytes;
-            delta += bytes as isize;
-            self.touched.insert(key.clone(), prior);
-        }
-        delta += self
-            .writes
-            .absorb_one_measured(key, change, change_bytes::<K, M>);
+        let delta = match self.writes.entry(key) {
+            Entry::Vacant(v) => {
+                // the entry, its change, and the run's memory of the key
+                let bytes = slot_bytes::<K, M>(v.key())
+                    + value_bytes::<M>(&change)
+                    + v.key().resident_size()
+                    + ENTRY_OVERHEAD;
+                self.touched.push(v.key().clone());
+                v.insert(Slot {
+                    change: Some(change),
+                    run: self.run,
+                    prior: Prior::Absent,
+                });
+                bytes as isize
+            }
+            Entry::Occupied(mut o) => {
+                let key_bytes = o.key().resident_size();
+                let mut delta = 0isize;
+                if o.get().run != self.run {
+                    // the first write of this run remembers the value
+                    // the key had when the run began
+                    self.touched.push(o.key().clone());
+                    let slot = o.get_mut();
+                    slot.run = self.run;
+                    slot.prior = match slot.value() {
+                        None => Prior::Absent,
+                        Some(v) => Prior::Was(v.cloned()),
+                    };
+                    delta += (prior_bytes::<M>(&slot.prior) + key_bytes + ENTRY_OVERHEAD) as isize;
+                }
+                let slot = o.get_mut();
+                let before = slot.change.as_ref().map_or(0, value_bytes::<M>);
+                slot.change = match slot.change.take() {
+                    Some(prev) => prev.compose(change),
+                    None => Some(change),
+                };
+                let after = slot.change.as_ref().map_or(0, value_bytes::<M>);
+                delta + after as isize - before as isize
+            }
+        };
         if self.state.grow(delta) {
             // release this keyspace's writes now; the tx drops the rest
             // the next time it opens a keyspace, or when it ends
-            *self.writes = Register::new();
+            *self.writes = Overlay::new();
             self.touched.clear();
-            *self.touched_bytes = 0;
             return self.state.check();
         }
         Ok(())
@@ -399,10 +512,11 @@ where
     /// wins (a Delete there shadows the snapshot), otherwise the snapshot.
     /// Overlay hits borrow; snapshot hits are owned.
     pub fn get(&self, key: &K) -> Result<Option<Cow<'_, M::Value>>> {
-        self.state.read(|| match self.writes.get(key) {
-            Some(c) => Ok(c.new_value().map(Cow::Borrowed)),
-            None => self.snap.get(self.id, key),
-        })
+        self.state
+            .read(|| match self.writes.get(key).and_then(Slot::value) {
+                Some(v) => Ok(v.map(Cow::Borrowed)),
+                None => self.snap.get(self.id, key),
+            })
     }
 
     /// Materialize `change` against the current value of `key`. Returns the
@@ -420,7 +534,7 @@ where
     /// changes land in `out` in key order.
     pub fn resolve_sorted(
         &self,
-        changes: Register<K, M>,
+        changes: impl IntoIterator<Item = (K, Change<M>)>,
         out: &mut Vec<(K, Change<M>)>,
     ) -> Result<()>
     where
@@ -430,8 +544,8 @@ where
         self.state.check()?;
         let mut lookup = self.snap.lookup(self.id);
         for (key, change) in changes {
-            let old = match self.writes.get(&key) {
-                Some(c) => c.new_value().map(Cow::Borrowed),
+            let old = match self.writes.get(&key).and_then(Slot::value) {
+                Some(v) => v.map(Cow::Borrowed),
                 None => lookup.get(&key).inspect_err(|e| self.state.fail(e))?,
             };
             if let Some(resolved) = materialize(old.as_deref(), change) {
@@ -469,16 +583,9 @@ where
     /// The value of `key` as of the start of this graph run: what
     /// [`get`](Self::get) returned before anything this run wrote.
     pub fn get_old(&self, key: &K) -> Result<Option<Cow<'_, M::Value>>> {
-        match self.touched.get(key) {
-            None => self.get(key),
-            Some(Some(prior)) => Ok(prior.new_value().map(Cow::Borrowed)),
-            // not in the overlay before this run: as of before the tx,
-            // which the entry written since remembers, or which the
-            // snapshot holds if the writes cancelled out
-            Some(None) => match self.writes.get(key) {
-                Some(c) => Ok(c.old_value().map(Cow::Borrowed)),
-                None => self.state.read(|| self.snap.get(self.id, key)),
-            },
+        match self.writes.get(key).and_then(|s| s.value_as_of(self.run)) {
+            Some(v) => Ok(v.map(Cow::Borrowed)),
+            None => self.state.read(|| self.snap.get(self.id, key)),
         }
     }
 
@@ -504,8 +611,8 @@ where
     {
         self.snap.cursor_as_of(
             self.id,
-            self.writes.map(),
-            &*self.touched,
+            &*self.writes,
+            self.run,
             range.start_bound().cloned(),
             range.end_bound().cloned(),
             rev,
@@ -526,21 +633,15 @@ where
         K: Clone,
         M::Value: PartialEq,
     {
-        for (k, prior) in self.touched.iter() {
-            let now = self.writes.get(k);
-            let old = match prior {
-                Some(c) => c.new_value(),
-                None => match now {
-                    Some(c) => c.old_value(),
-                    // written and cancelled within the run
-                    None => continue,
-                },
+        for k in self.touched.iter() {
+            let slot = &self.writes[k];
+            let old = match &slot.prior {
+                Prior::Was(v) => v.as_ref(),
+                // nothing before this run: as of before the tx
+                Prior::Absent => slot.change.as_ref().and_then(Change::old_value),
+                Prior::Stale => unreachable!("touched keys keep their prior"),
             };
-            let new = match now {
-                Some(c) => c.new_value(),
-                // cancelled back to its value before the tx
-                None => prior.as_ref().and_then(|c| c.old_value()),
-            };
+            let new = slot.change.as_ref().and_then(Change::new_value);
             let change = match (old, new) {
                 (None, None) => continue,
                 (Some(o), Some(n)) if o == n => continue,
@@ -558,7 +659,7 @@ where
     {
         self.snap.cursor(
             self.id,
-            Some(self.writes.map()),
+            Some(&*self.writes),
             lower,
             upper,
             rev,
@@ -618,18 +719,11 @@ impl<'tx> WriteTx<'tx> {
             .as_any_mut()
             .downcast_mut()
             .expect("keyspace id reused with a different type");
-        if handle.run != self.run {
-            // a new graph run: nothing written in it yet
-            handle.run = self.run;
-            handle.touched.clear();
-            self.state
-                .grow(-(std::mem::take(&mut handle.touched_bytes) as isize));
-        }
         Keyspace {
             id,
             writes: &mut handle.inner,
             touched: &mut handle.touched,
-            touched_bytes: &mut handle.touched_bytes,
+            run: self.run,
             state: &self.state,
             snap: &self.snapshot,
         }

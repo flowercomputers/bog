@@ -64,6 +64,9 @@ pub trait Buffer: Any + Send {
         Self: Sized;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// Put the buffer in the form readers expect; see [`Bag::consolidate`].
+    /// The graph does this to a node's output after every run.
+    fn consolidate(&mut self) {}
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -131,9 +134,6 @@ impl<K: Ord, M: Merge> Register<K, M> {
             }
         }
     }
-    pub(crate) fn map(&self) -> &BTreeMap<K, Change<M>> {
-        &self.inner
-    }
     pub fn get(&self, key: &K) -> Option<&Change<M>> {
         self.inner.get(key)
     }
@@ -156,16 +156,116 @@ impl<K: Ord, M: Merge> IntoIterator for Register<K, M> {
     }
 }
 
-/// Bag-specific helpers: every entry is a `Modify(delta)`.
-impl<T: Ord> Register<T, Delta> {
-    pub fn push(&mut self, data: T, delta: Delta) {
-        self.absorb_one(data, Change::Modify(delta));
+pub type Delta = i64;
+
+/// Rows at a multiplicity: a multiset. Pushing appends, so building one
+/// costs nothing per row; [`consolidate`](Self::consolidate) sorts it and
+/// merges equal rows once, which the graph does to every node's output
+/// after it runs, and which reading rows requires.
+pub struct Bag<T> {
+    rows: Vec<(T, Delta)>,
+    /// `rows[..sorted]` is sorted and consolidated.
+    sorted: usize,
+}
+
+impl<T> Default for Bag<T> {
+    fn default() -> Self {
+        Bag {
+            rows: Vec::new(),
+            sorted: 0,
+        }
     }
+}
+
+impl<T: Ord> Bag<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn push(&mut self, data: T, delta: Delta) {
+        if delta != 0 {
+            self.rows.push((data, delta));
+        }
+    }
+
+    /// Sort the rows and merge equal ones, dropping those whose
+    /// multiplicity reaches zero.
+    pub fn consolidate(&mut self) {
+        if self.sorted == self.rows.len() {
+            return;
+        }
+        self.rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out = 0;
+        for i in 0..self.rows.len() {
+            if out > 0 && self.rows[out - 1].0 == self.rows[i].0 {
+                let d = self.rows[i].1;
+                self.rows[out - 1].1 = self.rows[out - 1]
+                    .1
+                    .checked_add(d)
+                    .expect("multiplicity overflowed");
+                if self.rows[out - 1].1 == 0 {
+                    out -= 1;
+                }
+            } else {
+                self.rows.swap(out, i);
+                out += 1;
+            }
+        }
+        self.rows.truncate(out);
+        self.sorted = self.rows.len();
+    }
+
+    fn consolidated(&self) -> bool {
+        self.sorted == self.rows.len()
+    }
+
+    /// The rows, in order, each with its multiplicity. The bag must be
+    /// [consolidated](Self::consolidate).
     pub fn diffs(&self) -> impl Iterator<Item = (&T, Delta)> {
-        self.inner.iter().map(|(k, c)| match c {
-            Change::Modify(d) => (k, *d),
-            _ => unreachable!("bags only hold Modify"),
-        })
+        debug_assert!(self.consolidated(), "consolidate before reading a bag");
+        self.rows.iter().map(|(t, d)| (t, *d))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+impl<T: Ord> IntoIterator for Bag<T> {
+    type Item = (T, Delta);
+    type IntoIter = std::vec::IntoIter<(T, Delta)>;
+    /// The rows in order, consolidating first.
+    fn into_iter(mut self) -> Self::IntoIter {
+        self.consolidate();
+        self.rows.into_iter()
+    }
+}
+
+impl<T: Ord + Send + 'static> Buffer for Bag<T> {
+    fn empty() -> Self {
+        Self::default()
+    }
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.sorted = 0;
+    }
+    #[inline]
+    fn absorb(&mut self, other: &mut Self) {
+        self.rows.append(&mut other.rows);
+        other.sorted = 0;
+    }
+    fn consolidate(&mut self) {
+        Bag::consolidate(self)
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -188,8 +288,6 @@ impl<T: 'static + Send + Clone> Merge for Mergeless<T> {
         unreachable!("")
     }
 }
-pub type Delta = i64;
-pub type Bag<T> = Register<T, Delta>;
 
 // todo: make Underlay carry Change instead of ValOp?
 // when flushed to the storage, we convert it INTO valops
@@ -491,10 +589,10 @@ where
             }
         }
         let mut ks = tx.keyspace(self.counts);
-        if ks
-            .resolve_sorted(std::mem::take(&mut self.scratch), &mut self.resolved)
-            .is_err()
-        {
+        let scratch = std::mem::take(&mut self.scratch)
+            .into_iter()
+            .map(|(t, d)| (t, Change::Modify(d)));
+        if ks.resolve_sorted(scratch, &mut self.resolved).is_err() {
             self.resolved.clear();
             return;
         }
