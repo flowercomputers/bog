@@ -17,14 +17,19 @@ use crate::{
 /// parents are usually a table keyed by it. Its output is each run's
 /// violations, not a maintained relation: a rejected tx leaves nothing to
 /// retract.
-pub struct ForeignKey<L, R> {
+pub struct ForeignKey<L: State, R> {
+    dirty: Vec<L::Key>,
     children: L,
     parents: R,
 }
 
-impl<L, R> ForeignKey<L, R> {
+impl<L: State, R> ForeignKey<L, R> {
     pub fn new(children: L, parents: R) -> Self {
-        ForeignKey { children, parents }
+        ForeignKey {
+            dirty: Vec::new(),
+            children,
+            parents,
+        }
     }
 }
 
@@ -40,12 +45,12 @@ where
         r: &R::Delta,
         out: &mut Bag<L::Key>,
     ) -> Result<()> {
-        let mut dirty = Vec::new();
+        let dirty = &mut self.dirty;
         L::rows(l, &mut |k, _, _| dirty.push(k.clone()));
         R::rows(r, &mut |k, _, _| dirty.push(k.clone()));
         dirty.sort();
         dirty.dedup();
-        for k in dirty {
+        for k in dirty.drain(..) {
             if self.children.exists(tx, &k, When::New)?
                 && !self.parents.exists(tx, &k, When::New)?
             {

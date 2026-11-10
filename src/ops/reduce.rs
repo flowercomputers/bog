@@ -13,7 +13,7 @@ use crate::{
     tx::{KeyspaceId, WriteTx},
 };
 
-use super::{Key, Resolved, dirty_keys, read_group, update_counts};
+use super::{Key, Resolved, dirty_keys_into, read_group, update_counts};
 
 /// How much of a dirty key's group a reduction reads before calling its
 /// logic.
@@ -49,6 +49,8 @@ pub struct Aggregate<S: State, O: Clone + Send + 'static, F> {
     output: KeyspaceId<S::Key, Mergeless<O>>,
     take: Take,
     logic: F,
+    /// Scratch, reused across runs.
+    dirty: Vec<S::Key>,
     vals: Vec<(S::Value, Delta)>,
 }
 
@@ -59,6 +61,7 @@ impl<S: State, O: Clone + Send + 'static, F> Aggregate<S, O, F> {
             output,
             take: Take::Whole,
             logic,
+            dirty: Vec::new(),
             vals: Vec::new(),
         }
     }
@@ -84,16 +87,19 @@ where
         batches: &[&S::Delta],
         out: &mut Register<S::Key, Mergeless<O>>,
     ) -> Result<()> {
-        let mut dirty: Vec<S::Key> = batches.iter().flat_map(|b| dirty_keys::<S>(b)).collect();
-        if batches.len() > 1 {
-            dirty.sort();
-            dirty.dedup();
+        self.dirty.clear();
+        for b in batches {
+            dirty_keys_into::<S>(b, &mut self.dirty);
         }
-        for k in dirty {
-            read_group(&self.parent, tx, &k, When::New, self.take, &mut self.vals)?;
-            let new = (!self.vals.is_empty()).then(|| (self.logic)(&k, &self.vals));
+        if batches.len() > 1 {
+            self.dirty.sort();
+            self.dirty.dedup();
+        }
+        for k in &self.dirty {
+            read_group(&self.parent, tx, k, When::New, self.take, &mut self.vals)?;
+            let new = (!self.vals.is_empty()).then(|| (self.logic)(k, &self.vals));
             let mut ks = tx.keyspace(self.output);
-            let old = ks.get(&k)?.map(|o| o.into_owned());
+            let old = ks.get(k)?.map(|o| o.into_owned());
             let change = match (old, new) {
                 (None, None) => continue,
                 (Some(o), Some(n)) if o == n => continue,
@@ -102,7 +108,7 @@ where
                 (Some(o), Some(n)) => Change::Replace(o, n),
             };
             ks.absorb(k.clone(), change.clone())?;
-            out.absorb_one(k, change);
+            out.absorb_one(k.clone(), change);
         }
         Ok(())
     }
@@ -153,19 +159,22 @@ pub struct ReduceMany<S: State, O, F> {
     output: Arrangement<S::Key, O>,
     take: Take,
     logic: F,
+    /// Scratch, reused across runs.
+    dirty: Vec<S::Key>,
     vals: Vec<(S::Value, Delta)>,
     fresh: Vec<(O, Delta)>,
     old: Vec<(O, Delta)>,
     resolved: Resolved<S::Key, O>,
 }
 
-impl<S: State, O, F> ReduceMany<S, O, F> {
+impl<S: State, O: Ord, F> ReduceMany<S, O, F> {
     pub fn new(parent: S, output: Arrangement<S::Key, O>, logic: F) -> Self {
         ReduceMany {
             parent,
             output,
             take: Take::Whole,
             logic,
+            dirty: Vec::new(),
             vals: Vec::new(),
             fresh: Vec::new(),
             old: Vec::new(),
@@ -193,35 +202,35 @@ where
         batches: &[&S::Delta],
         out: &mut Bag<(S::Key, O)>,
     ) -> Result<()> {
-        let mut dirty: Vec<S::Key> = batches.iter().flat_map(|b| dirty_keys::<S>(b)).collect();
-        if batches.len() > 1 {
-            dirty.sort();
-            dirty.dedup();
+        self.dirty.clear();
+        for b in batches {
+            dirty_keys_into::<S>(b, &mut self.dirty);
         }
+        if batches.len() > 1 {
+            self.dirty.sort();
+            self.dirty.dedup();
+        }
+        // the corrections are the output: fresh results in, old ones out
         let output = Arranged::new(self.output, None);
-        let mut corrections = Bag::new();
-        for k in dirty {
-            read_group(&self.parent, tx, &k, When::New, self.take, &mut self.vals)?;
+        for k in &self.dirty {
+            read_group(&self.parent, tx, k, When::New, self.take, &mut self.vals)?;
             if !self.vals.is_empty() {
                 self.fresh.clear();
-                (self.logic)(&k, &self.vals, &mut self.fresh);
+                (self.logic)(k, &self.vals, &mut self.fresh);
                 for (o, d) in self.fresh.drain(..) {
-                    corrections.push((k.clone(), Edge::Val(o)), d);
+                    out.push((k.clone(), o), d);
                 }
             }
-            read_group(&output, tx, &k, When::New, Take::Whole, &mut self.old)?;
+            read_group(&output, tx, k, When::New, Take::Whole, &mut self.old)?;
             for (o, d) in self.old.drain(..) {
-                corrections.push((k.clone(), Edge::Val(o)), -d);
+                out.push((k.clone(), o), -d);
             }
         }
-        corrections.consolidate();
-        for ((k, o), d) in corrections.diffs() {
-            let Edge::Val(o) = o else {
-                unreachable!("corrections are values")
-            };
-            out.push((k.clone(), o.clone()), d);
-        }
-        update_counts(tx, self.output, corrections, &mut self.resolved)
+        out.consolidate();
+        let rows = out
+            .diffs()
+            .map(|((k, o), d)| ((k.clone(), Edge::Val(o.clone())), d));
+        update_counts(tx, self.output, rows, &mut self.resolved)
     }
 }
 
@@ -321,6 +330,7 @@ pub fn top_k<S>(
 ) -> ReduceMany<S, S::Value, TopK<S::Key, S::Value>>
 where
     S: State,
+    S::Value: Ord,
 {
     let logic: TopK<S::Key, S::Value> = Box::new(move |_, vals, out| {
         for (v, _) in vals.iter().rev().take(k) {

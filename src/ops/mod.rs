@@ -73,38 +73,81 @@ pub(crate) fn read_group<S: State>(
     }
 }
 
-/// The distinct keys of `delta`'s rows, in order.
-pub(crate) fn dirty_keys<S: State>(delta: &S::Delta) -> Vec<S::Key> {
-    let mut keys: Vec<S::Key> = Vec::new();
+/// Append the distinct keys of `delta`'s rows, in order, to `keys`.
+pub(crate) fn dirty_keys_into<S: State>(delta: &S::Delta, keys: &mut Vec<S::Key>) {
+    let start = keys.len();
     S::rows(delta, &mut |k, _, _| {
-        if keys.last() != Some(k) {
+        if keys[start..].last() != Some(k) {
             keys.push(k.clone());
         }
     });
-    keys
 }
 
-/// `delta`'s rows grouped by key, in key order.
-pub(crate) fn rows_by_key<S: State>(delta: &S::Delta) -> Vec<(S::Key, Vec<(S::Value, Delta)>)> {
-    let mut groups: Vec<(S::Key, Vec<(S::Value, Delta)>)> = Vec::new();
-    S::rows(delta, &mut |k, v, d| match groups.last_mut() {
-        Some((last, rows)) if last == k => rows.push((v.clone(), d)),
-        _ => groups.push((k.clone(), vec![(v.clone(), d)])),
-    });
-    groups
+/// A delta's rows grouped by key, in key order: an operator's scratch,
+/// refilled every run so a steady state allocates nothing.
+pub(crate) struct Groups<K, V> {
+    keys: Vec<K>,
+    rows: Vec<(V, Delta)>,
+    /// Where each key's rows end.
+    ends: Vec<usize>,
 }
 
-/// Add `changes` to the counts in `ks`, removing counts that reach zero.
+impl<K, V> Default for Groups<K, V> {
+    fn default() -> Self {
+        Groups {
+            keys: Vec::new(),
+            rows: Vec::new(),
+            ends: Vec::new(),
+        }
+    }
+}
+
+impl<K: Clone + PartialEq, V: Clone> Groups<K, V> {
+    /// Replace the contents with `delta`'s rows.
+    pub fn fill<S: State<Key = K, Value = V>>(&mut self, delta: &S::Delta) {
+        let (keys, rows, ends) = (&mut self.keys, &mut self.rows, &mut self.ends);
+        keys.clear();
+        rows.clear();
+        ends.clear();
+        S::rows(delta, &mut |k, v, d| {
+            if keys.last() != Some(k) {
+                if !keys.is_empty() {
+                    ends.push(rows.len());
+                }
+                keys.push(k.clone());
+            }
+            rows.push((v.clone(), d));
+        });
+        if !keys.is_empty() {
+            ends.push(rows.len());
+        }
+    }
+
+    /// The distinct keys, in order.
+    pub fn keys(&self) -> &[K] {
+        &self.keys
+    }
+
+    /// Each key with its rows.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &[(V, Delta)])> {
+        let mut start = 0;
+        self.keys.iter().zip(&self.ends).map(move |(k, &end)| {
+            let group = &self.rows[start..end];
+            start = end;
+            (k, group)
+        })
+    }
+}
+
+/// Add `changes`, sorted and consolidated, to the counts in `ks`,
+/// removing counts that reach zero.
 pub(crate) fn update_counts<T: Key>(
     tx: &mut WriteTx,
     ks: KeyspaceId<T, Delta>,
-    changes: Bag<T>,
+    changes: impl IntoIterator<Item = (T, Delta)>,
     resolved: &mut Vec<(T, Change<Delta>)>,
 ) -> Result<()> {
     resolved.clear();
-    if changes.is_empty() {
-        return Ok(());
-    }
     let mut view = tx.keyspace(ks);
     view.resolve_sorted(
         changes.into_iter().map(|(t, d)| (t, Change::Modify(d))),
@@ -121,6 +164,24 @@ pub(crate) fn update_counts<T: Key>(
     Ok(())
 }
 
+/// Sorted rows `(key, _)` reduced to each key's total multiplicity.
+pub(crate) fn key_totals<'a, K, V>(
+    rows: impl Iterator<Item = (&'a (K, V), Delta)> + 'a,
+) -> impl Iterator<Item = (K, Delta)> + 'a
+where
+    K: Clone + PartialEq + 'a,
+    V: 'a,
+{
+    let mut rows = rows.peekable();
+    std::iter::from_fn(move || {
+        let ((k, _), mut total) = rows.next()?;
+        while let Some((_, d)) = rows.next_if(|((k2, _), _)| k2 == k) {
+            total = total.checked_add(d).expect("multiplicity overflowed");
+        }
+        Some((k.clone(), total))
+    })
+}
+
 /// `a * b`, which must not overflow.
 pub(crate) fn multiply(a: Delta, b: Delta) -> Delta {
     a.checked_mul(b).expect("multiplicity overflowed")
@@ -135,11 +196,12 @@ pub(crate) fn multiply(a: Delta, b: Delta) -> Delta {
 pub struct Arrange<K, V> {
     id: Arrangement<K, V>,
     totals: KeyspaceId<K, Delta>,
+    /// Scratch, reused across runs.
     resolved: Resolved<K, V>,
     resolved_totals: Vec<(K, Change<Delta>)>,
 }
 
-impl<K, V> Arrange<K, V> {
+impl<K: Ord, V: Ord> Arrange<K, V> {
     pub fn new(arrangement: Arrangement<K, V>, totals: KeyspaceId<K, Delta>) -> Self {
         Arrange {
             id: arrangement,
@@ -164,16 +226,26 @@ impl<K: Key, V: Key + Ord> Nary for Arrange<K, V> {
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<(K, V)>], out: &mut Bag<(K, V)>) {
-        let (mut rows, mut totals) = (Bag::new(), Bag::new());
+        // the output is the rows to arrange, so it is built first and the
+        // arrangement's rows and totals are read off it
         for b in batches {
             for ((k, v), d) in b.diffs() {
-                rows.push((k.clone(), Edge::Val(v.clone())), d);
-                totals.push(k.clone(), d);
                 out.push((k.clone(), v.clone()), d);
             }
         }
-        let done = update_counts(tx, self.id, rows, &mut self.resolved)
-            .and_then(|()| update_counts(tx, self.totals, totals, &mut self.resolved_totals));
+        // linear when there is one input, which arrives sorted
+        out.consolidate();
+        let rows = out
+            .diffs()
+            .map(|((k, v), d)| ((k.clone(), Edge::Val(v.clone())), d));
+        let done = update_counts(tx, self.id, rows, &mut self.resolved).and_then(|()| {
+            update_counts(
+                tx,
+                self.totals,
+                key_totals(out.diffs()),
+                &mut self.resolved_totals,
+            )
+        });
         if done.is_err() {
             // the tx failed; the graph stops here
             out.clear();

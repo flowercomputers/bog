@@ -323,9 +323,22 @@ struct Version {
     /// Keyspace id to the epoch it was truncated at; tables no newer than
     /// that hold nothing visible for it. Mirrors the manifest's floors.
     floors: Arc<BTreeMap<u64, u64>>,
+    /// Layers through this epoch are being written to a table: a
+    /// checkpoint in flight. They are read as before, but no fold may
+    /// change them or merge newer layers into them, since the checkpoint
+    /// drops them by epoch when it installs.
+    frozen: Option<u64>,
 }
 
 impl Version {
+    /// The index of the first layer a fold may touch.
+    fn live_from(&self) -> usize {
+        match self.frozen {
+            Some(through) => self.layers.partition_point(|l| l.epoch <= through),
+            None => 0,
+        }
+    }
+
     /// The tables that can hold visible data for `ks`, newest first.
     fn tables_for(&self, ks: u64) -> impl Iterator<Item = &Arc<Table>> {
         let floor = self.floors.get(&ks).copied().unwrap_or(0);
@@ -1007,18 +1020,34 @@ where
     K: OrderedCodec + Send + Sync + 'static,
     V: Codec + Send + Sync + 'static,
 {
-    let mut merged: BTreeMap<&K, &Option<V>> = BTreeMap::new();
-    for tree in trees {
-        let tree = tree
-            .downcast_ref::<Resident<K, V>>()
-            .expect("layer tree has the registered type");
-        for (k, v) in tree {
-            // newest first, so the first sighting of a key wins
-            merged.entry(k).or_insert(v);
-        }
-    }
+    // a k-way merge of the sorted trees, streamed out: nothing is built
+    // first, so a checkpoint of a large layer costs no memory
+    let mut its: Vec<_> = trees
+        .iter()
+        .map(|t| {
+            t.downcast_ref::<Resident<K, V>>()
+                .expect("layer tree has the registered type")
+                .iter()
+                .peekable()
+        })
+        .collect();
     let (mut key, mut value) = (Vec::new(), Vec::new());
-    for (k, v) in merged {
+    loop {
+        // the least head key; among equals, the newest tree's, which
+        // comes first
+        let mut win: Option<(usize, &K)> = None;
+        for (i, it) in its.iter_mut().enumerate() {
+            if let Some(&(k, _)) = it.peek()
+                && win.is_none_or(|(_, best)| k < best)
+            {
+                win = Some((i, k));
+            }
+        }
+        let Some((w, _)) = win else { break };
+        let (k, v) = its[w].next().expect("the winner has a head");
+        for it in its.iter_mut() {
+            it.next_if(|(other, _)| *other == k);
+        }
         key.clear();
         value.clear();
         k.encode_ordered(&mut key);
@@ -1806,6 +1835,7 @@ impl Store {
                 tables,
                 resident_bytes: bytes,
                 floors: Arc::new(writer.manifest.floors.clone()),
+                frozen: None,
             }),
             durable: writer.dir.is_some(),
             writer: Mutex::new(writer),
@@ -2010,6 +2040,7 @@ impl Store {
             layers,
             tables: current.tables.clone(),
             floors: current.floors.clone(),
+            frozen: current.frozen,
         }));
 
         // the tx's snapshot and our hold on the old version go first, so
@@ -2157,6 +2188,7 @@ impl Shared {
             layers,
             tables: version.tables.clone(),
             floors,
+            frozen: version.frozen,
         }));
         Ok(())
     }
@@ -2165,7 +2197,9 @@ impl Shared {
     /// tables to compact.
     fn maintenance_due(&self) -> bool {
         let v = self.current.load();
-        v.layers.len() >= 2 || v.tables.len() > self.opts.max_tables || self.over_limits(1)
+        v.layers.len() - v.live_from() >= 2
+            || v.tables.len() > self.opts.max_tables
+            || self.over_limits(1)
     }
 
     /// Wake the maintenance thread, starting it if this is the first
@@ -2322,9 +2356,11 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let before = self.current.load_full();
-        let Some(start) = fold_plan(&before.layers, self.opts.max_layers) else {
+        let from = before.live_from();
+        let Some(start) = fold_plan(&before.layers[from..], self.opts.max_layers) else {
             return false;
         };
+        let start = from + start;
         let window = &before.layers[start..];
         let drop_tombstones = start == 0 && before.tables.is_empty();
         let merged = self.merge_layers(window, drop_tombstones);
@@ -2332,6 +2368,7 @@ impl Shared {
         let w = self.lock_writer();
         let now = self.current.load_full();
         let in_place = now.layers.len() >= before.layers.len()
+            && now.live_from() <= start
             && now.layers[start..before.layers.len()]
                 .iter()
                 .zip(window)
@@ -2346,6 +2383,7 @@ impl Shared {
                 layers,
                 tables: now.tables.clone(),
                 floors: now.floors.clone(),
+                frozen: now.frozen,
             }));
         }
         drop(w);
@@ -2382,10 +2420,16 @@ impl Shared {
             return None;
         }
         let current = self.current.load_full();
-        if current.layers.len() < 2 {
+        let from = current.live_from();
+        if current.layers.len() - from < 2 {
             return Some(false);
         }
-        if current.layers[1..].iter().map(|l| l.bytes).sum::<usize>() > limit {
+        if current.layers[from + 1..]
+            .iter()
+            .map(|l| l.bytes)
+            .sum::<usize>()
+            > limit
+        {
             return None;
         }
         // what readers of stats see for the moment: nobody else can read
@@ -2396,6 +2440,7 @@ impl Shared {
             tables: current.tables.clone(),
             resident_bytes: 0,
             floors: current.floors.clone(),
+            frozen: current.frozen,
         });
         drop(current);
         let version = match Arc::try_unwrap(self.current.swap(stand_in)) {
@@ -2410,25 +2455,34 @@ impl Shared {
             layers,
             tables,
             floors,
+            frozen,
             ..
         } = version;
         let mut layers = layers.into_iter();
-        let mut base = match Arc::try_unwrap(layers.next().expect("two layers")) {
+        // frozen layers stay as they are, beneath the fold
+        let mut folded: Vec<Arc<Layer>> = layers.by_ref().take(from).collect();
+        // nothing lies beneath the oldest layer without tables
+        let drop_tombstones = from == 0 && tables.is_empty();
+        let restore = |this: &Self, folded: Vec<Arc<Layer>>, rest: Vec<Arc<Layer>>| {
+            let mut layers = folded;
+            layers.extend(rest);
+            this.current.store(Arc::new(Version {
+                epoch,
+                resident_bytes: layers.iter().map(|l| l.bytes).sum(),
+                layers,
+                tables,
+                floors,
+                frozen,
+            }));
+        };
+        let mut base = match Arc::try_unwrap(layers.next().expect("two live layers")) {
             Ok(base) => base,
             Err(shared) => {
-                let layers: Vec<_> = std::iter::once(shared).chain(layers).collect();
-                self.current.store(Arc::new(Version {
-                    epoch,
-                    resident_bytes: layers.iter().map(|l| l.bytes).sum(),
-                    layers,
-                    tables,
-                    floors,
-                }));
+                let rest: Vec<_> = std::iter::once(shared).chain(layers).collect();
+                restore(self, folded, rest);
                 return None;
             }
         };
-        // nothing lies beneath the oldest layer without tables
-        let drop_tombstones = tables.is_empty();
         for layer in layers {
             let (newest, trees) = match Arc::try_unwrap(layer) {
                 Ok(l) => (l.epoch, l.trees),
@@ -2457,18 +2511,10 @@ impl Shared {
             base.epoch = newest;
         }
         base.bytes = base.trees.values().map(|t| t.bytes).sum();
-        let layers = if base.trees.is_empty() {
-            Vec::new()
-        } else {
-            vec![Arc::new(base)]
-        };
-        self.current.store(Arc::new(Version {
-            epoch,
-            resident_bytes: layers.iter().map(|l| l.bytes).sum(),
-            layers,
-            tables,
-            floors,
-        }));
+        if !base.trees.is_empty() {
+            folded.push(Arc::new(base));
+        }
+        restore(self, folded, Vec::new());
         Some(true)
     }
 
@@ -2543,7 +2589,7 @@ impl Shared {
 
         // freeze: everything committed so far goes in the table, and the
         // WAL moves to a new segment, so the old ones hold only that
-        let (dir, version, ckpt, retired, frozen_wal) = {
+        let (dir, frozen, ckpt, retired, frozen_wal) = {
             let mut w = self.lock_writer();
             w.check()?;
             let Some(dir) = w.dir.clone() else {
@@ -2561,6 +2607,7 @@ impl Shared {
                     .all(|l| l.epoch > w.manifest.checkpointed()),
                 "every layer is newer than every table"
             );
+            debug_assert!(version.frozen.is_none(), "one checkpoint at a time");
             // reserve a file number; it reaches disk with a later manifest,
             // and a crash before then leaves an orphan the next open sweeps
             let ckpt = Checkpoint {
@@ -2585,23 +2632,47 @@ impl Shared {
                 w.install_manifest(&dir, next)?;
                 w.wal = Some(fresh);
             }
-            (dir, version, ckpt, retired, self.wal_bytes.load(Relaxed))
+            // freeze every layer: commits keep folding into new ones above
+            // them while the table is written
+            self.current.store(Arc::new(Version {
+                epoch: version.epoch,
+                layers: version.layers.clone(),
+                tables: version.tables.clone(),
+                resident_bytes: version.resident_bytes,
+                floors: version.floors.clone(),
+                frozen: Some(version.epoch),
+            }));
+            let frozen: Vec<Arc<Layer>> = version.layers.clone();
+            (dir, frozen, ckpt, retired, self.wal_bytes.load(Relaxed))
         };
 
         // write the table without locks; files left by a failure are
         // orphans the next open sweeps
         let path = dir.join(ckpt.file_name());
-        let table = self.write_checkpoint(&path, &version, ckpt)?;
+        let table = match self.write_checkpoint(&path, &frozen, ckpt) {
+            Ok(table) => table,
+            Err(e) => {
+                self.thaw();
+                return Err(e);
+            }
+        };
+        drop(frozen);
 
-        // install: the table replaces the layers it holds, which are all
-        // at or below its epoch, since only this thread folds layers
+        // install: the table replaces the frozen layers, which are all at
+        // or below its epoch, and nothing has been folded into them
         let mut w = self.lock_writer();
-        w.check()?;
+        if let Err(e) = w.check() {
+            self.thaw();
+            return Err(e);
+        }
         let mut next = w.manifest.clone();
         next.checkpoints.push(ckpt);
         next.segments.retain(|s| !retired.contains(&s.number));
         next.prune_floors();
-        w.install_manifest(&dir, next)?;
+        if let Err(e) = w.install_manifest(&dir, next) {
+            self.thaw();
+            return Err(e);
+        }
         let now = self.current.load_full();
         let layers: Vec<Arc<Layer>> = now
             .layers
@@ -2617,6 +2688,7 @@ impl Shared {
             layers,
             tables,
             floors: Arc::new(w.manifest.floors.clone()),
+            frozen: None,
         }));
         self.wal_bytes.fetch_sub(frozen_wal, Relaxed);
         drop(w);
@@ -2632,18 +2704,36 @@ impl Shared {
         Ok(Some(ckpt.epoch))
     }
 
-    /// Write `version`'s layers to a checkpoint table at `path`.
-    fn write_checkpoint(&self, path: &Path, version: &Version, ckpt: Checkpoint) -> Result<Table> {
+    /// Unfreeze the layers a failed checkpoint froze, so folds resume;
+    /// the next checkpoint freezes them again.
+    fn thaw(&self) {
+        let _w = self.lock_writer();
+        let now = self.current.load_full();
+        self.current.store(Arc::new(Version {
+            epoch: now.epoch,
+            layers: now.layers.clone(),
+            tables: now.tables.clone(),
+            resident_bytes: now.resident_bytes,
+            floors: now.floors.clone(),
+            frozen: None,
+        }));
+    }
+
+    /// Write `layers`, oldest first, to a checkpoint table at `path`.
+    fn write_checkpoint(
+        &self,
+        path: &Path,
+        layers: &[Arc<Layer>],
+        ckpt: Checkpoint,
+    ) -> Result<Table> {
         let mut table = TableBuilder::create(path, self.opts.block_size)?;
         let mut built = BuiltIndexes::default();
-        let ids: BTreeSet<u64> = version
-            .layers
+        let ids: BTreeSet<u64> = layers
             .iter()
             .flat_map(|l| l.trees.keys().copied())
             .collect();
         for ks in ids {
-            let trees: Vec<&(dyn Any + Send + Sync)> = version
-                .layers
+            let trees: Vec<&(dyn Any + Send + Sync)> = layers
                 .iter()
                 .rev()
                 .filter_map(|l| l.trees.get(&ks).map(|t| &*t.tree))
@@ -2836,6 +2926,7 @@ impl Shared {
                 tables,
                 resident_bytes: current.resident_bytes,
                 floors,
+                frozen: current.frozen,
             }));
         }
 

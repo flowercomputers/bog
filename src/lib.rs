@@ -190,12 +190,16 @@ impl<T: Ord> Bag<T> {
     }
 
     /// Sort the rows and merge equal ones, dropping those whose
-    /// multiplicity reaches zero.
+    /// multiplicity reaches zero. Linear for rows already in order.
     pub fn consolidate(&mut self) {
         if self.sorted == self.rows.len() {
             return;
         }
         self.rows.sort_by(|a, b| a.0.cmp(&b.0));
+        if self.rows.windows(2).all(|w| w[0].0 < w[1].0) {
+            self.sorted = self.rows.len();
+            return;
+        }
         let mut out = 0;
         for i in 0..self.rows.len() {
             if out > 0 && self.rows[out - 1].0 == self.rows[i].0 {
@@ -229,6 +233,14 @@ impl<T: Ord> Bag<T> {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// Take the rows, in order, consolidating first; the bag keeps its
+    /// allocation.
+    pub fn drain(&mut self) -> impl Iterator<Item = (T, Delta)> + '_ {
+        self.consolidate();
+        self.sorted = 0;
+        self.rows.drain(..)
     }
 }
 
@@ -503,22 +515,38 @@ where
         batches: &[&Bag<(K, V)>],
         out: &mut Register<K, (i64, V)>,
     ) {
-        // 1. every row becomes a Modify; equal keys combine on the way in
-        self.scratch.clear();
-        for b in batches {
-            for ((k, v), d) in b.diffs() {
-                let mut diff = (1, v.clone());
-                <(i64, V)>::scale(&mut diff, d);
-                self.scratch.absorb_one(k.clone(), Change::Modify(diff));
-            }
-        }
-
-        // 2. one sorted sweep resolves every Modify against the keyspace
+        // 1. every row becomes a Modify, equal keys combined: streamed
+        // off a single input, which is sorted; merged through the scratch
+        // register when there are several
         let mut ks = tx.keyspace(self.ks);
-        if ks
-            .resolve_sorted(std::mem::take(&mut self.scratch), &mut self.resolved)
-            .is_err()
-        {
+        let diff = |v: &V, d: Delta| {
+            let mut diff = (1, v.clone());
+            <(i64, V)>::scale(&mut diff, d);
+            diff
+        };
+        // 2. one sorted sweep resolves every Modify against the keyspace
+        let resolved = if let [only] = batches {
+            let mut rows = only.diffs().peekable();
+            let changes = std::iter::from_fn(|| {
+                let ((k, v), d) = rows.next()?;
+                let mut acc = diff(v, d);
+                while let Some(((_, v), d)) = rows.next_if(|((k2, _), _)| k2 == k) {
+                    <(i64, V)>::combine(&mut acc, std::iter::once(Cow::Owned(diff(v, d))));
+                }
+                Some((k.clone(), Change::Modify(acc)))
+            });
+            ks.resolve_sorted(changes, &mut self.resolved)
+        } else {
+            self.scratch.clear();
+            for b in batches {
+                for ((k, v), d) in b.diffs() {
+                    self.scratch
+                        .absorb_one(k.clone(), Change::Modify(diff(v, d)));
+                }
+            }
+            ks.resolve_sorted(std::mem::take(&mut self.scratch), &mut self.resolved)
+        };
+        if resolved.is_err() {
             // the tx failed, and with it this epoch; the graph stops here
             self.resolved.clear();
             return;
@@ -582,17 +610,22 @@ where
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], out: &mut Bag<T>) {
-        self.scratch.clear();
-        for b in batches {
-            for (t, d) in b.diffs() {
-                self.scratch.push(t.clone(), d);
-            }
-        }
         let mut ks = tx.keyspace(self.counts);
-        let scratch = std::mem::take(&mut self.scratch)
-            .into_iter()
-            .map(|(t, d)| (t, Change::Modify(d)));
-        if ks.resolve_sorted(scratch, &mut self.resolved).is_err() {
+        // a single input is sorted already; several merge through the scratch
+        let resolved = if let [only] = batches {
+            let changes = only.diffs().map(|(t, d)| (t.clone(), Change::Modify(d)));
+            ks.resolve_sorted(changes, &mut self.resolved)
+        } else {
+            self.scratch.clear();
+            for b in batches {
+                for (t, d) in b.diffs() {
+                    self.scratch.push(t.clone(), d);
+                }
+            }
+            let scratch = self.scratch.drain().map(|(t, d)| (t, Change::Modify(d)));
+            ks.resolve_sorted(scratch, &mut self.resolved)
+        };
+        if resolved.is_err() {
             self.resolved.clear();
             return;
         }

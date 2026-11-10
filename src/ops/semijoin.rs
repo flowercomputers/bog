@@ -5,13 +5,13 @@
 //! [`without`]: Semijoin::without
 
 use crate::{
-    Bag, Binary,
+    Bag, Binary, Delta,
     error::Result,
     state::{State, When},
     tx::WriteTx,
 };
 
-use super::{Take, read_group, rows_by_key};
+use super::{Groups, Take, read_group};
 
 /// Passes left rows `(k, a)` while the right side has a row of key `k`
 /// ([`matching`](Self::matching), SQL's `EXISTS`), or while it has none
@@ -23,28 +23,35 @@ use super::{Take, read_group, rows_by_key};
 /// not; for one that starts or stops passing, its whole left group is
 /// emitted or retracted. A right row at a nonpositive multiplicity does
 /// not count.
-pub struct Semijoin<L, R> {
+pub struct Semijoin<L: State, R> {
     anti: bool,
     left: L,
     right: R,
+    /// Scratch, reused across runs.
+    rows: Groups<L::Key, L::Value>,
+    dirty: Vec<L::Key>,
+    group: Vec<(L::Value, Delta)>,
 }
 
-impl<L, R> Semijoin<L, R> {
+impl<L: State, R> Semijoin<L, R> {
     /// Left rows whose key the right side has.
     pub fn matching(left: L, right: R) -> Self {
-        Semijoin {
-            anti: false,
-            left,
-            right,
-        }
+        Self::new(false, left, right)
     }
 
     /// Left rows whose key the right side lacks.
     pub fn without(left: L, right: R) -> Self {
+        Self::new(true, left, right)
+    }
+
+    fn new(anti: bool, left: L, right: R) -> Self {
         Semijoin {
-            anti: true,
+            anti,
             left,
             right,
+            rows: Groups::default(),
+            dirty: Vec::new(),
+            group: Vec::new(),
         }
     }
 }
@@ -62,28 +69,29 @@ where
         r: &R::Delta,
         out: &mut Bag<(L::Key, L::Value)>,
     ) -> Result<()> {
-        let left = rows_by_key::<L>(l);
-        let mut dirty: Vec<L::Key> = left.iter().map(|(k, _)| k.clone()).collect();
+        self.rows.fill::<L>(l);
+        let dirty = &mut self.dirty;
+        dirty.clear();
+        dirty.extend_from_slice(self.rows.keys());
         R::rows(r, &mut |k, _, _| dirty.push(k.clone()));
         dirty.sort();
         dirty.dedup();
-        let mut left = left.into_iter().peekable();
-        let mut group = Vec::new();
-        for k in dirty {
+        let mut left = self.rows.iter().peekable();
+        for k in &self.dirty {
             let rows = left.next_if(|(lk, _)| *lk == k).map(|(_, rows)| rows);
-            let was = self.right.exists(tx, &k, When::Old)? != self.anti;
-            let now = self.right.exists(tx, &k, When::New)? != self.anti;
+            let was = self.right.exists(tx, k, When::Old)? != self.anti;
+            let now = self.right.exists(tx, k, When::New)? != self.anti;
             if was == now {
                 if now {
                     for (a, d) in rows.into_iter().flatten() {
-                        out.push((k.clone(), a), d);
+                        out.push((k.clone(), a.clone()), *d);
                     }
                 }
                 continue;
             }
             let (when, sign) = if now { (When::New, 1) } else { (When::Old, -1) };
-            read_group(&self.left, tx, &k, when, Take::Whole, &mut group)?;
-            for (a, d) in group.drain(..) {
+            read_group(&self.left, tx, k, when, Take::Whole, &mut self.group)?;
+            for (a, d) in self.group.drain(..) {
                 out.push((k.clone(), a), sign * d);
             }
         }
