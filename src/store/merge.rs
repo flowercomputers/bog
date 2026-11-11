@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, convert::Infallible};
 
 use bytes::Bytes;
 
@@ -288,4 +288,92 @@ pub trait IndexBuilder<K, M: Merge> {
     fn push(&mut self, key: &K, op: &ValOp<M>);
     /// `None` declines: not worth a section for this run.
     fn finish(self) -> Option<Bytes>;
+}
+
+// an opaque type without merges (emitted by tables, etc)
+#[repr(transparent)]
+pub struct Mergeless<T>(T);
+impl<T: 'static + Send + Clone> Merge for Mergeless<T> {
+    type Diff = Infallible;
+    type Value = T;
+    fn base() -> Self::Value {
+        unreachable!("")
+    }
+    fn merge<'a>(_: &mut Self::Value, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        unreachable!("")
+    }
+    fn combine<'a>(_: &mut Self::Diff, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {
+        unreachable!("")
+    }
+    fn scale(_: &mut Self::Diff, _: Delta) {
+        unreachable!("")
+    }
+}
+
+// todo: make Underlay carry Change instead of ValOp?
+// when flushed to the storage, we convert it INTO valops
+pub enum Change<M: Merge> {
+    Insert(M::Value),
+    Delete(M::Value),            // old value attached
+    Replace(M::Value, M::Value), // old, new
+    Modify(M::Diff),             // a Merge diff, no values needed
+}
+impl<M: Merge> Clone for Change<M> {
+    fn clone(&self) -> Self {
+        use Change::*;
+        match self {
+            Insert(v) => Insert(v.clone()),
+            Delete(v) => Delete(v.clone()),
+            Replace(o, n) => Replace(o.clone(), n.clone()),
+            Modify(d) => Modify(d.clone()),
+        }
+    }
+}
+
+impl<M: Merge> Change<M> {
+    /// The value at this key after the change, if any.
+    pub fn new_value(&self) -> Option<&M::Value> {
+        match self {
+            Change::Insert(v) | Change::Replace(_, v) => Some(v),
+            Change::Delete(_) => None,
+            Change::Modify(_) => unreachable!("Modify has no materialized value"),
+        }
+    }
+    /// The value at this key before the change, if any.
+    pub fn old_value(&self) -> Option<&M::Value> {
+        match self {
+            Change::Delete(v) | Change::Replace(v, _) => Some(v),
+            Change::Insert(_) => None,
+            Change::Modify(_) => unreachable!("Modify has no materialized value"),
+        }
+    }
+    pub fn compose(self, next: Self) -> Option<Self> {
+        use Change::*;
+        Some(match (self, next) {
+            (Insert(_), Delete(_)) => return None,
+            (Insert(_), Insert(b)) | (Insert(_), Replace(_, b)) => Insert(b),
+            (Insert(mut a), Modify(d)) => {
+                M::merge(&mut a, std::iter::once(Cow::Owned(d)));
+                Insert(a)
+            }
+            (Delete(o), Insert(b)) | (Delete(o), Replace(_, b)) => Replace(o, b),
+            (Delete(o), Delete(_)) => Delete(o),
+            (Delete(o), Modify(d)) => {
+                let mut v = M::base();
+                M::merge(&mut v, std::iter::once(Cow::Owned(d)));
+                Replace(o, v)
+            }
+            (Replace(o, _), Insert(b)) | (Replace(o, _), Replace(_, b)) => Replace(o, b),
+            (Replace(o, _), Delete(_)) => Delete(o),
+            (Replace(o, mut a), Modify(d)) => {
+                M::merge(&mut a, std::iter::once(Cow::Owned(d)));
+                Replace(o, a)
+            }
+            (Modify(mut a), Modify(b)) => {
+                M::combine(&mut a, std::iter::once(Cow::Owned(b)));
+                Modify(a)
+            }
+            (Modify(_), _) => unreachable!("change register into delta register"),
+        })
+    }
 }

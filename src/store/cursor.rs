@@ -22,7 +22,7 @@ use crate::{
     error::{Error, Result},
     merge::Merge,
     store::Resident,
-    table::TableCursor,
+    store::table::TableCursor,
     tx::TxState,
 };
 

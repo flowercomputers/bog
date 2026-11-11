@@ -176,12 +176,12 @@ where
 /// that stores nothing.
 pub(crate) struct FilterMappedReader<K, V, W> {
     pub parent: Arc<dyn KeyedReader<K, V>>,
-    pub f: super::dynstate::ValueMap<K, V, W>,
+    pub f: crate::stream::dynstate::ValueMap<K, V, W>,
 }
 
 struct FilterMappedSeek<'s, K, V, W> {
     inner: Box<dyn Seeker<K, V> + 's>,
-    f: super::dynstate::ValueMap<K, V, W>,
+    f: crate::stream::dynstate::ValueMap<K, V, W>,
 }
 
 impl<K, V, W> Seeker<K, W> for FilterMappedSeek<'_, K, V, W> {

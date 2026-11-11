@@ -1,11 +1,11 @@
-//! Linear operators over rows, beyond those in the crate root: keying,
-//! and per-value variants over keyed rows `(K, V)`. Like the rest, they
-//! are [`Emit`] stages, fused into one node by
-//! [`FusedLinears`](crate::FusedLinears).
+//! Linear operators over rows: map, filter and their kin, keying, and
+//! per-value variants over keyed rows `(K, V)`. They are [`Emit`]
+//! stages, fused into one node by [`FusedLinears`](crate::FusedLinears).
+//! [`Flatten`] turns a register's changes into rows.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, marker::PhantomData};
 
-use crate::{Delta, Emit};
+use crate::{Bag, Delta, Emit, Register, Unary, merge::Merge, tx::WriteTx};
 
 /// Keys each row by `f`: `t` becomes `(f(&t), t)`.
 #[derive(Clone)]
@@ -267,5 +267,142 @@ fn value<K: Clone, V: Clone>(row: Cow<(K, V)>) -> V {
     match row {
         Cow::Owned((_, v)) => v,
         Cow::Borrowed((_, v)) => v.clone(),
+    }
+}
+
+#[derive(Clone)]
+pub struct Filter<F>(pub F);
+impl<In, F> Emit<In> for Filter<F>
+where
+    In: Clone + 'static,
+    F: Fn(&In) -> bool + 'static + Send,
+{
+    type Emits = In;
+    #[inline]
+    fn emit<S: FnMut(Cow<In>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
+        if (self.0)(&data) {
+            sink(data, diff);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Map<F>(pub F);
+impl<In, Out, F> Emit<In> for Map<F>
+where
+    In: Clone + 'static,
+    Out: Clone + 'static,
+    F: Fn(&In) -> Out + 'static + Send,
+{
+    type Emits = Out;
+    #[inline]
+    fn emit<S: FnMut(Cow<Out>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
+        sink(Cow::Owned((self.0)(&data)), diff);
+    }
+}
+
+#[derive(Clone)]
+pub struct FilterMap<F>(pub F);
+impl<In, Out, F> Emit<In> for FilterMap<F>
+where
+    In: Clone + 'static,
+    Out: Clone + 'static,
+    F: Fn(&In) -> Option<Out> + 'static + Send,
+{
+    type Emits = Out;
+    #[inline]
+    fn emit<S: FnMut(Cow<Out>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
+        if let Some(r) = (self.0)(&data) {
+            sink(Cow::Owned(r), diff);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct FlatMap<F>(pub F);
+impl<In, Out, I, F> Emit<In> for FlatMap<F>
+where
+    In: Clone + 'static,
+    Out: Clone + 'static,
+    I: IntoIterator<Item = Out> + 'static,
+    F: Fn(&In) -> I + 'static + Send,
+{
+    type Emits = Out;
+    #[inline]
+    fn emit<S: FnMut(Cow<Out>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
+        for out in (self.0)(&data) {
+            sink(Cow::Owned(out), diff);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Explode<F>(pub F);
+impl<In, Out, I, F> Emit<In> for Explode<F>
+where
+    In: Clone + 'static,
+    Out: Clone + 'static,
+    I: IntoIterator<Item = (Out, i64)> + 'static,
+    F: Fn(&In) -> I + 'static + Send,
+{
+    type Emits = Out;
+    #[inline]
+    fn emit<S: FnMut(Cow<Out>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
+        for (out, d) in (self.0)(&data) {
+            let d = d
+                .checked_mul(diff)
+                .expect("explode multiplication overflowed");
+            if d != 0 {
+                sink(Cow::Owned(out), d);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Negate;
+impl<In> Emit<In> for Negate
+where
+    In: Clone + 'static,
+{
+    type Emits = In;
+    #[inline]
+    fn emit<S: FnMut(Cow<In>, i64)>(&self, data: Cow<In>, diff: i64, sink: &mut S) {
+        sink(data, diff.checked_neg().expect("negate overflowed"))
+    }
+}
+
+/// A register's changes as rows: an insert is the new row at `+1`, a
+/// delete the old row at `-1`, a replace both. Turns a register, such as
+/// a table or [`Sum`](crate::Sum)'s output, into rows for the linear
+/// operators and [`Arrange`](super::Arrange).
+pub struct Flatten<K, M>(PhantomData<fn() -> (K, M)>);
+
+impl<K, M> Default for Flatten<K, M> {
+    fn default() -> Self {
+        Flatten(PhantomData)
+    }
+}
+
+impl<K, M> Unary for Flatten<K, M>
+where
+    K: Ord + Clone + Send + 'static,
+    M: Merge + Send,
+    M::Value: Ord + Send + 'static,
+    M::Diff: Send,
+{
+    type Takes = Register<K, M>;
+    type Gives = Bag<(K, M::Value)>;
+    type State = ();
+    fn state(&self) {}
+    fn eval(&mut self, _: &mut WriteTx, batch: &Register<K, M>, out: &mut Self::Gives) {
+        for (k, change) in batch.iter() {
+            if let Some(o) = change.old_value() {
+                out.push((k.clone(), o.clone()), -1);
+            }
+            if let Some(n) = change.new_value() {
+                out.push((k.clone(), n.clone()), 1);
+            }
+        }
     }
 }

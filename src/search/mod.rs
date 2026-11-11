@@ -37,7 +37,7 @@ use crate::{
     tx::{KeyspaceId, WriteTx},
 };
 
-use super::{
+use crate::schema::{
     At, Data, Grouped, KeyedFeed, Root, Rows, Shared,
     view::{SlotCore, ViewDecl},
 };
@@ -61,7 +61,7 @@ pub(super) const TOTAL_LEN: u8 = 1;
 /// A full-text index over documents `D`, defined from a [`Keyed`]
 /// stream of `(D, String)`: each document's text.
 ///
-/// [`Keyed`]: super::Keyed
+/// [`Keyed`]: crate::stream::Keyed
 pub struct SearchView<D, T = Simple>(PhantomData<fn() -> (D, T)>);
 
 /// The keyspaces of a search view.

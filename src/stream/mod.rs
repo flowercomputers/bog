@@ -35,21 +35,23 @@ use crate::{
     merge::Merge,
     ops::{
         Arrange, DistinctCounts, DistinctRows, Distinctly, Flatten, Join, ReduceMany, Semijoin,
+        aggregate::{Aggregate, Take},
         linear::{
             ExplodeVal, FilterKV, FlatMapVal, KeyBy, Keys, MapVal, MapWith, ReKey, ReKeyWith,
             Reindex, Unkey, Values,
         },
-        reduce::{Aggregate, Take},
     },
     state::{Arranged, Arrangement, Stored},
     tx::KeyspaceId,
 };
 
-use super::{
-    Shared,
-    dynstate::{DynKeyed, DynState, FilterMapValues, FilterMapped, ValueMap},
-    read::{FilterMappedReader, KeyedReader, RegisterReader},
+use crate::{
+    dataflow::Shared,
+    schema::read::{FilterMappedReader, KeyedReader, RegisterReader},
 };
+
+pub(crate) mod dynstate;
+use dynstate::{DynKeyed, DynState, FilterMapValues, FilterMapped, ValueMap};
 
 /// What a stream can carry: ordered, encodable, and sendable. Keys and
 /// values alike.
@@ -1287,7 +1289,7 @@ where
     /// Treat this grouped stream as a register, enforcing that it is
     /// one row per key. A transaction that leaves a key with more than
     /// one row, or one row at a multiplicity other than one, is refused
-    /// with a [`Rejected`](super::Rejected) naming the operator. Prefer
+    /// with a [`Rejected`](crate::Rejected) naming the operator. Prefer
     /// [`min`](Self::min) or [`max`](Self::max) when a key may
     /// legitimately have several rows.
     pub fn unique(&self) -> Keyed<K, V> {
@@ -1297,7 +1299,7 @@ where
         let id: KeyspaceId<K, Mergeless<V>> = b.id(&name);
         let node = b.graph.nary(
             &[input],
-            super::constraints::Unique::new(name.as_str().into(), state, id),
+            crate::constraints::Unique::new(name.as_str().into(), state, id),
         );
         drop(b);
         Rows::at_stored(id, node.rows(), self.flow.build.clone(), name.into())

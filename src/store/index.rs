@@ -35,7 +35,7 @@ use crate::{
     error::{Error, Result},
     merge::Merge,
     store::Resident,
-    table::{BlockCache, Table},
+    store::table::{BlockCache, Table},
 };
 
 /// An auxiliary structure over one run of one keyspace. Starts as

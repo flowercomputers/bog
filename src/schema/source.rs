@@ -6,13 +6,17 @@
 use std::{cell::RefCell, marker::PhantomData, ops::Deref, rc::Rc, sync::Arc};
 
 use crate::{
-    Delta, Mergeless, Tally, db::DbTx, error::Result, id::Id, source as raw, source::Retain,
+    Delta, Mergeless, Tally, database::DbTx, error::Result, id::Id, source as raw, source::Retain,
     tx::KeyspaceId,
 };
 
 use super::{
     At, Data, Keyed, KeyedOrigin, MultisetRead, Read, Root, SetRead, Shared, Stream, TxCell, Value,
-    ValueRead, constraints::AltKey, dynstate::DynKeyed, read::RegisterReader, stream::Changes,
+    ValueRead, read::RegisterReader,
+};
+use crate::{
+    constraints::AltKey,
+    stream::{Changes, dynstate::DynKeyed},
 };
 
 /// A write-time check on a row; see the heads' `check`.

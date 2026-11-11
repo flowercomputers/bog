@@ -2,9 +2,11 @@
 //! by key, so what reads the rows by key reads the counts directly.
 
 use crate::{
-    Bag, Buffer, Change, Delta, Mergeless, Nary,
+    Bag, Buffer, Change, Delta, Mergeless, Nary, Tally,
+    codec::OrderedCodec,
+    dataflow::Fingerprint,
     error::Result,
-    state::{Declare, Edge, State, When},
+    state::{Counted, Declare, Edge, State, When},
     tx::{KeyspaceId, WriteTx},
 };
 
@@ -16,7 +18,7 @@ use super::Key;
 pub type DistinctCounts<K, V> = KeyspaceId<(K, Edge<V>), Mergeless<Delta>>;
 
 /// Counts each `(key, value)` row's multiplicity in `counts` and emits
-/// the row when its presence changes, like [`Distinct`](crate::Distinct),
+/// the row when its presence changes, like [`Distinct`],
 /// but keyed: its [`Distinctly`] state is each key's present values,
 /// which joins, reductions and grouped views read in place.
 pub struct DistinctRows<K, V> {
@@ -193,5 +195,88 @@ impl<K: Key, V: Key> State for Distinctly<K, V> {
         f: &mut dyn FnMut(&V, Delta) -> bool,
     ) -> Result<()> {
         self.scan(tx, key, when, true, f)
+    }
+}
+
+/// Counts each row's multiplicity in `counts` and emits a row when its
+/// presence changes: `+1` when its count becomes positive, `-1` when it
+/// stops being positive. Downstream sees each row at most once.
+pub struct Distinct<T> {
+    counts: KeyspaceId<T, Tally>,
+    scratch: Bag<T>,
+}
+
+impl<T: Ord> Distinct<T> {
+    pub fn new(counts: KeyspaceId<T, Tally>) -> Self {
+        Distinct {
+            counts,
+            scratch: Bag::new(),
+        }
+    }
+}
+
+impl<T> Nary for Distinct<T>
+where
+    T: OrderedCodec + Clone + Send + Sync + 'static,
+{
+    type Takes = Bag<T>;
+    type Gives = Bag<T>;
+    type State = Counted<T>;
+
+    fn state(&self) -> Counted<T> {
+        Counted::new(self.counts)
+    }
+
+    fn keyspaces(&self) -> Vec<Declare> {
+        vec![Declare::derived(self.counts)]
+    }
+
+    fn fingerprint(&self, fp: &mut Fingerprint) {
+        fp.write_u64(self.counts.raw());
+    }
+
+    fn scratch(&mut self, release: bool) -> usize {
+        Buffer::scratch(&mut self.scratch, release)
+    }
+
+    fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], out: &mut Bag<T>) {
+        // a single input is sorted already; several merge through the scratch
+        let single;
+        let rows: &Bag<T> = if let [only] = batches {
+            only
+        } else {
+            self.scratch.clear();
+            for b in batches {
+                for (t, d) in b.diffs() {
+                    self.scratch.push(t.clone(), d);
+                }
+            }
+            self.scratch.consolidate();
+            single = &self.scratch;
+            single
+        };
+        // each row's count as it was, read in order, then the change added
+        // blind: the count decides nothing but whether the row crossed zero
+        let mut ks = tx.keyspace(self.counts);
+        let mut lookup = ks.lookup();
+        let mut counts = Vec::with_capacity(rows.len());
+        for (t, _) in rows.diffs() {
+            match lookup.get(t) {
+                Ok(c) => counts.push(c.map_or(0, |c| *c)),
+                Err(_) => return,
+            }
+        }
+        drop(lookup);
+        for ((t, d), old) in rows.diffs().zip(counts) {
+            let new = old.checked_add(d).expect("multiplicity overflowed");
+            if ks.add(t.clone(), d).is_err() {
+                return;
+            }
+            match (old > 0, new > 0) {
+                (false, true) => out.push(t.clone(), 1),
+                (true, false) => out.push(t.clone(), -1),
+                _ => {}
+            }
+        }
     }
 }

@@ -10,10 +10,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::{linear::*, reduce, *};
+use super::{aggregate as reduce, linear::*, *};
+use crate::{
+    Bag, Delta, Nary, Register, Tally,
+    merge::Merge,
+    state::{Arranged, Arrangement},
+    tx::{KeyspaceId, WriteTx},
+};
 use crate::{
     FusedLinears, Map, Mergeless, Then,
-    db::Db,
+    database::Db,
     error::Error,
     graph::{NodeRef, OpDag},
     state::Stored,

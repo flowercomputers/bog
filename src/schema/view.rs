@@ -22,8 +22,8 @@ use super::{
     At, Data, GroupRead, Grouped, GroupedFeed, Keyed, KeyedFeed, KeyedOrigin, OrderedRead, Read,
     Root, Rows, Shared, Value, ValueRead,
     read::{GroupReader, KeyedReader, OrderReader},
-    stream::{GroupedInner, OriginKind},
 };
+use crate::stream::{GroupedInner, OriginKind};
 
 /// A view field of a schema.
 pub trait ViewDecl: 'static {
