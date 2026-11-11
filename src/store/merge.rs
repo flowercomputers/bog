@@ -2,7 +2,7 @@ use std::{borrow::Cow, convert::Infallible};
 
 use bytes::Bytes;
 
-use crate::Delta;
+use crate::dataflow::Delta;
 
 pub enum ValOp<M: Merge> {
     Store(M::Value),
@@ -47,7 +47,7 @@ pub trait Merge: 'static {
 
 /// A count kept additively: each write is an amount to add, made without
 /// reading the count, and a count of zero is absent. What
-/// [arrangements](crate::state::Arrangement) and
+/// [arrangements](crate::dataflow::state::Arrangement) and
 /// [multisets](crate::source::Multiset) are kept as.
 pub enum Tally {}
 

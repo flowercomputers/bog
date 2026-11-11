@@ -1,11 +1,13 @@
 //! [`Materialize`]: a register's rows, kept as a register.
 
 use crate::{
-    Bag, Buffer, Change, Delta, Mergeless, Nary, Register,
-    codec::Codec,
+    dataflow::state::{Declare, Stored},
+    dataflow::{Bag, Buffer, Delta, Nary, Register},
     error::Result,
-    state::{Declare, Stored},
-    tx::{KeyspaceId, WriteTx},
+    store::codec::Codec,
+    store::merge::Change,
+    store::merge::Mergeless,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use super::Key;
@@ -89,7 +91,7 @@ where
         vec![Declare::derived(self.output)]
     }
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         fp.write_u64(self.output.raw());
     }
 

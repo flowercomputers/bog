@@ -3,7 +3,11 @@
 
 use std::marker::PhantomData;
 
-use crate::{Bag, Binary, tx::WriteTx};
+use crate::stream::prelude::*;
+use crate::{
+    dataflow::{Bag, Binary},
+    store::txn::WriteTx,
+};
 
 /// Bag difference: the left input plus the negation of the right, so
 /// matching rows cancel. Multiplicities can go negative; for set
@@ -29,5 +33,40 @@ impl<T: Ord + Clone + Send + 'static> Binary for Minus<T> {
         for (t, d) in r.diffs() {
             out.push(t.clone(), d.checked_neg().expect("negate overflowed"));
         }
+    }
+}
+
+// The stream methods: how a schema declares this operator.
+
+impl<T: Data, C: Chain<Out = T>> Stream<T, C> {
+    /// Bag union with another stream. Costs nothing by itself: what
+    /// consumes the union takes both as inputs.
+    pub fn concat(&self, other: &impl StreamFeed<T>) -> Stream<T> {
+        let mut inputs = self.flow.inputs();
+        inputs.extend(other.inputs());
+        let name = self.flow.name("concat", Some(&other.label()));
+        Stream::rooted(Root::union(inputs), self.flow.build.clone(), name.into())
+    }
+}
+
+impl<K, V, C> Grouped<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Union with another grouped (or keyed) stream on the same key.
+    /// Costs nothing by itself: what consumes the union takes both as
+    /// inputs.
+    pub fn concat(&self, other: &impl GroupedFeed<K, V>) -> Grouped<K, V> {
+        let mut inputs = self.flow.inputs();
+        inputs.extend(other.inputs());
+        let name = self.flow.name("concat", Some(&other.label()));
+        Rows::rooted(
+            Root::union(inputs),
+            self.flow.build.clone(),
+            name.into(),
+            None,
+        )
     }
 }

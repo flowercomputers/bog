@@ -4,7 +4,7 @@ use super::*;
 
 /// An append-only log: each row gets a minted [`Id`], increasing across
 /// commits and within one. What is kept is set with
-/// [`Db::retain`](crate::Db::retain), and evicted rows leave as deletes
+/// [`Db::retain`](crate::raw::Db::retain), and evicted rows leave as deletes
 /// in the transaction that pushed them out, so the graph sees them go.
 pub struct Events<V: Value>(KeyspaceId<Id<V>, Mergeless<V>>);
 handle!([V: Value] Events[V], Id<V>, Mergeless<V>);

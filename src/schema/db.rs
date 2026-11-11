@@ -4,8 +4,10 @@ use std::{path::Path, rc::Rc, sync::Arc};
 
 use super::{At, Declare, Schema, TxCell};
 use crate::{
-    DurabilityPolicy, Snapshot, Store, StoreBuilder, StoreOptions, database::Db as RawDb,
-    dataflow::Build, error::Result,
+    database::Db as RawDb,
+    dataflow::Build,
+    error::Result,
+    store::{DurabilityPolicy, Snapshot, Store, StoreBuilder, StoreOptions},
 };
 
 /// Configure and open a database of schema `S`.
@@ -138,7 +140,7 @@ impl<S: Declare> Db<S> {
     /// Run a write transaction: `f` writes through the sources' facades,
     /// then the graph runs over what it wrote, then it commits. `f`'s
     /// `Err` aborts; a constraint refuses at the write call or after the
-    /// graph, as [`Error::Rejected`](crate::Error::Rejected). Blocks
+    /// graph, as [`Error::Rejected`](crate::error::Error::Rejected). Blocks
     /// while another write is in progress.
     pub fn write<T>(&self, f: impl FnOnce(&mut S::Write<'_>) -> Result<T>) -> Result<T> {
         let mut tx = self.inner.begin()?;

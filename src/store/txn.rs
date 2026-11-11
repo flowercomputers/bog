@@ -13,11 +13,12 @@ use std::{
 };
 
 use crate::{
-    Change, Register,
-    codec::{Codec, OrderedCodec, ResidentSize, heap_size},
-    cursor::Cursor,
+    dataflow::Register,
     error::{Error, Result},
-    merge::Merge,
+    store::codec::{Codec, OrderedCodec, ResidentSize, heap_size},
+    store::cursor::Cursor,
+    store::merge::Change,
+    store::merge::Merge,
     store::{ENTRY_OVERHEAD, Lookup, Resident, Snapshot, WriterGuard, resident_entry_bytes},
 };
 

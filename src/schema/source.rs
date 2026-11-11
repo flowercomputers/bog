@@ -6,8 +6,14 @@
 use std::{cell::RefCell, marker::PhantomData, ops::Deref, rc::Rc, sync::Arc};
 
 use crate::{
-    Delta, Mergeless, Tally, database::DbTx, error::Result, id::Id, source as raw, source::Retain,
-    tx::KeyspaceId,
+    database::DbTx,
+    dataflow::Delta,
+    error::Result,
+    id::Id,
+    source as raw,
+    source::Retain,
+    store::merge::{Mergeless, Tally},
+    store::txn::KeyspaceId,
 };
 
 use super::{
@@ -194,7 +200,7 @@ impl<V: Data> TableWrite<'_, Id<V>, V> {
         let id = tx.mint(self.h.raw.id().raw());
         self.alts(&mut tx, &id, None, Some(&value))?;
         tx.table(self.h.raw.id())
-            .absorb(id, crate::Change::Insert(value))?;
+            .absorb(id, crate::store::merge::Change::Insert(value))?;
         Ok(id)
     }
 

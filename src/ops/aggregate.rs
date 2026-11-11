@@ -1,19 +1,22 @@
 //! Per-key reductions that put aggregates in data position:
 //! [`Aggregate`], one value per key, kept as a register, and
 //! [`ReduceMany`], any number of values per key, kept as an arrangement.
-//! The built-ins are [`min`], [`max`], [`aggregate`] and [`top_k`].
+//! The built-ins are [`min`], [`max`], [`aggregate()`] and [`top_k`].
 //!
-//! Totals and counts need no group; see [`Sum`](crate::Sum).
+//! Totals and counts need no group; see [`Sum`].
 
 use crate::{
-    Bag, Change, Delta, Mergeless, Nary, Register,
-    codec::Codec,
+    dataflow::state::{Arranged, Arrangement, Declare, State, Stored, When},
+    dataflow::{Bag, Delta, Nary, Register},
     error::Result,
-    state::{Arranged, Arrangement, Declare, State, Stored, When},
-    tx::{KeyspaceId, WriteTx},
+    store::codec::Codec,
+    store::merge::Change,
+    store::merge::Mergeless,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use super::{Key, arrange, dirty_keys_into, read_group};
+use crate::stream::prelude::*;
 
 /// How much of a dirty key's group a reduction reads before calling its
 /// logic.
@@ -38,7 +41,7 @@ impl<K, V, O, F: FnMut(&K, &[(V, Delta)]) -> O + Send> Logic<K, V, O> for F {}
 /// register keyed like its parent, and emits its changes.
 ///
 /// It reads its group from its parent's state, which must be grouped by
-/// the key: an [`Arrange`](super::Arrange) node, or a register. `logic`
+/// the key: an [`Arrange`] node, or a register. `logic`
 /// is not called for a key whose group emptied; that key's value is
 /// deleted. It must be deterministic.
 ///
@@ -133,12 +136,13 @@ where
         vec![Declare::derived(self.output)]
     }
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         take_fingerprint(self.take, fp);
     }
 
     fn scratch(&mut self, release: bool) -> usize {
-        crate::vec_scratch(&mut self.dirty, release) + crate::vec_scratch(&mut self.vals, release)
+        crate::dataflow::vec_scratch(&mut self.dirty, release)
+            + crate::dataflow::vec_scratch(&mut self.vals, release)
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {
@@ -146,7 +150,7 @@ where
     }
 }
 
-fn take_fingerprint(take: Take, fp: &mut crate::graph::Fingerprint) {
+fn take_fingerprint(take: Take, fp: &mut crate::dataflow::graph::Fingerprint) {
     match take {
         Take::Whole => fp.write_u64(0),
         Take::First(n) => fp.write_u64(1 << 32 | n as u64),
@@ -256,15 +260,15 @@ where
         vec![Declare::derived(self.output)]
     }
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         take_fingerprint(self.take, fp);
     }
 
     fn scratch(&mut self, release: bool) -> usize {
-        crate::vec_scratch(&mut self.dirty, release)
-            + crate::vec_scratch(&mut self.vals, release)
-            + crate::vec_scratch(&mut self.fresh, release)
-            + crate::vec_scratch(&mut self.old, release)
+        crate::dataflow::vec_scratch(&mut self.dirty, release)
+            + crate::dataflow::vec_scratch(&mut self.vals, release)
+            + crate::dataflow::vec_scratch(&mut self.fresh, release)
+            + crate::dataflow::vec_scratch(&mut self.old, release)
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {
@@ -348,4 +352,133 @@ where
         }
     });
     ReduceMany::new(parent, output, logic).reading(Take::Last(k))
+}
+
+// The stream methods: how a schema declares this operator.
+
+impl<K, V, C> Grouped<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// One value per key from the key's whole group, which arrives
+    /// sorted ascending, consolidated, each value with its multiplicity.
+    /// `f` is not called for a key whose group emptied.
+    pub fn aggregate<O: Data, F>(&self, f: F) -> Keyed<K, O>
+    where
+        F: FnMut(&K, &[(V, Delta)]) -> O + Send + 'static,
+    {
+        self.aggregated("aggregate", f, Take::Whole)
+    }
+
+    /// The least value of each key.
+    pub fn min(&self) -> Keyed<K, V> {
+        fn least<K, V: Clone>(_: &K, vals: &[(V, Delta)]) -> V {
+            vals[0].0.clone()
+        }
+        self.aggregated("min", least::<K, V>, Take::First(1))
+    }
+
+    /// The greatest value of each key.
+    pub fn max(&self) -> Keyed<K, V> {
+        fn greatest<K, V: Clone>(_: &K, vals: &[(V, Delta)]) -> V {
+            vals[vals.len() - 1].0.clone()
+        }
+        self.aggregated("max", greatest::<K, V>, Take::Last(1))
+    }
+
+    pub(crate) fn aggregated<O: Data, F>(&self, kind: &str, logic: F, take: Take) -> Keyed<K, O>
+    where
+        F: FnMut(&K, &[(V, Delta)]) -> O + Send + 'static,
+    {
+        let name = self.flow.name(kind, None);
+        let (input, state) = arranged(self, &format!("{name}.state"));
+        let mut b = self.flow.build.borrow_mut();
+        let id: KeyspaceId<K, Mergeless<O>> = b.id(&name);
+        let node = b
+            .graph
+            .nary(&[input], Aggregate::new(state, id, logic).reading(take));
+        drop(b);
+        Rows::at_stored(id, node.rows(), self.flow.build.clone(), name.into())
+    }
+
+    /// Any number of outputs per key from the key's whole group: the
+    /// most general reduction. The outputs are kept, so downstream
+    /// always holds `f` of the current groups.
+    pub fn reduce<O: Data, F>(&self, f: F) -> Grouped<K, O>
+    where
+        F: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send + 'static,
+    {
+        self.reduced("reduce", f, Take::Whole)
+    }
+
+    /// The `k` greatest distinct values of each key, each once.
+    pub fn top_k(&self, k: usize) -> Grouped<K, V> {
+        let logic = move |_: &K, vals: &[(V, Delta)], out: &mut Vec<(V, Delta)>| {
+            for (v, _) in vals.iter().rev().take(k) {
+                out.push((v.clone(), 1));
+            }
+        };
+        self.reduced("top_k", logic, Take::Last(k))
+    }
+
+    pub(crate) fn reduced<O: Data, F>(&self, kind: &str, logic: F, take: Take) -> Grouped<K, O>
+    where
+        F: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send + 'static,
+    {
+        let name = self.flow.name(kind, None);
+        let (input, state) = arranged(self, &format!("{name}.state"));
+        let mut b = self.flow.build.borrow_mut();
+        let id: Arrangement<K, O> = b.id(&name);
+        let node = b
+            .graph
+            .nary(&[input], ReduceMany::new(state, id, logic).reading(take));
+        drop(b);
+        let origin = KeyedOrigin::arranged(id, None);
+        Rows::rooted(
+            Root::at(node.rows()),
+            self.flow.build.clone(),
+            name.into(),
+            Some(origin),
+        )
+    }
+}
+
+impl<K, V, C> Keyed<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Number of rows in the register.
+    pub fn count(&self) -> Value<Delta> {
+        self.unkeyed().count()
+    }
+
+    pub fn min(&self) -> Value<V> {
+        self.unkeyed().min()
+    }
+
+    pub fn max(&self) -> Value<V> {
+        self.unkeyed().max()
+    }
+
+    /// Total of every value in the register.
+    pub fn sum(&self) -> Value<V>
+    where
+        V: Additive,
+    {
+        self.unkeyed().sum()
+    }
+
+    /// One value from every row of the register.
+    pub fn aggregate<O: Data, F>(&self, mut f: F) -> Value<O>
+    where
+        F: FnMut(&[((K, V), Delta)]) -> O + Send + 'static,
+    {
+        let unit: Grouped<(), (K, V), _> =
+            Rows::from_flow(self.flow.extend(KeyBy(|_: &(K, V)| ())));
+        unit.aggregate(move |_, rows| f(rows))
+    }
 }

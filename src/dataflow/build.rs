@@ -9,7 +9,7 @@ use std::{
 };
 
 use super::{Fingerprint, OpDag, state::Declare as DeclareKeyspace};
-use crate::{database::Db as RawDb, merge::Merge, tx::KeyspaceId};
+use crate::{database::Db as RawDb, store::merge::Merge, store::txn::KeyspaceId};
 
 /// What one schema tree builds: the graph, the keyspace names, the
 /// views waiting to be defined.

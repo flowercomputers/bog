@@ -3,7 +3,11 @@
 
 use std::{error::Error as StdError, marker::PhantomData};
 
-use crate::{Bag, Nary, Register, merge::*, tx::WriteTx};
+use crate::{
+    dataflow::{Bag, Nary, Register},
+    store::merge::*,
+    store::txn::WriteTx,
+};
 
 /// Rejects the tx when a value its input view is left holding fails
 /// `check`. Only the values an epoch ends with are checked, so a tx that

@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::tx::OutOfMemory;
+use crate::store::txn::OutOfMemory;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

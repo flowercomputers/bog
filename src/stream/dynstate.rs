@@ -4,10 +4,12 @@
 use std::sync::Arc;
 
 use crate::{
-    Bag, Change, Delta, Mergeless, Register, Unary,
+    dataflow::state::{KeyedState, State, When},
+    dataflow::{Bag, Delta, Register, Unary},
     error::Result,
-    state::{KeyedState, State, When},
-    tx::WriteTx,
+    store::merge::Change,
+    store::merge::Mergeless,
+    store::txn::WriteTx,
 };
 
 use super::Data;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Change, Register, Tally};
+use crate::{dataflow::Register, store::merge::Change, store::merge::Tally};
 
 const KS: KeyspaceId<u8, i64> = KeyspaceId::new(3);
 
@@ -284,7 +284,7 @@ fn checkpoint_rows(path: &Path) -> Vec<(u8, Option<i64>)> {
     let mut rows = Vec::new();
     while let Some((k, v)) = c.current() {
         rows.push((
-            crate::codec::decode_all_ordered::<u8>(k).unwrap(),
+            crate::store::codec::decode_all_ordered::<u8>(k).unwrap(),
             decode_all::<Option<i64>>(v).unwrap(),
         ));
         c.advance().unwrap();
@@ -1497,7 +1497,7 @@ fn tallies_sum_at_every_level() {
         let mut rows = Vec::new();
         while let Some((k, v)) = c.current() {
             rows.push((
-                crate::codec::decode_all_ordered::<u8>(k).unwrap(),
+                crate::store::codec::decode_all_ordered::<u8>(k).unwrap(),
                 decode_all::<Option<i64>>(v).unwrap(),
             ));
             c.advance().unwrap();

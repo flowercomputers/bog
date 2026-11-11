@@ -2,12 +2,12 @@
 //! and the helpers here read and write groups for the operators over them.
 
 use crate::{
-    Bag, Buffer, Delta, Nary,
-    codec::OrderedCodec,
     dataflow::state::{Arranged, Arrangement, Counted, Declare, Edge, State, When},
+    dataflow::{Bag, Buffer, Delta, Nary},
     error::Result,
-    merge::Tally,
-    tx::{KeyspaceId, WriteTx},
+    store::codec::OrderedCodec,
+    store::merge::Tally,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use super::Take;
@@ -73,11 +73,11 @@ impl<K, V> Default for Groups<K, V> {
 }
 
 impl<K, V> Groups<K, V> {
-    /// See [`Nary::scratch`](crate::Nary::scratch).
+    /// See [`Nary::scratch`](crate::dataflow::Nary::scratch).
     pub(crate) fn scratch(&mut self, release: bool) -> usize {
-        crate::vec_scratch(&mut self.keys, release)
-            + crate::vec_scratch(&mut self.rows, release)
-            + crate::vec_scratch(&mut self.ends, release)
+        crate::dataflow::vec_scratch(&mut self.keys, release)
+            + crate::dataflow::vec_scratch(&mut self.rows, release)
+            + crate::dataflow::vec_scratch(&mut self.ends, release)
     }
 }
 
@@ -239,7 +239,7 @@ impl<T: Key> Nary for CountRows<T> {
         vec![Declare::derived(self.counts)]
     }
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         fp.write_u64(self.counts.raw());
     }
 

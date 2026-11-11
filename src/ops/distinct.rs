@@ -2,15 +2,18 @@
 //! by key, so what reads the rows by key reads the counts directly.
 
 use crate::{
-    Bag, Buffer, Change, Delta, Mergeless, Nary, Tally,
-    codec::OrderedCodec,
     dataflow::Fingerprint,
+    dataflow::state::{Counted, Declare, Edge, State, When},
+    dataflow::{Bag, Buffer, Delta, Nary},
     error::Result,
-    state::{Counted, Declare, Edge, State, When},
-    tx::{KeyspaceId, WriteTx},
+    store::codec::OrderedCodec,
+    store::merge::Change,
+    store::merge::{Mergeless, Tally},
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use super::Key;
+use crate::stream::prelude::*;
 
 /// Where [`DistinctRows`] keeps each row's count: `(k, Val(v)) -> count`,
 /// so a key's rows are the range `(k, Lo)..=(k, Hi)`. A count is a whole
@@ -100,7 +103,7 @@ impl<K: Key, V: Key> Nary for DistinctRows<K, V> {
         vec![Declare::derived(self.counts)]
     }
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         fp.write_u64(self.counts.raw());
     }
 
@@ -278,5 +281,46 @@ where
                 _ => {}
             }
         }
+    }
+}
+
+// The stream methods: how a schema declares this operator.
+
+impl<T: Data, C: Chain<Out = T>> Stream<T, C> {
+    /// Each row once, however many times it occurs: set semantics.
+    pub fn distinct(&self) -> Stream<T> {
+        let inputs = self.flow.inputs();
+        let name = self.flow.name("distinct", None);
+        let mut b = self.flow.build.borrow_mut();
+        let id: KeyspaceId<T, Tally> = b.id(&name);
+        let node = b.graph.nary(&inputs, Distinct::new(id));
+        drop(b);
+        Stream::rooted(Root::at(node.rows()), self.flow.build.clone(), name.into())
+    }
+}
+
+impl<K, V, C> Grouped<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Each `(key, value)` once, however many times it occurs. The rows
+    /// are kept by key, so a grouped view defined from them, or a join
+    /// or reduction over them, reads them in place.
+    pub fn distinct(&self) -> Grouped<K, V> {
+        let inputs = self.flow.inputs();
+        let name = self.flow.name("distinct", None);
+        let mut b = self.flow.build.borrow_mut();
+        let id: DistinctCounts<K, V> = b.id(&name);
+        let node = b.graph.nary(&inputs, DistinctRows::new(id));
+        let origin = KeyedOrigin::distinct(b.graph.state(node));
+        drop(b);
+        Rows::rooted(
+            Root::at(node.rows()),
+            self.flow.build.clone(),
+            name.into(),
+            Some(origin),
+        )
     }
 }

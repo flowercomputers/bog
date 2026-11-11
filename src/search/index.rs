@@ -2,10 +2,10 @@
 //! keyspace.
 
 use crate::{
-    Delta,
-    codec::{Codec, OrderedCodec},
-    index::RunIndex,
-    state::Edge,
+    dataflow::Delta,
+    dataflow::state::Edge,
+    store::codec::{Codec, OrderedCodec},
+    store::index::RunIndex,
 };
 
 use super::{Data, Posting};

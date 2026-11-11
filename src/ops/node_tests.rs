@@ -1,8 +1,8 @@
 //! Unit tests of the operators that need no arrangement.
 
-use crate::graph::OpDag;
+use crate::dataflow::graph::OpDag;
+use crate::raw::*;
 use crate::store::{DurabilityPolicy, StoreBuilder};
-use crate::*;
 
 #[test]
 fn sum_inserts_then_replaces_then_deletes() {
@@ -43,10 +43,10 @@ fn sum_inserts_then_replaces_then_deletes() {
 }
 
 mod rebuild {
+    use crate::dataflow::graph::{NodeRef, OpDag};
     use crate::error::Error;
-    use crate::graph::{NodeRef, OpDag};
     use crate::store::{DurabilityPolicy, Store, StoreBuilder};
-    use crate::*;
+    use crate::{raw::*, store::merge::*};
     use std::{collections::BTreeMap, ops::Bound, path::Path};
 
     const BASE: KeyspaceId<u8, i64> = KeyspaceId::new(1);
@@ -94,7 +94,7 @@ mod rebuild {
         }
 
         fn fingerprint(&self) -> u64 {
-            let mut fp = crate::graph::Fingerprint::new();
+            let mut fp = crate::dataflow::graph::Fingerprint::new();
             fp.write_u64(self.g.fingerprint());
             fp.write_u64(self.modulus as u64);
             fp.finish()

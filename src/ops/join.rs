@@ -1,13 +1,14 @@
 //! [`Join`]: the inner join, reactive on both sides.
 
 use crate::{
-    Bag, Binary,
+    dataflow::state::{State, When},
+    dataflow::{Bag, Binary},
     error::Result,
-    state::{State, When},
-    tx::WriteTx,
+    store::txn::WriteTx,
 };
 
 use super::{Groups, multiply};
+use crate::stream::prelude::*;
 
 /// Pairs each left row `(k, a)` with every right row `(k, b)` and emits
 /// `logic(&k, &a, &b)` at the product of their multiplicities: SQL's
@@ -15,7 +16,7 @@ use super::{Groups, multiply};
 ///
 /// It keeps nothing: it reads its parents' states, which must be grouped
 /// by the join key: tables and other registers keyed by it, or
-/// [`Arrange`](super::Arrange) nodes. A run emits
+/// [`Arrange`] nodes. A run emits
 /// `ΔA ⋈ B_old + A_new ⋈ ΔB`, so rows arriving on both sides at once
 /// pair exactly once. A dirty key costs reading its group on the other
 /// side: one lookup for a register.
@@ -29,7 +30,7 @@ pub struct Join<L: State, R: State, F> {
 }
 
 impl<L: State, R: State, F> Join<L, R, F> {
-    /// Build with [`OpDag::binary_with`](crate::graph::OpDag::binary_with),
+    /// Build with [`OpDag::binary_with`](crate::dataflow::graph::OpDag::binary_with),
     /// which hands over the parents' states.
     pub fn new(left: L, right: R, logic: F) -> Self {
         Join {
@@ -106,5 +107,65 @@ where
     fn eval(&mut self, tx: &mut WriteTx, l: &L::Delta, r: &R::Delta, out: &mut Bag<O>) {
         // on failure the tx has failed, and the graph stops after this node
         let _ = self.run(tx, l, r, out);
+    }
+}
+
+// The stream methods: how a schema declares this operator.
+
+impl<K, V, C> Grouped<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Inner join against a grouped stream on the same key: every row
+    /// pairs with every right row of its key, at the product of their
+    /// multiplicities. Reads both sides' state; see the module docs.
+    pub fn join<B: Data, O: Data, F>(
+        &self,
+        other: &impl GroupedFeed<K, B>,
+        mut f: F,
+    ) -> Grouped<K, O>
+    where
+        F: FnMut(&K, &V, &B) -> O + Send + 'static,
+    {
+        let name = self.flow.name("join", Some(&other.label()));
+        let (l, ls) = arranged(self, &format!("{name}.left"));
+        let (r, rs) = arranged(other, &format!("{name}.right"));
+        let logic = move |k: &K, a: &V, b: &B| (k.clone(), f(k, a, b));
+        let node = self
+            .flow
+            .build
+            .borrow_mut()
+            .graph
+            .binary(l, r, Join::new(ls, rs, logic));
+        Rows::rooted(Root::at(node), self.flow.build.clone(), name.into(), None)
+    }
+}
+
+impl<K, V, M, C> Rows<K, V, M, C>
+where
+    K: Data,
+    V: Data,
+    M: Kind,
+    C: Chain<Out = (K, V)>,
+{
+    /// Inner join against a register on the same key: each row pairs
+    /// with the key's one right value, so the kind is kept.
+    pub fn with<B: Data, O: Data, F>(&self, other: &impl KeyedFeed<K, B>, mut f: F) -> Rows<K, O, M>
+    where
+        F: FnMut(&K, &V, &B) -> O + Send + 'static,
+    {
+        let name = self.flow.name("with", Some(&other.label()));
+        let (l, ls) = arranged(self, &format!("{name}.left"));
+        let (r, rs) = arranged(other, &format!("{name}.right"));
+        let logic = move |k: &K, a: &V, b: &B| (k.clone(), f(k, a, b));
+        let node = self
+            .flow
+            .build
+            .borrow_mut()
+            .graph
+            .binary(l, r, Join::new(ls, rs, logic));
+        Rows::rooted(Root::at(node), self.flow.build.clone(), name.into(), None)
     }
 }

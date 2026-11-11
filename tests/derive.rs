@@ -3,9 +3,10 @@
 //! type works as a key and a value of a stored keyspace.
 
 use fold3::{
-    DurabilityPolicy, KeyspaceId, Mergeless, StoreBuilder,
-    codec::{Codec, DecodeError, OrderedCodec, ResidentSize},
+    DurabilityPolicy, Mergeless, StoreBuilder,
+    raw::KeyspaceId,
     schema::Codec as DeriveCodec,
+    store::codec::{Codec, DecodeError, OrderedCodec, ResidentSize},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, DeriveCodec)]

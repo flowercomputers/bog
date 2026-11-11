@@ -15,14 +15,16 @@ use std::{
 };
 
 use crate::{
-    Delta, Mergeless, Snapshot, Store, Tally,
-    codec::Codec,
-    cursor::Cursor,
+    dataflow::Delta,
+    dataflow::state::{Arrangement, Edge},
     error::Result,
-    merge::Merge,
     ops::DistinctCounts,
-    state::{Arrangement, Edge},
-    tx::{KeyspaceId, WriteTx},
+    store::codec::Codec,
+    store::cursor::Cursor,
+    store::merge::Merge,
+    store::merge::{Mergeless, Tally},
+    store::txn::{KeyspaceId, WriteTx},
+    store::{Snapshot, Store},
 };
 
 use super::{

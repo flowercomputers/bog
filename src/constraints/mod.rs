@@ -14,12 +14,14 @@
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
 use crate::{
-    Change, Delta, Mergeless, Nary, Register,
     database::DbTx,
+    dataflow::Nary,
+    dataflow::state::{Declare as DeclareKeyspace, State, When},
     error::{Error, Result},
-    ops::{Reject, Take, dirty_keys_into, read_group},
-    state::{Declare as DeclareKeyspace, State, Stored, When},
-    tx::{KeyspaceId, WriteTx},
+    ops::Reject,
+    store::merge::Change,
+    store::merge::Mergeless,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use crate::schema::{

@@ -1,7 +1,7 @@
 //! Change subscriptions: every committed transaction's net change to a
 //! keyspace, delivered to any number of subscribers.
 //!
-//! [`Store::subscribe`](crate::Store::subscribe) hands back a snapshot
+//! [`Store::subscribe`](crate::store::Store::subscribe) hands back a snapshot
 //! and a [`Subscription`] that starts right after it, so the snapshot's
 //! state plus every [`Delta`] received is the live state, with no gap and
 //! no double count, whichever thread reads. A keyspace nobody subscribes
@@ -23,10 +23,10 @@ use std::{
 };
 
 use crate::{
-    Change,
-    codec::{Codec, OrderedCodec},
-    merge::Merge,
-    tx::{ErasedUnderlay, entry_bytes, net_changes},
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Change,
+    store::merge::Merge,
+    store::txn::{ErasedUnderlay, entry_bytes, net_changes},
 };
 
 /// One committed transaction's net change to a keyspace.
@@ -35,7 +35,7 @@ pub struct Delta<K, M: Merge> {
     pub epoch: u64,
     /// Every key it changed, in key order, with the value before and
     /// after: an `Insert`, a `Delete` of the old value, or a `Replace`.
-    /// In a [`Tally`](crate::Tally) keyspace, an `Insert` of the amount
+    /// In a [`Tally`](crate::store::merge::Tally) keyspace, an `Insert` of the amount
     /// added, which may be negative.
     pub changes: Arc<Vec<(K, Change<M>)>>,
     /// Counts the changes as unread until every subscriber's copy of

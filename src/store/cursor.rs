@@ -17,13 +17,13 @@ use std::{
 };
 
 use crate::{
-    Change,
-    codec::{Codec, OrderedCodec, decode_all, decode_all_ordered},
     error::{Error, Result},
-    merge::Merge,
     store::Resident,
+    store::codec::{Codec, OrderedCodec, decode_all, decode_all_ordered},
+    store::merge::Change,
+    store::merge::Merge,
     store::table::TableCursor,
-    tx::TxState,
+    store::txn::TxState,
 };
 
 type Entry<'a, K, V> = (Cow<'a, K>, Option<Cow<'a, V>>);

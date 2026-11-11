@@ -1,6 +1,7 @@
 //! [`Unique`]: at most one row per key, as an operator.
 
 use super::*;
+use crate::stream::prelude::*;
 
 /// Keeps each key's one row in `output`, refusing the transaction when a
 /// key is left with any other number of rows.
@@ -101,15 +102,44 @@ where
         vec![DeclareKeyspace::derived(self.output)]
     }
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         fp.write_u64(self.output.raw());
     }
 
     fn scratch(&mut self, release: bool) -> usize {
-        crate::vec_scratch(&mut self.dirty, release) + crate::vec_scratch(&mut self.vals, release)
+        crate::dataflow::vec_scratch(&mut self.dirty, release)
+            + crate::dataflow::vec_scratch(&mut self.vals, release)
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {
         let _ = self.run(tx, batches, out);
+    }
+}
+
+// The stream methods: how a schema declares this operator.
+
+impl<K, V, C> Grouped<K, V, C>
+where
+    K: Data + std::fmt::Debug,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Treat this grouped stream as a register, enforcing that it is
+    /// one row per key. A transaction that leaves a key with more than
+    /// one row, or one row at a multiplicity other than one, is refused
+    /// with a [`Rejected`] naming the operator. Prefer
+    /// [`min`](Self::min) or [`max`](Self::max) when a key may
+    /// legitimately have several rows.
+    pub fn unique(&self) -> Keyed<K, V> {
+        let name = self.flow.name("unique", None);
+        let (input, state) = arranged(self, &format!("{name}.state"));
+        let mut b = self.flow.build.borrow_mut();
+        let id: KeyspaceId<K, Mergeless<V>> = b.id(&name);
+        let node = b.graph.nary(
+            &[input],
+            crate::constraints::Unique::new(name.as_str().into(), state, id),
+        );
+        drop(b);
+        Rows::at_stored(id, node.rows(), self.flow.build.clone(), name.into())
     }
 }

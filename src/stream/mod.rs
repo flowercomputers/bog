@@ -28,21 +28,14 @@
 use std::{cell::OnceCell, marker::PhantomData, rc::Rc, sync::Arc};
 
 use crate::{
-    Bag, Delta, Distinct, Emit, Explode, Filter, FilterMap, FlatMap, FusedLinears, Ident, Map,
-    Mergeless, Negate, Register, Sum, Tally, Then,
-    codec::{Codec, OrderedCodec},
-    graph::{NodeRef, OpDag},
-    merge::Merge,
-    ops::{
-        Arrange, DistinctCounts, DistinctRows, Distinctly, Flatten, Join, ReduceMany, Semijoin,
-        aggregate::{Aggregate, Take},
-        linear::{
-            ExplodeVal, FilterKV, FlatMapVal, KeyBy, Keys, MapVal, MapWith, ReKey, ReKeyWith,
-            Reindex, Unkey, Values,
-        },
-    },
-    state::{Arranged, Arrangement, Stored},
-    tx::KeyspaceId,
+    dataflow::graph::{NodeRef, OpDag},
+    dataflow::state::{Arranged, Arrangement, Stored},
+    dataflow::{Bag, Emit, FusedLinears, Ident, Register, Then},
+    ops::{Arrange, DistinctCounts, Distinctly, Flatten, linear::ReKeyWith},
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Merge,
+    store::merge::{Mergeless, Tally},
+    store::txn::KeyspaceId,
 };
 
 use crate::{
@@ -51,6 +44,26 @@ use crate::{
 };
 
 pub(crate) mod dynstate;
+
+/// Everything the operators' stream methods (in [`ops`](crate::ops))
+/// build with: the stream kinds and their internals, and what this
+/// module itself imports.
+pub(crate) mod prelude {
+    pub(crate) use super::dynstate::*;
+    pub(crate) use super::*;
+    pub(crate) use crate::{
+        dataflow::{Delta, Register, graph::NodeRef, state::Stored},
+        ops::*,
+        ops::{aggregate::*, linear::*},
+        schema::read::RegisterReader,
+        store::{
+            merge::{Mergeless, Tally},
+            txn::KeyspaceId,
+        },
+    };
+    pub(crate) use std::sync::Arc;
+}
+
 use dynstate::{DynKeyed, DynState, FilterMapValues, FilterMapped, ValueMap};
 
 /// What a stream can carry: ordered, encodable, and sendable. Keys and
@@ -68,10 +81,10 @@ impl<T: Data + Merge<Diff = T, Value = T>> Additive for T {}
 
 /// The graph node a chain starts from, giving rows of `T`.
 pub struct Root<T> {
-    node: RootNode<T>,
+    pub(crate) node: RootNode<T>,
 }
 
-enum RootNode<T> {
+pub(crate) enum RootNode<T> {
     Node(NodeRef<Bag<T>>),
     /// Made when first needed: the rows of a register node, which costs
     /// a node of its own.
@@ -82,14 +95,14 @@ enum RootNode<T> {
     Union(Rc<UnionNode<T>>),
 }
 
-struct LazyNode<T> {
-    made: OnceCell<NodeRef<Bag<T>>>,
-    make: Box<dyn Fn(&mut OpDag) -> NodeRef<Bag<T>>>,
+pub(crate) struct LazyNode<T> {
+    pub(crate) made: OnceCell<NodeRef<Bag<T>>>,
+    pub(crate) make: Box<dyn Fn(&mut OpDag) -> NodeRef<Bag<T>>>,
 }
 
-struct UnionNode<T> {
-    inputs: Vec<NodeRef<Bag<T>>>,
-    made: OnceCell<NodeRef<Bag<T>>>,
+pub(crate) struct UnionNode<T> {
+    pub(crate) inputs: Vec<NodeRef<Bag<T>>>,
+    pub(crate) made: OnceCell<NodeRef<Bag<T>>>,
 }
 
 impl<T> Clone for Root<T> {
@@ -129,7 +142,7 @@ impl<T: 'static> Root<T> {
         }
     }
 
-    fn node(&self, g: &mut OpDag) -> NodeRef<Bag<T>>
+    pub(crate) fn node(&self, g: &mut OpDag) -> NodeRef<Bag<T>>
     where
         T: Data,
     {
@@ -142,7 +155,7 @@ impl<T: 'static> Root<T> {
         }
     }
 
-    fn inputs(&self, g: &mut OpDag) -> Vec<NodeRef<Bag<T>>> {
+    pub(crate) fn inputs(&self, g: &mut OpDag) -> Vec<NodeRef<Bag<T>>> {
         match &self.node {
             RootNode::Node(n) => vec![*n],
             RootNode::Lazy(l) => vec![*l.made.get_or_init(|| (l.make)(g))],
@@ -223,14 +236,14 @@ where
 
 /// A [`Chain`] with its build and its name. See the module docs.
 pub struct Flow<T, C> {
-    chain: C,
-    build: Shared,
+    pub(crate) chain: C,
+    pub(crate) build: Shared,
     /// The name of this flow's root: a source or view name, or an
     /// operator name like `transfers.sum`. Operator keyspaces are named
     /// from it.
-    label: Arc<str>,
+    pub(crate) label: Arc<str>,
     /// The node this chain was built as, shared by its consumers.
-    attached: Rc<OnceCell<NodeRef<Bag<T>>>>,
+    pub(crate) attached: Rc<OnceCell<NodeRef<Bag<T>>>>,
 }
 
 impl<T, C: Clone> Clone for Flow<T, C> {
@@ -256,7 +269,7 @@ impl<T: Data> Flow<T, Root<T>> {
 }
 
 impl<T: Data, C: Chain<Out = T>> Flow<T, C> {
-    fn extend<Y>(&self, y: Y) -> Flow<Y::Emits, Ext<C, Y>>
+    pub(crate) fn extend<Y>(&self, y: Y) -> Flow<Y::Emits, Ext<C, Y>>
     where
         Y: Emit<T> + Clone + Send + 'static,
         Y::Emits: Data,
@@ -270,7 +283,7 @@ impl<T: Data, C: Chain<Out = T>> Flow<T, C> {
     }
 
     /// The node giving this flow's rows.
-    fn attach(&self) -> NodeRef<Bag<T>> {
+    pub(crate) fn attach(&self) -> NodeRef<Bag<T>> {
         *self.attached.get_or_init(|| {
             let mut b = self.build.borrow_mut();
             self.chain.attach(&mut b.graph)
@@ -279,7 +292,7 @@ impl<T: Data, C: Chain<Out = T>> Flow<T, C> {
 
     /// The nodes giving this flow's rows, for a consumer that unions
     /// its inputs: a union root's members, else the one node.
-    fn inputs(&self) -> Vec<NodeRef<Bag<T>>> {
+    pub(crate) fn inputs(&self) -> Vec<NodeRef<Bag<T>>> {
         match self.attached.get() {
             Some(n) => vec![*n],
             None => {
@@ -290,7 +303,7 @@ impl<T: Data, C: Chain<Out = T>> Flow<T, C> {
     }
 
     /// A fresh, unique operator name under this flow's label.
-    fn name(&self, kind: &str, other: Option<&str>) -> String {
+    pub(crate) fn name(&self, kind: &str, other: Option<&str>) -> String {
         let base = match other {
             Some(o) => format!("{}+{o}.{kind}", self.label),
             None => format!("{}.{kind}", self.label),
@@ -361,9 +374,9 @@ impl<K: Data, V: Data> Clone for KeyedOrigin<K, V> {
 /// its changes.
 pub(crate) struct Changes<K: Data, V: Data>(Rc<LazyChanges<K, V>>);
 
-struct LazyChanges<K: Data, V: Data> {
-    made: OnceCell<NodeRef<Register<K, Mergeless<V>>>>,
-    make: Box<dyn Fn(&mut OpDag) -> NodeRef<Register<K, Mergeless<V>>>>,
+pub(crate) struct LazyChanges<K: Data, V: Data> {
+    pub(crate) made: OnceCell<NodeRef<Register<K, Mergeless<V>>>>,
+    pub(crate) make: Box<dyn Fn(&mut OpDag) -> NodeRef<Register<K, Mergeless<V>>>>,
 }
 
 impl<K: Data, V: Data> Clone for Changes<K, V> {
@@ -382,7 +395,9 @@ impl<K: Data, V: Data> Changes<K, V> {
         }))
     }
 
-    fn lazy(make: impl Fn(&mut OpDag) -> NodeRef<Register<K, Mergeless<V>>> + 'static) -> Self {
+    pub(crate) fn lazy(
+        make: impl Fn(&mut OpDag) -> NodeRef<Register<K, Mergeless<V>>> + 'static,
+    ) -> Self {
         Changes(Rc::new(LazyChanges {
             made: OnceCell::new(),
             make: Box::new(make),
@@ -570,7 +585,7 @@ pub(crate) fn arranged<K: Data, V: Data>(
 
 /// A bag of `T`.
 pub struct Stream<T, C = Root<T>> {
-    flow: Flow<T, C>,
+    pub(crate) flow: Flow<T, C>,
 }
 
 /// How many rows a key may hold: the kind marker of [`Rows`].
@@ -584,11 +599,11 @@ impl Kind for Many {}
 
 /// `(K, V)` rows of kind `M`. Spelled [`Keyed`] or [`Grouped`].
 pub struct Rows<K: Data, V: Data, M, C = Root<(K, V)>> {
-    flow: Flow<(K, V), C>,
+    pub(crate) flow: Flow<(K, V), C>,
     /// Where the rows live, when an operator keeps them. Only a stream
     /// rooted at that operator has one: any combinator clears it.
-    origin: Option<KeyedOrigin<K, V>>,
-    _m: PhantomData<fn() -> M>,
+    pub(crate) origin: Option<KeyedOrigin<K, V>>,
+    pub(crate) _m: PhantomData<fn() -> M>,
 }
 
 /// `(K, V)` rows, any number per key.
@@ -619,7 +634,7 @@ impl<K: Data, V: Data, M, C: Clone> Clone for Rows<K, V, M, C> {
 }
 
 impl<T, C> Stream<T, C> {
-    fn from_flow(flow: Flow<T, C>) -> Self {
+    pub(crate) fn from_flow(flow: Flow<T, C>) -> Self {
         Stream { flow }
     }
 }
@@ -632,7 +647,7 @@ impl<T: Data> Stream<T> {
 }
 
 impl<K: Data, V: Data, M, C> Rows<K, V, M, C> {
-    fn from_flow(flow: Flow<(K, V), C>) -> Self {
+    pub(crate) fn from_flow(flow: Flow<(K, V), C>) -> Self {
         Rows {
             flow,
             origin: None,
@@ -730,529 +745,10 @@ impl<K: Data, V: Data, C: Chain<Out = (K, V)>> KeyedFeed<K, V> for Keyed<K, V, C
 // Linear combinators
 // ---------------------------------------------------------------------------
 
-impl<T: Data, C: Chain<Out = T>> Stream<T, C> {
-    pub fn map<U: Data, F>(&self, f: F) -> Stream<U, Ext<C, Map<F>>>
-    where
-        F: Fn(&T) -> U + Clone + Send + 'static,
-    {
-        Stream::from_flow(self.flow.extend(Map(f)))
-    }
-
-    pub fn filter<P>(&self, p: P) -> Stream<T, Ext<C, Filter<P>>>
-    where
-        P: Fn(&T) -> bool + Clone + Send + 'static,
-    {
-        Stream::from_flow(self.flow.extend(Filter(p)))
-    }
-
-    pub fn flat_map<I, F>(&self, f: F) -> Stream<I::Item, Ext<C, FlatMap<F>>>
-    where
-        I: IntoIterator + 'static,
-        I::Item: Data,
-        F: Fn(&T) -> I + Clone + Send + 'static,
-    {
-        Stream::from_flow(self.flow.extend(FlatMap(f)))
-    }
-
-    pub fn filter_map<U: Data, F>(&self, f: F) -> Stream<U, Ext<C, FilterMap<F>>>
-    where
-        F: Fn(&T) -> Option<U> + Clone + Send + 'static,
-    {
-        Stream::from_flow(self.flow.extend(FilterMap(f)))
-    }
-
-    /// Any number of weighted rows per row, each at the row's
-    /// multiplicity times its weight.
-    pub fn explode<I, U: Data, F>(&self, f: F) -> Stream<U, Ext<C, Explode<F>>>
-    where
-        I: IntoIterator<Item = (U, Delta)> + 'static,
-        F: Fn(&T) -> I + Clone + Send + 'static,
-    {
-        Stream::from_flow(self.flow.extend(Explode(f)))
-    }
-
-    /// Every row at the opposite multiplicity.
-    pub fn negate(&self) -> Stream<T, Ext<C, Negate>> {
-        Stream::from_flow(self.flow.extend(Negate))
-    }
-
-    /// Group the rows by `f`: `t` becomes `(f(&t), t)`.
-    pub fn key_by<K: Data, F>(&self, f: F) -> Grouped<K, T, Ext<C, KeyBy<F>>>
-    where
-        F: Fn(&T) -> K + Clone + Send + 'static,
-    {
-        Rows::from_flow(self.flow.extend(KeyBy(f)))
-    }
-}
-
-impl<K, V, M, C> Rows<K, V, M, C>
-where
-    K: Data,
-    V: Data,
-    M: Kind,
-    C: Chain<Out = (K, V)>,
-{
-    /// Map each value, keeping its key. Over a register an operator
-    /// keeps, the result is still one, read through `f`: a view defined
-    /// from it stores nothing.
-    pub fn map<W: Data, F>(&self, f: F) -> Rows<K, W, M, Ext<C, MapVal<F>>>
-    where
-        F: Fn(&V) -> W + Clone + Send + Sync + 'static,
-    {
-        let g = f.clone();
-        self.through(MapVal(f), Arc::new(move |_: &K, v: &V| Some(g(v))))
-    }
-
-    /// Map each value with its key, keeping the key. See [`map`](Self::map).
-    pub fn map_with<W: Data, F>(&self, f: F) -> Rows<K, W, M, Ext<C, MapWith<F>>>
-    where
-        F: Fn(&K, &V) -> W + Clone + Send + Sync + 'static,
-    {
-        let g = f.clone();
-        self.through(MapWith(f), Arc::new(move |k: &K, v: &V| Some(g(k, v))))
-    }
-
-    /// Keep the rows `p` accepts. See [`map`](Self::map).
-    pub fn filter<P>(&self, p: P) -> Rows<K, V, M, Ext<C, FilterKV<P>>>
-    where
-        P: Fn(&K, &V) -> bool + Clone + Send + Sync + 'static,
-    {
-        let q = p.clone();
-        self.through(
-            FilterKV(p),
-            Arc::new(move |k: &K, v: &V| q(k, v).then(|| v.clone())),
-        )
-    }
-
-    /// Map each value, dropping those `f` maps to `None`. See
-    /// [`map`](Self::map).
-    pub fn filter_map<W: Data, F>(&self, f: F) -> Rows<K, W, M, Ext<C, FlatMapVal<F>>>
-    where
-        F: Fn(&V) -> Option<W> + Clone + Send + Sync + 'static,
-    {
-        let g = f.clone();
-        self.through(FlatMapVal(f), Arc::new(move |_: &K, v: &V| g(v)))
-    }
-
-    /// Extend the chain by `stage`, which maps each value as `f` says,
-    /// keeping a register origin as a mapped register.
-    fn through<W: Data, Y>(&self, stage: Y, f: ValueMap<K, V, W>) -> Rows<K, W, M, Ext<C, Y>>
-    where
-        Y: Emit<(K, V), Emits = (K, W)> + Clone + Send + 'static,
-    {
-        Rows {
-            flow: self.flow.extend(stage),
-            origin: self.origin.as_ref().and_then(|o| o.filter_map(f)),
-            _m: PhantomData,
-        }
-    }
-
-    /// Regroup by `f` of the value. Two rows may now share a key, so
-    /// the result is grouped.
-    pub fn key_by<K2: Data, F>(&self, f: F) -> Grouped<K2, V, Ext<C, ReKey<F>>>
-    where
-        F: Fn(&V) -> K2 + Clone + Send + 'static,
-    {
-        Rows::from_flow(self.flow.extend(ReKey(f)))
-    }
-
-    /// Regroup by `f` of the key and value.
-    pub fn key_by_with<K2: Data, F>(&self, f: F) -> Grouped<K2, V, Ext<C, ReKeyWith<F>>>
-    where
-        F: Fn(&K, &V) -> K2 + Clone + Send + 'static,
-    {
-        Rows::from_flow(self.flow.extend(ReKeyWith(f)))
-    }
-
-    /// Just the keys, as a bag: one per row.
-    pub fn keys(&self) -> Stream<K, Ext<C, Keys>> {
-        Stream::from_flow(self.flow.extend(Keys))
-    }
-
-    /// Just the values, as a bag: one per row.
-    pub fn values(&self) -> Stream<V, Ext<C, Values>> {
-        Stream::from_flow(self.flow.extend(Values))
-    }
-
-    /// Leave the keyed world: the rows as a bag of pairs.
-    pub fn entries(&self) -> Stream<(K, V), C> {
-        Stream::from_flow(self.flow.clone())
-    }
-
-    /// The same rows, viewed as grouped: a register is a group of at
-    /// most one.
-    pub fn grouped(&self) -> Grouped<K, V, C> {
-        Rows {
-            flow: self.flow.clone(),
-            origin: self.origin.clone(),
-            _m: PhantomData,
-        }
-    }
-}
-
-impl<K, V, C> Grouped<K, V, C>
-where
-    K: Data,
-    V: Data,
-    C: Chain<Out = (K, V)>,
-{
-    /// Any number of values per value, each keeping the key.
-    pub fn flat_map<I, F>(&self, f: F) -> Grouped<K, I::Item, Ext<C, FlatMapVal<F>>>
-    where
-        I: IntoIterator + 'static,
-        I::Item: Data,
-        F: Fn(&V) -> I + Clone + Send + 'static,
-    {
-        Rows::from_flow(self.flow.extend(FlatMapVal(f)))
-    }
-
-    /// Weighted values per value, each keeping the key; see
-    /// [`Stream::explode`].
-    pub fn explode<I, W: Data, F>(&self, f: F) -> Grouped<K, W, Ext<C, ExplodeVal<F>>>
-    where
-        I: IntoIterator<Item = (W, Delta)> + 'static,
-        F: Fn(&V) -> I + Clone + Send + 'static,
-    {
-        Rows::from_flow(self.flow.extend(ExplodeVal(f)))
-    }
-}
-
-impl<K, V, C> Keyed<K, V, C>
-where
-    K: Data,
-    V: Data,
-    C: Chain<Out = (K, V)>,
-{
-    /// Re-key by a derived prefix, keeping the key as the last
-    /// component: `(k, v)` becomes `((f(&k, &v), k), v)`. Injective by
-    /// construction, so still a register: a secondary index, whose rows
-    /// sort by the prefix first.
-    pub fn index_by<X: Data, F>(&self, f: F) -> Keyed<(X, K), V, Ext<C, Reindex<F>>>
-    where
-        F: Fn(&K, &V) -> X + Clone + Send + 'static,
-    {
-        Rows::from_flow(self.flow.extend(Reindex(f)))
-    }
-
-    /// Every row under the one key `()`, for reductions over the whole
-    /// register.
-    fn unkeyed(&self) -> Grouped<(), V, Ext<C, Unkey>> {
-        Rows::from_flow(self.flow.extend(Unkey))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stateful combinators
-// ---------------------------------------------------------------------------
-
-impl<T: Data, C: Chain<Out = T>> Stream<T, C> {
-    /// Bag union with another stream. Costs nothing by itself: what
-    /// consumes the union takes both as inputs.
-    pub fn concat(&self, other: &impl StreamFeed<T>) -> Stream<T> {
-        let mut inputs = self.flow.inputs();
-        inputs.extend(other.inputs());
-        let name = self.flow.name("concat", Some(&other.label()));
-        Stream::rooted(Root::union(inputs), self.flow.build.clone(), name.into())
-    }
-
-    /// Each row once, however many times it occurs: set semantics.
-    pub fn distinct(&self) -> Stream<T> {
-        let inputs = self.flow.inputs();
-        let name = self.flow.name("distinct", None);
-        let mut b = self.flow.build.borrow_mut();
-        let id: KeyspaceId<T, Tally> = b.id(&name);
-        let node = b.graph.nary(&inputs, Distinct::new(id));
-        drop(b);
-        Stream::rooted(Root::at(node.rows()), self.flow.build.clone(), name.into())
-    }
-
-    /// Total multiplicity across the whole stream.
-    pub fn count(&self) -> Value<Delta> {
-        self.key_by(|_| ()).count()
-    }
-}
-
-/// The output of a [`Sum`] node, read through `pick`.
-fn summed<K, V, W, C>(
-    flow: &Flow<(K, V), C>,
-    kind: &str,
-    pick: impl Fn(&(Delta, V)) -> W + Send + Sync + 'static,
-) -> Keyed<K, W>
-where
-    K: Data,
-    V: Additive,
-    W: Data,
-    C: Chain<Out = (K, V)>,
-{
-    let inputs = flow.inputs();
-    let name = flow.name(kind, None);
-    let pick: Arc<dyn Fn(&(Delta, V)) -> W + Send + Sync> = Arc::new(pick);
-    let mut b = flow.build.borrow_mut();
-    let id: KeyspaceId<K, (Delta, V)> = b.id(&name);
-    let node = b.graph.nary(&inputs, Sum::<K, V>::new(id));
-    let p = pick.clone();
-    let mapped = b.graph.map_values(node, move |v| p(v));
-    let keyed = DynKeyed::new(b.graph.state(mapped));
-    drop(b);
-    let changes = Changes::at(mapped.rows());
-    let origin = KeyedOrigin::register(
-        keyed,
-        changes.clone(),
-        Arc::new(RegisterReader::new(id, pick)),
-    );
-    Rows::at_register(changes, origin, flow.build.clone(), name.into())
-}
-
-impl<K, V, C> Grouped<K, V, C>
-where
-    K: Data,
-    V: Data,
-    C: Chain<Out = (K, V)>,
-{
-    /// Union with another grouped (or keyed) stream on the same key.
-    /// Costs nothing by itself: what consumes the union takes both as
-    /// inputs.
-    pub fn concat(&self, other: &impl GroupedFeed<K, V>) -> Grouped<K, V> {
-        let mut inputs = self.flow.inputs();
-        inputs.extend(other.inputs());
-        let name = self.flow.name("concat", Some(&other.label()));
-        Rows::rooted(
-            Root::union(inputs),
-            self.flow.build.clone(),
-            name.into(),
-            None,
-        )
-    }
-
-    /// Each `(key, value)` once, however many times it occurs. The rows
-    /// are kept by key, so a grouped view defined from them, or a join
-    /// or reduction over them, reads them in place.
-    pub fn distinct(&self) -> Grouped<K, V> {
-        let inputs = self.flow.inputs();
-        let name = self.flow.name("distinct", None);
-        let mut b = self.flow.build.borrow_mut();
-        let id: DistinctCounts<K, V> = b.id(&name);
-        let node = b.graph.nary(&inputs, DistinctRows::new(id));
-        let origin = KeyedOrigin::distinct(b.graph.state(node));
-        drop(b);
-        Rows::rooted(
-            Root::at(node.rows()),
-            self.flow.build.clone(),
-            name.into(),
-            Some(origin),
-        )
-    }
-
-    /// Inner join against a grouped stream on the same key: every row
-    /// pairs with every right row of its key, at the product of their
-    /// multiplicities. Reads both sides' state; see the module docs.
-    pub fn join<B: Data, O: Data, F>(
-        &self,
-        other: &impl GroupedFeed<K, B>,
-        mut f: F,
-    ) -> Grouped<K, O>
-    where
-        F: FnMut(&K, &V, &B) -> O + Send + 'static,
-    {
-        let name = self.flow.name("join", Some(&other.label()));
-        let (l, ls) = arranged(self, &format!("{name}.left"));
-        let (r, rs) = arranged(other, &format!("{name}.right"));
-        let logic = move |k: &K, a: &V, b: &B| (k.clone(), f(k, a, b));
-        let node = self
-            .flow
-            .build
-            .borrow_mut()
-            .graph
-            .binary(l, r, Join::new(ls, rs, logic));
-        Rows::rooted(Root::at(node), self.flow.build.clone(), name.into(), None)
-    }
-
-    /// Total of the values per key. A key with values is present even
-    /// when they total zero; a key whose values are all retracted is
-    /// not. One accumulator per key, so a dirty key costs one lookup
-    /// whatever its group size.
-    pub fn sum(&self) -> Keyed<K, V>
-    where
-        V: Additive,
-    {
-        summed(&self.flow, "sum", |(_, v)| v.clone())
-    }
-
-    /// Multiplicity per key.
-    pub fn count(&self) -> Keyed<K, Delta> {
-        let unit: Grouped<K, (), _> = Rows::from_flow(self.flow.extend(MapVal(|_: &V| ())));
-        summed(&unit.flow, "count", |(n, _)| *n)
-    }
-
-    /// One value per key from the key's whole group, which arrives
-    /// sorted ascending, consolidated, each value with its multiplicity.
-    /// `f` is not called for a key whose group emptied.
-    pub fn aggregate<O: Data, F>(&self, f: F) -> Keyed<K, O>
-    where
-        F: FnMut(&K, &[(V, Delta)]) -> O + Send + 'static,
-    {
-        self.aggregated("aggregate", f, Take::Whole)
-    }
-
-    /// The least value of each key.
-    pub fn min(&self) -> Keyed<K, V> {
-        fn least<K, V: Clone>(_: &K, vals: &[(V, Delta)]) -> V {
-            vals[0].0.clone()
-        }
-        self.aggregated("min", least::<K, V>, Take::First(1))
-    }
-
-    /// The greatest value of each key.
-    pub fn max(&self) -> Keyed<K, V> {
-        fn greatest<K, V: Clone>(_: &K, vals: &[(V, Delta)]) -> V {
-            vals[vals.len() - 1].0.clone()
-        }
-        self.aggregated("max", greatest::<K, V>, Take::Last(1))
-    }
-
-    fn aggregated<O: Data, F>(&self, kind: &str, logic: F, take: Take) -> Keyed<K, O>
-    where
-        F: FnMut(&K, &[(V, Delta)]) -> O + Send + 'static,
-    {
-        let name = self.flow.name(kind, None);
-        let (input, state) = arranged(self, &format!("{name}.state"));
-        let mut b = self.flow.build.borrow_mut();
-        let id: KeyspaceId<K, Mergeless<O>> = b.id(&name);
-        let node = b
-            .graph
-            .nary(&[input], Aggregate::new(state, id, logic).reading(take));
-        drop(b);
-        Rows::at_stored(id, node.rows(), self.flow.build.clone(), name.into())
-    }
-
-    /// Any number of outputs per key from the key's whole group: the
-    /// most general reduction. The outputs are kept, so downstream
-    /// always holds `f` of the current groups.
-    pub fn reduce<O: Data, F>(&self, f: F) -> Grouped<K, O>
-    where
-        F: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send + 'static,
-    {
-        self.reduced("reduce", f, Take::Whole)
-    }
-
-    /// The `k` greatest distinct values of each key, each once.
-    pub fn top_k(&self, k: usize) -> Grouped<K, V> {
-        let logic = move |_: &K, vals: &[(V, Delta)], out: &mut Vec<(V, Delta)>| {
-            for (v, _) in vals.iter().rev().take(k) {
-                out.push((v.clone(), 1));
-            }
-        };
-        self.reduced("top_k", logic, Take::Last(k))
-    }
-
-    fn reduced<O: Data, F>(&self, kind: &str, logic: F, take: Take) -> Grouped<K, O>
-    where
-        F: FnMut(&K, &[(V, Delta)], &mut Vec<(O, Delta)>) + Send + 'static,
-    {
-        let name = self.flow.name(kind, None);
-        let (input, state) = arranged(self, &format!("{name}.state"));
-        let mut b = self.flow.build.borrow_mut();
-        let id: Arrangement<K, O> = b.id(&name);
-        let node = b
-            .graph
-            .nary(&[input], ReduceMany::new(state, id, logic).reading(take));
-        drop(b);
-        let origin = KeyedOrigin::arranged(id, None);
-        Rows::rooted(
-            Root::at(node.rows()),
-            self.flow.build.clone(),
-            name.into(),
-            Some(origin),
-        )
-    }
-}
-
-impl<K, V, M, C> Rows<K, V, M, C>
-where
-    K: Data,
-    V: Data,
-    M: Kind,
-    C: Chain<Out = (K, V)>,
-{
-    /// Inner join against a register on the same key: each row pairs
-    /// with the key's one right value, so the kind is kept.
-    pub fn with<B: Data, O: Data, F>(&self, other: &impl KeyedFeed<K, B>, mut f: F) -> Rows<K, O, M>
-    where
-        F: FnMut(&K, &V, &B) -> O + Send + 'static,
-    {
-        let name = self.flow.name("with", Some(&other.label()));
-        let (l, ls) = arranged(self, &format!("{name}.left"));
-        let (r, rs) = arranged(other, &format!("{name}.right"));
-        let logic = move |k: &K, a: &V, b: &B| (k.clone(), f(k, a, b));
-        let node = self
-            .flow
-            .build
-            .borrow_mut()
-            .graph
-            .binary(l, r, Join::new(ls, rs, logic));
-        Rows::rooted(Root::at(node), self.flow.build.clone(), name.into(), None)
-    }
-
-    /// The rows whose key the other side has: SQL's `EXISTS`.
-    pub fn matching<B: Data>(&self, other: &impl GroupedFeed<K, B>) -> Rows<K, V, M> {
-        self.semijoin(other, false)
-    }
-
-    /// The rows whose key the other side lacks: `NOT EXISTS`.
-    pub fn without<B: Data>(&self, other: &impl GroupedFeed<K, B>) -> Rows<K, V, M> {
-        self.semijoin(other, true)
-    }
-
-    fn semijoin<B: Data>(&self, other: &impl GroupedFeed<K, B>, anti: bool) -> Rows<K, V, M> {
-        let kind = if anti { "without" } else { "matching" };
-        let name = self.flow.name(kind, Some(&other.label()));
-        let (l, ls) = arranged(self, &format!("{name}.left"));
-        let (r, rs) = arranged(other, &format!("{name}.right"));
-        let op = if anti {
-            Semijoin::without(ls, rs)
-        } else {
-            Semijoin::matching(ls, rs)
-        };
-        let node = self.flow.build.borrow_mut().graph.binary(l, r, op);
-        Rows::rooted(Root::at(node), self.flow.build.clone(), name.into(), None)
-    }
-}
-
-impl<K, V, C> Keyed<K, V, C>
-where
-    K: Data,
-    V: Data,
-    C: Chain<Out = (K, V)>,
-{
-    /// Number of rows in the register.
-    pub fn count(&self) -> Value<Delta> {
-        self.unkeyed().count()
-    }
-
-    pub fn min(&self) -> Value<V> {
-        self.unkeyed().min()
-    }
-
-    pub fn max(&self) -> Value<V> {
-        self.unkeyed().max()
-    }
-
-    /// Total of every value in the register.
-    pub fn sum(&self) -> Value<V>
-    where
-        V: Additive,
-    {
-        self.unkeyed().sum()
-    }
-
-    /// One value from every row of the register.
-    pub fn aggregate<O: Data, F>(&self, mut f: F) -> Value<O>
-    where
-        F: FnMut(&[((K, V), Delta)]) -> O + Send + 'static,
-    {
-        let unit: Grouped<(), (K, V), _> =
-            Rows::from_flow(self.flow.extend(KeyBy(|_: &(K, V)| ())));
-        unit.aggregate(move |_, rows| f(rows))
+impl<K: Data, C: Chain<Out = K>> Stream<K, C> {
+    /// The build this stream belongs to.
+    pub(crate) fn shared(&self) -> &Shared {
+        &self.flow.build
     }
 }
 
@@ -1277,61 +773,5 @@ where
             self.flow.label.clone(),
             None,
         )
-    }
-}
-
-impl<K, V, C> Grouped<K, V, C>
-where
-    K: Data + std::fmt::Debug,
-    V: Data,
-    C: Chain<Out = (K, V)>,
-{
-    /// Treat this grouped stream as a register, enforcing that it is
-    /// one row per key. A transaction that leaves a key with more than
-    /// one row, or one row at a multiplicity other than one, is refused
-    /// with a [`Rejected`](crate::Rejected) naming the operator. Prefer
-    /// [`min`](Self::min) or [`max`](Self::max) when a key may
-    /// legitimately have several rows.
-    pub fn unique(&self) -> Keyed<K, V> {
-        let name = self.flow.name("unique", None);
-        let (input, state) = arranged(self, &format!("{name}.state"));
-        let mut b = self.flow.build.borrow_mut();
-        let id: KeyspaceId<K, Mergeless<V>> = b.id(&name);
-        let node = b.graph.nary(
-            &[input],
-            crate::constraints::Unique::new(name.as_str().into(), state, id),
-        );
-        drop(b);
-        Rows::at_stored(id, node.rows(), self.flow.build.clone(), name.into())
-    }
-}
-
-impl<K: Data, C: Chain<Out = K>> Stream<K, C> {
-    /// The keys here that `parent` lacks, after each run, and the
-    /// operator's name: the rows a foreign key refuses. The keys are
-    /// counted, so the state is one count per distinct key.
-    pub(crate) fn dangling<B: Data>(
-        &self,
-        parent: &impl GroupedFeed<K, B>,
-    ) -> (NodeRef<Bag<K>>, String) {
-        let name = self.flow.name("foreign_key", Some(&parent.label()));
-        let inputs = self.flow.inputs();
-        let counts = {
-            let mut b = self.flow.build.borrow_mut();
-            let id: KeyspaceId<K, Tally> = b.id(&format!("{name}.refs"));
-            b.graph.nary(&inputs, crate::ops::CountRows::new(id))
-        };
-        let (r, rs) = arranged(parent, &format!("{name}.parents"));
-        let mut b = self.flow.build.borrow_mut();
-        let refs = b.graph.state(counts);
-        let node = b
-            .graph
-            .binary(counts.rows(), r, crate::ops::ForeignKey::new(refs, rs));
-        (node, name)
-    }
-
-    /// The build this stream belongs to.
-    pub(crate) fn shared(&self) -> &Shared {
-        &self.flow.build
     }
 }

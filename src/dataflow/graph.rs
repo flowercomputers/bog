@@ -1,11 +1,14 @@
 use crate::{
-    Bag, Binary, Buffer, Change, Mergeless, Nary, Node, Register, Tally, Unary, WriteTx,
-    codec::{Codec, OrderedCodec},
+    dataflow::state::{Declare, Delivered, Filtered, KeyedState, Mapped, State, Stored},
+    dataflow::{Bag, Binary, Buffer, Nary, Node, Register, Unary},
     error::Result,
-    merge::Merge,
-    state::{Declare, Delivered, Filtered, KeyedState, Mapped, State, Stored},
     store::StoreBuilder,
-    tx::KeyspaceId,
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Change,
+    store::merge::Merge,
+    store::merge::{Mergeless, Tally},
+    store::txn::KeyspaceId,
+    store::txn::WriteTx,
 };
 use smallvec::SmallVec;
 use std::{
@@ -58,7 +61,7 @@ type OpDagNodeId = usize;
 
 /// Typed, copyable handle to a node's output. `B` is the buffer type the
 /// node gives (`Bag<_>` or `Register<_, _>`), so wiring a child whose
-/// `Takes` differs is a compile error. `S` is its [state](crate::state)
+/// `Takes` differs is a compile error. `S` is its [state](crate::dataflow::state)
 /// handle, `()` for none, which children read through
 /// [`unary_with`](OpDag::unary_with) and its siblings.
 pub struct NodeRef<B, S = ()>(OpDagNodeId, PhantomData<fn() -> (B, S)>);
@@ -934,7 +937,7 @@ fn change<T: Clone + PartialEq + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Bag;
+    use crate::dataflow::Bag;
     use crate::store::{DurabilityPolicy, StoreBuilder};
 
     struct Double;

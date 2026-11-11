@@ -3,7 +3,7 @@
 //! A node's delta is what changed in one run. Its *state* is its whole
 //! output: a keyspace it owns, or a view computed over its parent's
 //! state. Children get their parents' state handles when they are
-//! built (see [`OpDag::binary_with`](crate::graph::OpDag::binary_with)),
+//! built (see [`OpDag::binary_with`](crate::dataflow::graph::OpDag::binary_with)),
 //! so an operator reads what already exists rather than keeping a copy.
 //! A handle reads the state as it is now ([`When::New`]) or as it was at
 //! the start of the run ([`When::Old`]); parents run before children,
@@ -15,12 +15,13 @@ use std::{
 };
 
 use crate::{
-    Bag, Buffer, Delta, Mergeless, Register,
-    codec::{Codec, OrderedCodec},
+    dataflow::{Bag, Buffer, Delta, Register},
     error::Result,
-    merge::{Merge, Tally},
     store::StoreBuilder,
-    tx::{KeyspaceId, WriteTx},
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Mergeless,
+    store::merge::{Merge, Tally},
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 /// Which state to read.
@@ -444,7 +445,7 @@ where
     }
 }
 
-/// The state of a [`Distinct`](crate::Distinct) node: every row whose
+/// The state of a [`Distinct`](crate::ops::Distinct) node: every row whose
 /// count is positive, once, under its own key, with value `()`.
 pub struct Counted<T> {
     id: KeyspaceId<T, Tally>,
@@ -636,13 +637,13 @@ impl Declare {
     }
 
     /// A derived keyspace whose runs carry an `I`; see
-    /// [`RunIndex`](crate::index::RunIndex).
+    /// [`RunIndex`](crate::store::index::RunIndex).
     pub fn derived_indexed<K, M, I>(id: KeyspaceId<K, M>) -> Self
     where
         K: OrderedCodec + Clone + Send + Sync + 'static,
         M: Merge,
         M::Value: Codec + Sync,
-        I: crate::index::RunIndex<K, M::Value>,
+        I: crate::store::index::RunIndex<K, M::Value>,
     {
         Declare {
             id: id.raw(),

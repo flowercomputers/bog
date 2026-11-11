@@ -1,5 +1,5 @@
 //! Stored sources: typed handles on the base keyspaces an application
-//! writes, each a thin layer over a keyspace of a [`Db`](crate::Db).
+//! writes, each a thin layer over a keyspace of a [`Db`](crate::raw::Db).
 //!
 //! - [`Table`]: one value per key, last writer wins.
 //! - [`Set`]: distinct membership, a table of `()`.
@@ -17,19 +17,19 @@
 use std::ops::Bound;
 
 use crate::{
-    Bag, Change, Delta, Mergeless, Register, Tally,
-    codec::{Codec, OrderedCodec},
     database::DbTx,
+    dataflow::graph::{NodeRef, OpDag},
+    dataflow::state::Stored,
+    dataflow::{Bag, Delta, Register},
     error::Result,
-    graph::{NodeRef, OpDag},
     id::Id,
-    state::Stored,
-    tx::{KeyspaceId, WriteTx},
+    store::codec::Codec,
+    store::merge::Change,
+    store::merge::{Mergeless, Tally},
+    store::txn::{KeyspaceId, WriteTx},
 };
 
-/// What a table can hold as a key.
-pub trait Key: OrderedCodec + Clone + Send + Sync + 'static {}
-impl<T: OrderedCodec + Clone + Send + Sync + 'static> Key for T {}
+pub use crate::ops::Key;
 
 /// What a table can hold as a value.
 pub trait Value: Codec + Clone + PartialEq + Send + Sync + 'static {}

@@ -13,10 +13,11 @@ use std::{
 };
 
 use fold3::{
-    Change, Db, Distinct, DurabilityPolicy, FlatMap, FusedLinears, Id, KeyspaceId, OpDag,
-    StoreBuilder, Sum, Tally,
-    ops::Flatten,
-    source::{Cell, Events, Multiset, Retain, Set, Table},
+    DurabilityPolicy, Id, StoreBuilder, Tally,
+    raw::{
+        Cell, Change, Db, Distinct, Events, FlatMap, Flatten, FusedLinears, KeyspaceId, Multiset,
+        OpDag, Retain, Set, Sum, Table,
+    },
 };
 
 /// A reading: (sensor, value).
@@ -284,7 +285,7 @@ fn a_subscription_follows_a_keyspace_from_its_snapshot() {
     assert_eq!(checkpoints.load(Ordering::SeqCst), through);
 
     drop(db);
-    assert!(matches!(sub.try_recv(), Err(fold3::subscribe::Closed)));
+    assert!(matches!(sub.try_recv(), Err(fold3::raw::Closed)));
     assert!(late.recv().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }

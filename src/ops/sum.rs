@@ -2,16 +2,17 @@
 
 use std::borrow::Cow;
 
+use crate::stream::prelude::*;
 use crate::{
-    Bag, Buffer, Change, Delta, Nary, Register,
-    codec::{Codec, OrderedCodec},
+    dataflow::{Bag, Buffer, Delta, Nary, Register, vec_scratch},
     dataflow::{
         Fingerprint,
         state::{Declare, Stored},
     },
-    merge::*,
-    tx::{KeyspaceId, WriteTx},
-    vec_scratch,
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Change,
+    store::merge::*,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 pub struct Sum<K, V: Merge> {
@@ -113,5 +114,69 @@ where
         // this node is the keyspace's only writer, so what changed in it
         // this run is exactly the delta
         ks.run_changes(out);
+    }
+}
+
+// The stream methods: how a schema declares this operator.
+
+impl<T: Data, C: Chain<Out = T>> Stream<T, C> {
+    /// Total multiplicity across the whole stream.
+    pub fn count(&self) -> Value<Delta> {
+        self.key_by(|_| ()).count()
+    }
+}
+
+/// The output of a [`Sum`] node, read through `pick`.
+fn summed<K, V, W, C>(
+    flow: &Flow<(K, V), C>,
+    kind: &str,
+    pick: impl Fn(&(Delta, V)) -> W + Send + Sync + 'static,
+) -> Keyed<K, W>
+where
+    K: Data,
+    V: Additive,
+    W: Data,
+    C: Chain<Out = (K, V)>,
+{
+    let inputs = flow.inputs();
+    let name = flow.name(kind, None);
+    let pick: Arc<dyn Fn(&(Delta, V)) -> W + Send + Sync> = Arc::new(pick);
+    let mut b = flow.build.borrow_mut();
+    let id: KeyspaceId<K, (Delta, V)> = b.id(&name);
+    let node = b.graph.nary(&inputs, Sum::<K, V>::new(id));
+    let p = pick.clone();
+    let mapped = b.graph.map_values(node, move |v| p(v));
+    let keyed = DynKeyed::new(b.graph.state(mapped));
+    drop(b);
+    let changes = Changes::at(mapped.rows());
+    let origin = KeyedOrigin::register(
+        keyed,
+        changes.clone(),
+        Arc::new(RegisterReader::new(id, pick)),
+    );
+    Rows::at_register(changes, origin, flow.build.clone(), name.into())
+}
+
+impl<K, V, C> Grouped<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Total of the values per key. A key with values is present even
+    /// when they total zero; a key whose values are all retracted is
+    /// not. One accumulator per key, so a dirty key costs one lookup
+    /// whatever its group size.
+    pub fn sum(&self) -> Keyed<K, V>
+    where
+        V: Additive,
+    {
+        summed(&self.flow, "sum", |(_, v)| v.clone())
+    }
+
+    /// Multiplicity per key.
+    pub fn count(&self) -> Keyed<K, Delta> {
+        let unit: Grouped<K, (), _> = Rows::from_flow(self.flow.extend(MapVal(|_: &V| ())));
+        summed(&unit.flow, "count", |(n, _)| *n)
     }
 }

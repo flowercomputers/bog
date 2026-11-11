@@ -1,7 +1,7 @@
 //! Sorted tables: the on-disk form of a checkpoint.
 //!
 //! A table holds sorted runs for any number of keyspaces. Keys are stored in
-//! their [`OrderedCodec`](crate::codec::OrderedCodec) encoding, whose byte
+//! their [`OrderedCodec`](crate::store::codec::OrderedCodec) encoding, whose byte
 //! order matches the key type's `Ord`, so the table compares raw bytes and
 //! never needs to know key or value types.
 //!
@@ -36,7 +36,7 @@ use std::{
 
 use crate::{
     error::{Error, IoContext, Result},
-    index::TableIndexes,
+    store::index::TableIndexes,
 };
 
 const MAGIC: &[u8; 8] = b"fold3sst";

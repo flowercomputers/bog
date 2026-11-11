@@ -10,10 +10,12 @@
 use std::time::Instant;
 
 use fold3::{
-    Change, Check, Db, Distinct, DurabilityPolicy, FlatMap, FusedLinears, IndexBy, KeyspaceId, Map,
-    Mergeless, OpDag, StoreBuilder, Sum, Tally,
-    ops::{Arrange, Flatten, ForeignKey, Reject},
-    state::Arrangement,
+    DurabilityPolicy, Mergeless, StoreBuilder, Tally,
+    dataflow::state::Arrangement,
+    raw::{
+        Arrange, Change, Check, Db, Distinct, FlatMap, Flatten, ForeignKey, FusedLinears, IndexBy,
+        KeyspaceId, Map, OpDag, Reject, Sum,
+    },
 };
 
 type User = u64;

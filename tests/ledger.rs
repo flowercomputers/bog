@@ -5,10 +5,12 @@
 use std::{borrow::Cow, collections::BTreeMap, path::PathBuf};
 
 use fold3::{
-    Db, DurabilityPolicy, Error, FlatMap, FusedLinears, KeyspaceId, Mergeless, OpDag, StoreBuilder,
-    Sum, Tally,
-    ops::{Arrange, Flatten, ForeignKey, Join, Reject},
-    state::{Arrangement, Edge},
+    DurabilityPolicy, Error, Mergeless, StoreBuilder, Tally,
+    dataflow::state::{Arrangement, Edge},
+    raw::{
+        Arrange, Db, FlatMap, Flatten, ForeignKey, FusedLinears, Join, KeyspaceId, OpDag, Reject,
+        Sum,
+    },
 };
 
 type Account = u64;

@@ -1,11 +1,16 @@
 //! Linear operators over rows: map, filter and their kin, keying, and
 //! per-value variants over keyed rows `(K, V)`. They are [`Emit`]
-//! stages, fused into one node by [`FusedLinears`](crate::FusedLinears).
+//! stages, fused into one node by [`FusedLinears`](crate::dataflow::FusedLinears).
 //! [`Flatten`] turns a register's changes into rows.
 
 use std::{borrow::Cow, marker::PhantomData};
 
-use crate::{Bag, Delta, Emit, Register, Unary, merge::Merge, tx::WriteTx};
+use crate::stream::prelude::*;
+use crate::{
+    dataflow::{Bag, Delta, Emit, Register, Unary},
+    store::merge::Merge,
+    store::txn::WriteTx,
+};
 
 /// Keys each row by `f`: `t` becomes `(f(&t), t)`.
 #[derive(Clone)]
@@ -374,8 +379,8 @@ where
 
 /// A register's changes as rows: an insert is the new row at `+1`, a
 /// delete the old row at `-1`, a replace both. Turns a register, such as
-/// a table or [`Sum`](crate::Sum)'s output, into rows for the linear
-/// operators and [`Arrange`](super::Arrange).
+/// a table or [`Sum`]'s output, into rows for the linear
+/// operators and [`Arrange`].
 pub struct Flatten<K, M>(PhantomData<fn() -> (K, M)>);
 
 impl<K, M> Default for Flatten<K, M> {
@@ -406,3 +411,220 @@ where
         }
     }
 }
+
+// The stream methods: how a schema declares this operator.
+
+impl<T: Data, C: Chain<Out = T>> Stream<T, C> {
+    pub fn map<U: Data, F>(&self, f: F) -> Stream<U, Ext<C, Map<F>>>
+    where
+        F: Fn(&T) -> U + Clone + Send + 'static,
+    {
+        Stream::from_flow(self.flow.extend(Map(f)))
+    }
+
+    pub fn filter<P>(&self, p: P) -> Stream<T, Ext<C, Filter<P>>>
+    where
+        P: Fn(&T) -> bool + Clone + Send + 'static,
+    {
+        Stream::from_flow(self.flow.extend(Filter(p)))
+    }
+
+    pub fn flat_map<I, F>(&self, f: F) -> Stream<I::Item, Ext<C, FlatMap<F>>>
+    where
+        I: IntoIterator + 'static,
+        I::Item: Data,
+        F: Fn(&T) -> I + Clone + Send + 'static,
+    {
+        Stream::from_flow(self.flow.extend(FlatMap(f)))
+    }
+
+    pub fn filter_map<U: Data, F>(&self, f: F) -> Stream<U, Ext<C, FilterMap<F>>>
+    where
+        F: Fn(&T) -> Option<U> + Clone + Send + 'static,
+    {
+        Stream::from_flow(self.flow.extend(FilterMap(f)))
+    }
+
+    /// Any number of weighted rows per row, each at the row's
+    /// multiplicity times its weight.
+    pub fn explode<I, U: Data, F>(&self, f: F) -> Stream<U, Ext<C, Explode<F>>>
+    where
+        I: IntoIterator<Item = (U, Delta)> + 'static,
+        F: Fn(&T) -> I + Clone + Send + 'static,
+    {
+        Stream::from_flow(self.flow.extend(Explode(f)))
+    }
+
+    /// Every row at the opposite multiplicity.
+    pub fn negate(&self) -> Stream<T, Ext<C, Negate>> {
+        Stream::from_flow(self.flow.extend(Negate))
+    }
+
+    /// Group the rows by `f`: `t` becomes `(f(&t), t)`.
+    pub fn key_by<K: Data, F>(&self, f: F) -> Grouped<K, T, Ext<C, KeyBy<F>>>
+    where
+        F: Fn(&T) -> K + Clone + Send + 'static,
+    {
+        Rows::from_flow(self.flow.extend(KeyBy(f)))
+    }
+}
+
+impl<K, V, M, C> Rows<K, V, M, C>
+where
+    K: Data,
+    V: Data,
+    M: Kind,
+    C: Chain<Out = (K, V)>,
+{
+    /// Map each value, keeping its key. Over a register an operator
+    /// keeps, the result is still one, read through `f`: a view defined
+    /// from it stores nothing.
+    pub fn map<W: Data, F>(&self, f: F) -> Rows<K, W, M, Ext<C, MapVal<F>>>
+    where
+        F: Fn(&V) -> W + Clone + Send + Sync + 'static,
+    {
+        let g = f.clone();
+        self.through(MapVal(f), Arc::new(move |_: &K, v: &V| Some(g(v))))
+    }
+
+    /// Map each value with its key, keeping the key. See [`map`](Self::map).
+    pub fn map_with<W: Data, F>(&self, f: F) -> Rows<K, W, M, Ext<C, MapWith<F>>>
+    where
+        F: Fn(&K, &V) -> W + Clone + Send + Sync + 'static,
+    {
+        let g = f.clone();
+        self.through(MapWith(f), Arc::new(move |k: &K, v: &V| Some(g(k, v))))
+    }
+
+    /// Keep the rows `p` accepts. See [`map`](Self::map).
+    pub fn filter<P>(&self, p: P) -> Rows<K, V, M, Ext<C, FilterKV<P>>>
+    where
+        P: Fn(&K, &V) -> bool + Clone + Send + Sync + 'static,
+    {
+        let q = p.clone();
+        self.through(
+            FilterKV(p),
+            Arc::new(move |k: &K, v: &V| q(k, v).then(|| v.clone())),
+        )
+    }
+
+    /// Map each value, dropping those `f` maps to `None`. See
+    /// [`map`](Self::map).
+    pub fn filter_map<W: Data, F>(&self, f: F) -> Rows<K, W, M, Ext<C, FlatMapVal<F>>>
+    where
+        F: Fn(&V) -> Option<W> + Clone + Send + Sync + 'static,
+    {
+        let g = f.clone();
+        self.through(FlatMapVal(f), Arc::new(move |_: &K, v: &V| g(v)))
+    }
+
+    /// Extend the chain by `stage`, which maps each value as `f` says,
+    /// keeping a register origin as a mapped register.
+    fn through<W: Data, Y>(&self, stage: Y, f: ValueMap<K, V, W>) -> Rows<K, W, M, Ext<C, Y>>
+    where
+        Y: Emit<(K, V), Emits = (K, W)> + Clone + Send + 'static,
+    {
+        Rows {
+            flow: self.flow.extend(stage),
+            origin: self.origin.as_ref().and_then(|o| o.filter_map(f)),
+            _m: PhantomData,
+        }
+    }
+
+    /// Regroup by `f` of the value. Two rows may now share a key, so
+    /// the result is grouped.
+    pub fn key_by<K2: Data, F>(&self, f: F) -> Grouped<K2, V, Ext<C, ReKey<F>>>
+    where
+        F: Fn(&V) -> K2 + Clone + Send + 'static,
+    {
+        Rows::from_flow(self.flow.extend(ReKey(f)))
+    }
+
+    /// Regroup by `f` of the key and value.
+    pub fn key_by_with<K2: Data, F>(&self, f: F) -> Grouped<K2, V, Ext<C, ReKeyWith<F>>>
+    where
+        F: Fn(&K, &V) -> K2 + Clone + Send + 'static,
+    {
+        Rows::from_flow(self.flow.extend(ReKeyWith(f)))
+    }
+
+    /// Just the keys, as a bag: one per row.
+    pub fn keys(&self) -> Stream<K, Ext<C, Keys>> {
+        Stream::from_flow(self.flow.extend(Keys))
+    }
+
+    /// Just the values, as a bag: one per row.
+    pub fn values(&self) -> Stream<V, Ext<C, Values>> {
+        Stream::from_flow(self.flow.extend(Values))
+    }
+
+    /// Leave the keyed world: the rows as a bag of pairs.
+    pub fn entries(&self) -> Stream<(K, V), C> {
+        Stream::from_flow(self.flow.clone())
+    }
+
+    /// The same rows, viewed as grouped: a register is a group of at
+    /// most one.
+    pub fn grouped(&self) -> Grouped<K, V, C> {
+        Rows {
+            flow: self.flow.clone(),
+            origin: self.origin.clone(),
+            _m: PhantomData,
+        }
+    }
+}
+
+impl<K, V, C> Grouped<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Any number of values per value, each keeping the key.
+    pub fn flat_map<I, F>(&self, f: F) -> Grouped<K, I::Item, Ext<C, FlatMapVal<F>>>
+    where
+        I: IntoIterator + 'static,
+        I::Item: Data,
+        F: Fn(&V) -> I + Clone + Send + 'static,
+    {
+        Rows::from_flow(self.flow.extend(FlatMapVal(f)))
+    }
+
+    /// Weighted values per value, each keeping the key; see
+    /// [`Stream::explode`].
+    pub fn explode<I, W: Data, F>(&self, f: F) -> Grouped<K, W, Ext<C, ExplodeVal<F>>>
+    where
+        I: IntoIterator<Item = (W, Delta)> + 'static,
+        F: Fn(&V) -> I + Clone + Send + 'static,
+    {
+        Rows::from_flow(self.flow.extend(ExplodeVal(f)))
+    }
+}
+
+impl<K, V, C> Keyed<K, V, C>
+where
+    K: Data,
+    V: Data,
+    C: Chain<Out = (K, V)>,
+{
+    /// Re-key by a derived prefix, keeping the key as the last
+    /// component: `(k, v)` becomes `((f(&k, &v), k), v)`. Injective by
+    /// construction, so still a register: a secondary index, whose rows
+    /// sort by the prefix first.
+    pub fn index_by<X: Data, F>(&self, f: F) -> Keyed<(X, K), V, Ext<C, Reindex<F>>>
+    where
+        F: Fn(&K, &V) -> X + Clone + Send + 'static,
+    {
+        Rows::from_flow(self.flow.extend(Reindex(f)))
+    }
+
+    /// Every row under the one key `()`, for reductions over the whole
+    /// register.
+    pub(crate) fn unkeyed(&self) -> Grouped<(), V, Ext<C, Unkey>> {
+        Rows::from_flow(self.flow.extend(Unkey))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stateful combinators
+// ---------------------------------------------------------------------------

@@ -19,16 +19,16 @@ use std::{
 };
 
 use crate::{
-    Buffer,
-    codec::{Codec, OrderedCodec},
+    dataflow::Buffer,
+    dataflow::graph::{NodeRef, OpDag},
     error::{Error, Result},
-    graph::{NodeRef, OpDag},
     id::Id,
-    merge::Merge,
     source::{Events, EventsRetention, Retain, Retention, Value},
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Merge,
+    store::subscribe::Subscription,
+    store::txn::{Keyspace, KeyspaceId, WriteTx},
     store::{Snapshot, Store, StoreBuilder},
-    subscribe::Subscription,
-    tx::{Keyspace, KeyspaceId, WriteTx},
 };
 
 /// Rows a rebuild reads from a table per transaction, by default.

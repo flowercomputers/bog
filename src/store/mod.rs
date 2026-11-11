@@ -53,17 +53,19 @@ pub mod txn;
 use arc_swap::ArcSwap;
 
 use crate::{
-    codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
-    cursor::{Cursor, Source, empty_bounds},
+    dataflow::graph::{DEFAULT_GRAPH_RETAIN, Fingerprint},
     error::{Error, IoContext, Result},
-    graph::{DEFAULT_GRAPH_RETAIN, Fingerprint},
-    index::{Aux, EncodedBuilder, IndexKind, IndexedRun, LayerIndexes, Run, RunIndex, table_index},
-    merge::Merge,
     store::DurabilityPolicyCadence::Never,
+    store::codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
+    store::cursor::{Cursor, Source, empty_bounds},
+    store::index::{
+        Aux, EncodedBuilder, IndexKind, IndexedRun, LayerIndexes, Run, RunIndex, table_index,
+    },
     store::manifest::{Checkpoint, InstallError, MANIFEST_TMP, Manifest, Segment},
+    store::merge::Merge,
+    store::subscribe::{Publish, Senders, Subscription},
     store::table::{BlockCache, DEFAULT_BLOCK_SIZE, TOMBSTONE, Table, TableBuilder, TableCursor},
-    subscribe::{Publish, Senders, Subscription},
-    tx::{KeyspaceId, OverlayRun, TxState, WriteTx},
+    store::txn::{KeyspaceId, OverlayRun, TxState, WriteTx},
 };
 
 /// An open store: a handle on its [`Shared`] state. Dropping it stops and

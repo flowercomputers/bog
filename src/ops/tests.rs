@@ -12,18 +12,21 @@ use std::{
 
 use super::{aggregate as reduce, linear::*, *};
 use crate::{
-    Bag, Delta, Nary, Register, Tally,
-    merge::Merge,
-    state::{Arranged, Arrangement},
-    tx::{KeyspaceId, WriteTx},
+    database::Db,
+    dataflow::graph::{NodeRef, OpDag},
+    dataflow::state::Stored,
+    dataflow::{FusedLinears, Then},
+    error::Error,
+    ops::Map,
+    store::merge::Mergeless,
+    store::{DurabilityPolicy, StoreBuilder},
 };
 use crate::{
-    FusedLinears, Map, Mergeless, Then,
-    database::Db,
-    error::Error,
-    graph::{NodeRef, OpDag},
-    state::Stored,
-    store::{DurabilityPolicy, StoreBuilder},
+    dataflow::state::{Arranged, Arrangement},
+    dataflow::{Bag, Delta, Nary, Register},
+    store::merge::Merge,
+    store::merge::Tally,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 type Rows<T> = BTreeMap<T, Delta>;
@@ -752,7 +755,7 @@ fn unstored_sources_need_the_application_to_replay_them() {
         .range(EVENTS, ..)
         .map(|r| {
             r.map(|(k, _)| match &k.1 {
-                crate::state::Edge::Val(v) => (k.0, *v),
+                crate::dataflow::state::Edge::Val(v) => (k.0, *v),
                 _ => unreachable!(),
             })
             .unwrap()
@@ -771,7 +774,7 @@ fn matching_reads_a_distincts_state() {
         |g, l, r| {
             let l = g.nary(&[l], Arrange::new(AL, TL));
             let keys = g.nary(&[r], FusedLinears::new(Keys));
-            let seen = g.nary(&[keys], crate::Distinct::new(SEEN));
+            let seen = g.nary(&[keys], crate::ops::Distinct::new(SEEN));
             g.binary_with(l, seen, Semijoin::matching)
         },
         |l, r| semijoin_expected(l, r, false),

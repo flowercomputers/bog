@@ -3,14 +3,15 @@
 use std::marker::PhantomData;
 
 use crate::{
-    Bag, Change, Nary, Register,
-    codec::OrderedCodec,
+    dataflow::{Bag, Nary, Register},
     dataflow::{
         Fingerprint,
         state::{Declare, Stored},
     },
-    merge::*,
-    tx::{KeyspaceId, WriteTx},
+    store::codec::OrderedCodec,
+    store::merge::Change,
+    store::merge::*,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 /// Maintains `index`, a keyspace holding `key(k, v)` for every live

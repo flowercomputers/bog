@@ -71,10 +71,10 @@
 //! method, which returns the error. `foreign_key` and `unique` are
 //! dataflow, and `reject`/`check` on a view run after the graph: a
 //! violation fails the whole transaction. Every refusal arrives as
-//! [`Error::Rejected`](crate::Error::Rejected) carrying the constraint's
+//! [`Error::Rejected`](crate::error::Error::Rejected) carrying the constraint's
 //! error, a [`Rejected`] for the predicate forms; recover it with
-//! [`Error::rejected`](crate::Error::rejected). A write closure refuses
-//! its own transaction the same way, with [`Error::reject`](crate::Error::reject).
+//! [`Error::rejected`](crate::error::Error::rejected). A write closure refuses
+//! its own transaction the same way, with [`Error::reject`](crate::error::Error::reject).
 //!
 //! # Composition
 //!
@@ -91,7 +91,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::{Snapshot, database::DbTx};
+use crate::{database::DbTx, store::Snapshot};
 
 mod db;
 pub(crate) mod read;
@@ -110,7 +110,7 @@ pub use crate::stream::*;
 pub use subscribe::*;
 pub use view::*;
 
-pub use crate::Delta;
+pub use crate::dataflow::Delta;
 pub use crate::id::Id;
 pub use crate::source::Retain;
 

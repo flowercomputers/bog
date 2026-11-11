@@ -20,7 +20,7 @@ use std::{
     marker::PhantomData,
 };
 
-use crate::codec::{self, BufMut, Codec, OrderedCodec, ResidentSize};
+use crate::store::codec::{self, BufMut, Codec, OrderedCodec, ResidentSize};
 
 const SEQ_BITS: u32 = 24;
 const SEQ_MASK: u64 = (1 << SEQ_BITS) - 1;

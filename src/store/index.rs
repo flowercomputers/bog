@@ -30,11 +30,11 @@ use std::{
 };
 
 use crate::{
-    codec::{Codec, DecodeError, OrderedCodec, decode_all, decode_all_ordered},
-    cursor::{Cursor, Source, empty_bounds},
     error::{Error, Result},
-    merge::Merge,
     store::Resident,
+    store::codec::{Codec, DecodeError, OrderedCodec, decode_all, decode_all_ordered},
+    store::cursor::{Cursor, Source, empty_bounds},
+    store::merge::Merge,
     store::table::{BlockCache, Table},
 };
 

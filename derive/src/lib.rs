@@ -104,7 +104,7 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error().into(),
     };
-    let codec = quote!(#krate::codec);
+    let codec = quote!(#krate::store::codec);
 
     let mut generics = input.generics.clone();
     for p in generics.type_params_mut() {

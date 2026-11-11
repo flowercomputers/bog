@@ -32,9 +32,10 @@
 use std::{cell::OnceCell, collections::HashMap, marker::PhantomData, ops::Deref, sync::Arc};
 
 use crate::{
-    Bag, Delta, Nary, Tally,
-    state::{Declare, Edge},
-    tx::{KeyspaceId, WriteTx},
+    dataflow::state::{Declare, Edge},
+    dataflow::{Bag, Delta, Nary},
+    store::merge::Tally,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use crate::schema::{
@@ -159,7 +160,7 @@ impl<D: Data, T: Tokenizer> Nary for Index<D, T> {
         ]
     }
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         fp.write_str(T::NAME);
     }
 
@@ -168,14 +169,14 @@ impl<D: Data, T: Tokenizer> Nary for Index<D, T> {
             self.tf = HashMap::new();
         }
         self.tf.capacity() * size_of::<(String, Delta)>()
-            + crate::vec_scratch(&mut self.postings, release)
-            + crate::vec_scratch(&mut self.terms, release)
-            + crate::vec_scratch(&mut self.lengths, release)
+            + crate::dataflow::vec_scratch(&mut self.postings, release)
+            + crate::dataflow::vec_scratch(&mut self.terms, release)
+            + crate::dataflow::vec_scratch(&mut self.lengths, release)
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Self::Takes], out: &mut Self::Gives) {
         if self.run(tx, batches, out).is_err() {
-            crate::Buffer::clear(out);
+            crate::dataflow::Buffer::clear(out);
         }
     }
 }

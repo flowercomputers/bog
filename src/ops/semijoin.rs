@@ -5,13 +5,14 @@
 //! [`without`]: Semijoin::without
 
 use crate::{
-    Bag, Binary, Delta,
+    dataflow::state::{State, When},
+    dataflow::{Bag, Binary, Delta},
     error::Result,
-    state::{State, When},
-    tx::WriteTx,
+    store::txn::WriteTx,
 };
 
 use super::{Groups, Take, read_group};
+use crate::stream::prelude::*;
 
 /// Passes left rows `(k, a)` while the right side has a row of key `k`
 /// ([`matching`](Self::matching), SQL's `EXISTS`), or while it has none
@@ -112,17 +113,55 @@ where
 
     fn state(&self) {}
 
-    fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
+    fn fingerprint(&self, fp: &mut crate::dataflow::graph::Fingerprint) {
         fp.write_u64(self.anti as u64);
     }
 
     fn scratch(&mut self, release: bool) -> usize {
-        crate::vec_scratch(&mut self.dirty, release)
-            + crate::vec_scratch(&mut self.group, release)
+        crate::dataflow::vec_scratch(&mut self.dirty, release)
+            + crate::dataflow::vec_scratch(&mut self.group, release)
             + self.rows.scratch(release)
     }
 
     fn eval(&mut self, tx: &mut WriteTx, l: &L::Delta, r: &R::Delta, out: &mut Self::Gives) {
         let _ = self.run(tx, l, r, out);
+    }
+}
+
+// The stream methods: how a schema declares this operator.
+
+impl<K, V, M, C> Rows<K, V, M, C>
+where
+    K: Data,
+    V: Data,
+    M: Kind,
+    C: Chain<Out = (K, V)>,
+{
+    /// The rows whose key the other side has: SQL's `EXISTS`.
+    pub fn matching<B: Data>(&self, other: &impl GroupedFeed<K, B>) -> Rows<K, V, M> {
+        self.semijoin(other, false)
+    }
+
+    /// The rows whose key the other side lacks: `NOT EXISTS`.
+    pub fn without<B: Data>(&self, other: &impl GroupedFeed<K, B>) -> Rows<K, V, M> {
+        self.semijoin(other, true)
+    }
+
+    pub(crate) fn semijoin<B: Data>(
+        &self,
+        other: &impl GroupedFeed<K, B>,
+        anti: bool,
+    ) -> Rows<K, V, M> {
+        let kind = if anti { "without" } else { "matching" };
+        let name = self.flow.name(kind, Some(&other.label()));
+        let (l, ls) = arranged(self, &format!("{name}.left"));
+        let (r, rs) = arranged(other, &format!("{name}.right"));
+        let op = if anti {
+            Semijoin::without(ls, rs)
+        } else {
+            Semijoin::matching(ls, rs)
+        };
+        let node = self.flow.build.borrow_mut().graph.binary(l, r, op);
+        Rows::rooted(Root::at(node), self.flow.build.clone(), name.into(), None)
     }
 }

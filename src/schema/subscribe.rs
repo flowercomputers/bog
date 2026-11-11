@@ -5,14 +5,16 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    Change as RawChange, Delta, Mergeless, Tally,
-    codec::{Codec, OrderedCodec},
-    merge::Merge,
-    state::Edge,
-    subscribe as raw,
+    dataflow::Delta,
+    dataflow::state::Edge,
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Change as RawChange,
+    store::merge::Merge,
+    store::merge::{Mergeless, Tally},
+    store::subscribe as raw,
 };
 
-pub use crate::subscribe::Closed;
+pub use crate::store::subscribe::Closed;
 
 /// One committed transaction's changes to a source or view.
 #[derive(Clone, Debug)]

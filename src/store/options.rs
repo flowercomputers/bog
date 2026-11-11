@@ -29,8 +29,8 @@ pub struct StoreOptions {
     /// layers than this. Every layer is checked on a read, so this bounds
     /// read cost when maintenance falls behind.
     pub max_layers: usize,
-    /// Bytes of buffers a [`Db`](crate::Db)'s graph may keep between
-    /// runs; see [`OpDag::retain`](crate::graph::OpDag::retain).
+    /// Bytes of buffers a [`Db`](crate::raw::Db)'s graph may keep between
+    /// runs; see [`OpDag::retain`](crate::dataflow::graph::OpDag::retain).
     pub graph_retain: usize,
     /// How much memory the store should plan to use in all, or `None`
     /// for no plan. It is not enforced as such: it sets every memory
@@ -168,8 +168,8 @@ pub struct MemoryStats {
     /// Changes sent to subscriptions and not yet received, counted once
     /// however many subscribers share them.
     pub subscription_bytes: usize,
-    /// Buffers the [`Db`](crate::Db)'s graph holds between runs; see
-    /// [`OpDag::retain`](crate::graph::OpDag::retain). Zero for a store
+    /// Buffers the [`Db`](crate::raw::Db)'s graph holds between runs; see
+    /// [`OpDag::retain`](crate::dataflow::graph::OpDag::retain). Zero for a store
     /// without one.
     pub graph_bytes: usize,
 }

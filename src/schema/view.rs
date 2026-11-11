@@ -12,10 +12,12 @@ use std::{
 };
 
 use crate::{
-    Bag, IndexBy, Mergeless, Nary, Register,
+    dataflow::state::Edge,
+    dataflow::{Bag, Nary, Register},
+    ops::IndexBy,
     ops::{Arrange, Materialize},
-    state::Edge,
-    tx::{KeyspaceId, WriteTx},
+    store::merge::Mergeless,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use super::{
@@ -517,7 +519,7 @@ impl<V: Data> ViewDecl for ValueView<V> {
 
 #[allow(dead_code)]
 fn _uses<K: Data, V: Data>(
-    r: &Register<K, crate::Mergeless<V>>,
-) -> &Register<K, crate::Mergeless<V>> {
+    r: &Register<K, crate::store::merge::Mergeless<V>>,
+) -> &Register<K, crate::store::merge::Mergeless<V>> {
     r
 }

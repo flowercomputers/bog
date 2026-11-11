@@ -121,7 +121,7 @@ impl StoreBuilder {
     }
 
     /// The fingerprint of the graph that computes the derived keyspaces,
-    /// typically [`OpDag::fingerprint`](crate::graph::OpDag::fingerprint)
+    /// typically [`OpDag::fingerprint`](crate::dataflow::graph::OpDag::fingerprint)
     /// mixed with a schema version.
     pub fn graph(mut self, fingerprint: u64) -> Self {
         self.graph = fingerprint;
@@ -206,7 +206,7 @@ impl StoreBuilder {
     /// through the tx, as inserts, and run it; chunking keeps each tx
     /// within the tx memory limit. Chunks commit as they go, but the store
     /// is not handed out until the last, so nobody sees a partial rebuild.
-    /// Each tx reports [`WriteTx::rebuilding`], and [`Check`](crate::Check)
+    /// Each tx reports [`WriteTx::rebuilding`], and [`Check`](crate::ops::Check)
     /// accepts everything in one: a chunk can hold a state the rows never
     /// passed through, such as a sum with only its negative rows so far.
     /// The rows were checked when first written; a check added since is

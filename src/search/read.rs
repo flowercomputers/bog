@@ -8,13 +8,14 @@ use std::{
 };
 
 use crate::{
-    Delta, Snapshot,
-    codec::{Codec, OrderedCodec},
+    dataflow::Delta,
+    dataflow::state::Edge,
     error::Result,
-    merge::Merge,
-    state::Edge,
-    subscribe as raw,
-    tx::{KeyspaceId, WriteTx},
+    store::Snapshot,
+    store::codec::{Codec, OrderedCodec},
+    store::merge::Merge,
+    store::subscribe as raw,
+    store::txn::{KeyspaceId, WriteTx},
 };
 
 use super::{
@@ -128,7 +129,11 @@ impl<'a, D: Data, T: Tokenizer> SearchRead<'a, D, T> {
     }
 
     /// An amount in a tally keyspace, zero when absent.
-    fn amount<K: TallyKey>(&self, id: KeyspaceId<K, crate::Tally>, key: &K) -> Result<Delta> {
+    fn amount<K: TallyKey>(
+        &self,
+        id: KeyspaceId<K, crate::store::merge::Tally>,
+        key: &K,
+    ) -> Result<Delta> {
         self.at.with(
             |s| Ok(s.get(id, key)?.map_or(0, |n| *n)),
             |tx| Ok(tx.keyspace(id).get(key)?.map_or(0, |n| *n)),
@@ -138,7 +143,7 @@ impl<'a, D: Data, T: Tokenizer> SearchRead<'a, D, T> {
     /// The rows of a tally keyspace in `range`, collected.
     fn rows<K: TallyKey>(
         &self,
-        id: KeyspaceId<K, crate::Tally>,
+        id: KeyspaceId<K, crate::store::merge::Tally>,
         range: impl RangeBounds<K>,
     ) -> Result<Vec<(K, Delta)>> {
         let (lo, hi) = (range.start_bound().cloned(), range.end_bound().cloned());
@@ -170,7 +175,7 @@ impl<'a, D: Data, T: Tokenizer> SearchRead<'a, D, T> {
 
     /// The postings keyspace: [`Posting`] keys at term frequency, the
     /// escape hatch to [`Snapshot::runs_indexed`].
-    pub fn postings_keyspace(&self) -> KeyspaceId<Posting<D>, crate::Tally> {
+    pub fn postings_keyspace(&self) -> KeyspaceId<Posting<D>, crate::store::merge::Tally> {
         self.h.postings
     }
 
@@ -351,8 +356,9 @@ impl<'a, D: Data, T: Tokenizer> SearchRead<'a, D, T> {
         avg: f64,
     ) -> Result<Option<Vec<(D, f64)>>> {
         // every block of every query term across runs, tagged by term
-        let runs =
-            snap.runs_indexed::<Posting<D>, crate::Tally, PostingBlocks<D>>(self.h.postings)?;
+        let runs = snap.runs_indexed::<Posting<D>, crate::store::merge::Tally, PostingBlocks<D>>(
+            self.h.postings,
+        )?;
         let mut indexes = Vec::with_capacity(runs.len());
         for run in &runs {
             let Some(index) = run.index() else {
@@ -509,16 +515,19 @@ impl<'a, D: Data, T: Tokenizer> SearchRead<'a, D, T> {
 
 /// The postings keyspace's commits as `(term id, doc, change in tf)`.
 struct PostingChanges<D> {
-    sub: raw::Subscription<Posting<D>, crate::Tally>,
+    sub: raw::Subscription<Posting<D>, crate::store::merge::Tally>,
 }
 
 impl<D: Clone> PostingChanges<D> {
-    fn commit(&self, d: raw::Delta<Posting<D>, crate::Tally>) -> Commit<(u64, D, Delta)> {
+    fn commit(
+        &self,
+        d: raw::Delta<Posting<D>, crate::store::merge::Tally>,
+    ) -> Commit<(u64, D, Delta)> {
         let changes = d
             .changes
             .iter()
             .map(|((term, doc, _), c)| {
-                let (crate::Change::Insert(by), Edge::Val(doc)) = (c, doc) else {
+                let (crate::store::merge::Change::Insert(by), Edge::Val(doc)) = (c, doc) else {
                     unreachable!("postings are amounts by document")
                 };
                 (*term, doc.clone(), *by)
@@ -537,13 +546,13 @@ impl<D: Data> Recv<(u64, D, Delta)> for PostingChanges<D> {
     }
     fn try_recv(
         &self,
-    ) -> std::result::Result<Option<Commit<(u64, D, Delta)>>, crate::subscribe::Closed> {
+    ) -> std::result::Result<Option<Commit<(u64, D, Delta)>>, crate::store::subscribe::Closed> {
         Ok(self.sub.try_recv()?.map(|d| self.commit(d)))
     }
     fn recv_timeout(
         &self,
         timeout: std::time::Duration,
-    ) -> std::result::Result<Option<Commit<(u64, D, Delta)>>, crate::subscribe::Closed> {
+    ) -> std::result::Result<Option<Commit<(u64, D, Delta)>>, crate::store::subscribe::Closed> {
         Ok(self.sub.recv_timeout(timeout)?.map(|d| self.commit(d)))
     }
 }

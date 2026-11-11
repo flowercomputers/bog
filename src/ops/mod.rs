@@ -17,10 +17,10 @@
 //! - [`Minus`] and [`Flatten`], small adapters.
 //!
 //! An operator that needs a parent's whole output reads the parent's
-//! [state](crate::state) instead of keeping a copy: a table, a register an
+//! [state](crate::dataflow::state) instead of keeping a copy: a table, a register an
 //! operator keeps, or an [`Arrange`] node, which several operators can
 //! share. Build them with
-//! [`OpDag::binary_with`](crate::graph::OpDag::binary_with) and its
+//! [`OpDag::binary_with`](crate::dataflow::graph::OpDag::binary_with) and its
 //! siblings, which hand them their parents' state handles.
 
 pub mod aggregate;
