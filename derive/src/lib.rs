@@ -123,17 +123,17 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
                 types,
                 ctor,
             } = shape(&s.fields);
-            encode = quote! { let Self #pattern = self; #( <#types as #codec::Codec>::encode(#names, out); )* };
-            encode_ordered = quote! { let Self #pattern = self; #( <#types as #codec::OrderedCodec>::encode_ordered(#names, out); )* };
+            encode = quote! { let Self #pattern = self; #( <#types as #codec::Codec>::encode(#names, __out); )* };
+            encode_ordered = quote! { let Self #pattern = self; #( <#types as #codec::OrderedCodec>::encode_ordered(#names, __out); )* };
             size = quote! { let Self #pattern = self; 0 #( + <#types as #codec::Codec>::encode_size(#names) )* };
             size_ordered = quote! { let Self #pattern = self; 0 #( + <#types as #codec::OrderedCodec>::encode_ordered_size(#names) )* };
             resident = quote! { let Self #pattern = self; ::std::mem::size_of::<Self>() #( + #codec::heap_size(#names) )* };
             decode = quote! {
-                #( let #names = <#types as #codec::Codec>::decode(b)?; )*
+                #( let #names = <#types as #codec::Codec>::decode(__input)?; )*
                 ::std::result::Result::Ok(Self #ctor)
             };
             decode_ordered = quote! {
-                #( let #names = <#types as #codec::OrderedCodec>::decode_ordered(b)?; )*
+                #( let #names = <#types as #codec::OrderedCodec>::decode_ordered(__input)?; )*
                 ::std::result::Result::Ok(Self #ctor)
             };
         }
@@ -158,10 +158,10 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
                     ctor,
                 } = shape(&v.fields);
                 enc_arms.extend(quote! {
-                    Self::#vname #pattern => { <u8 as #codec::Codec>::encode(&#tag, out); #( <#types as #codec::Codec>::encode(#names, out); )* }
+                    Self::#vname #pattern => { <u8 as #codec::Codec>::encode(&#tag, __out); #( <#types as #codec::Codec>::encode(#names, __out); )* }
                 });
                 enc_ord_arms.extend(quote! {
-                    Self::#vname #pattern => { <u8 as #codec::Codec>::encode(&#tag, out); #( <#types as #codec::OrderedCodec>::encode_ordered(#names, out); )* }
+                    Self::#vname #pattern => { <u8 as #codec::Codec>::encode(&#tag, __out); #( <#types as #codec::OrderedCodec>::encode_ordered(#names, __out); )* }
                 });
                 size_arms.extend(quote! {
                     Self::#vname #pattern => 1 #( + <#types as #codec::Codec>::encode_size(#names) )*,
@@ -173,10 +173,10 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
                     Self::#vname #pattern => ::std::mem::size_of::<Self>() #( + #codec::heap_size(#names) )*,
                 });
                 dec_arms.extend(quote! {
-                    #tag => { #( let #names = <#types as #codec::Codec>::decode(b)?; )* ::std::result::Result::Ok(Self::#vname #ctor) }
+                    #tag => { #( let #names = <#types as #codec::Codec>::decode(__input)?; )* ::std::result::Result::Ok(Self::#vname #ctor) }
                 });
                 dec_ord_arms.extend(quote! {
-                    #tag => { #( let #names = <#types as #codec::OrderedCodec>::decode_ordered(b)?; )* ::std::result::Result::Ok(Self::#vname #ctor) }
+                    #tag => { #( let #names = <#types as #codec::OrderedCodec>::decode_ordered(__input)?; )* ::std::result::Result::Ok(Self::#vname #ctor) }
                 });
             }
             let what = name.to_string();
@@ -186,13 +186,13 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
             size_ordered = quote! { match self { #size_ord_arms } };
             resident = quote! { match self { #res_arms } };
             decode = quote! {
-                match <u8 as #codec::Codec>::decode(b)? {
+                match <u8 as #codec::Codec>::decode(__input)? {
                     #dec_arms
                     tag => ::std::result::Result::Err(#codec::DecodeError::InvalidTag { what: #what, tag }),
                 }
             };
             decode_ordered = quote! {
-                match <u8 as #codec::Codec>::decode(b)? {
+                match <u8 as #codec::Codec>::decode(__input)? {
                     #dec_ord_arms
                     tag => ::std::result::Result::Err(#codec::DecodeError::InvalidTag { what: #what, tag }),
                 }
@@ -208,10 +208,10 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
             }
         }
         impl #impl_g #codec::Codec for #name #ty_g #where_c {
-            fn encode(&self, out: &mut impl #codec::BufMut) {
+            fn encode(&self, __out: &mut impl #codec::BufMut) {
                 #encode
             }
-            fn decode(b: &mut &[u8]) -> #codec::Result<Self> {
+            fn decode(__input: &mut &[u8]) -> #codec::Result<Self> {
                 #decode
             }
             fn encode_size(&self) -> usize {
@@ -219,10 +219,10 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
             }
         }
         impl #impl_g #codec::OrderedCodec for #name #ty_g #where_c {
-            fn encode_ordered(&self, out: &mut impl #codec::BufMut) {
+            fn encode_ordered(&self, __out: &mut impl #codec::BufMut) {
                 #encode_ordered
             }
-            fn decode_ordered(b: &mut &[u8]) -> #codec::Result<Self> {
+            fn decode_ordered(__input: &mut &[u8]) -> #codec::Result<Self> {
                 #decode_ordered
             }
             fn encode_ordered_size(&self) -> usize {

@@ -666,6 +666,109 @@ impl_tuple_codec!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
 // std only implements Ord to arity 12
 impl_tuple_codec!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
 
+impl<T: ResidentSize> ResidentSize for std::cmp::Reverse<T> {
+    fn resident_size(&self) -> usize {
+        self.0.resident_size()
+    }
+}
+
+/// Stored as `T` is.
+impl<T: Codec> Codec for std::cmp::Reverse<T> {
+    fn encode(&self, out: &mut impl BufMut) {
+        self.0.encode(out)
+    }
+    fn decode(b: &mut &[u8]) -> Result<Self> {
+        T::decode(b).map(std::cmp::Reverse)
+    }
+    fn encode_size(&self) -> usize {
+        self.0.encode_size()
+    }
+}
+
+/// `T`'s ordered bytes, each complemented, so keys sort in reverse.
+///
+/// Every ordered encoding is self-delimiting (its decoder knows where it
+/// ends), so no value's bytes are a proper prefix of another's: two
+/// values first differ at a byte inside both, and complementing that
+/// byte reverses the comparison, whatever follows in a composite key.
+impl<T: OrderedCodec> OrderedCodec for std::cmp::Reverse<T> {
+    fn encode_ordered(&self, out: &mut impl BufMut) {
+        let mut inner = Vec::with_capacity(self.0.encode_ordered_size());
+        self.0.encode_ordered(&mut inner);
+        for byte in &mut inner {
+            *byte = !*byte;
+        }
+        out.put_slice(&inner);
+    }
+    fn decode_ordered(b: &mut &[u8]) -> Result<Self> {
+        // T's decoder reads plain bytes and stops where its encoding
+        // ends, so un-complement what follows and advance by what it took
+        let plain: Vec<u8> = b.iter().map(|byte| !byte).collect();
+        let mut rest = &plain[..];
+        let v = T::decode_ordered(&mut rest)?;
+        *b = &b[plain.len() - rest.len()..];
+        Ok(std::cmp::Reverse(v))
+    }
+    fn encode_ordered_size(&self) -> usize {
+        self.0.encode_ordered_size()
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use std::cmp::Reverse;
+
+    use super::*;
+
+    fn ordered<T: OrderedCodec>(v: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        v.encode_ordered(&mut out);
+        assert_eq!(out.len(), v.encode_ordered_size());
+        out
+    }
+
+    #[test]
+    fn sorts_backwards_and_round_trips_inside_a_key() {
+        let mut keys: Vec<((u8, Reverse<i64>), String)> = Vec::new();
+        for price in [-5i64, 0, 3, 3, 900, i64::MIN, i64::MAX] {
+            for name in ["", "a", "ab"] {
+                keys.push(((1, Reverse(price)), name.to_string()));
+            }
+        }
+        let mut by_bytes = keys.clone();
+        by_bytes.sort_by_key(ordered);
+        keys.sort();
+        assert_eq!(by_bytes, keys);
+        for k in &keys {
+            assert_eq!(
+                decode_all_ordered::<((u8, Reverse<i64>), String)>(&ordered(k)).unwrap(),
+                *k
+            );
+        }
+
+        let names = [
+            Reverse("".to_string()),
+            Reverse("a".into()),
+            Reverse("a\0".into()),
+            Reverse("b".into()),
+        ];
+        let mut by_bytes = names.to_vec();
+        by_bytes.sort_by_key(ordered);
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        assert_eq!(by_bytes, sorted);
+        assert_eq!(
+            decode_all::<Reverse<u32>>(&{
+                let mut o = Vec::new();
+                Reverse(7u32).encode(&mut o);
+                o
+            })
+            .unwrap(),
+            Reverse(7)
+        );
+    }
+}
+
 #[cfg(test)]
 mod resident_size_tests {
     use super::*;

@@ -556,6 +556,70 @@ fn an_event_log_evicts_through_its_views() {
 }
 
 #[derive(Schema)]
+struct Sensors {
+    readings: Events<(u8, i64)>,
+    #[view]
+    by_sensor: GroupView<u8, i64>,
+}
+
+impl Declare for Sensors {
+    fn declare(b: &mut SensorsBuilder) {
+        b.by_sensor
+            .define(&b.readings.key_by(|&(sensor, _)| sensor).map(|&(_, v)| v));
+    }
+}
+
+#[test]
+fn a_group_view_scans_a_range_of_keys() {
+    let db = Sensors::memory().build().unwrap();
+    db.write(|tx| {
+        for r in [(1u8, 5i64), (2, 9), (2, 3), (3, 4), (5, 1), (5, 1)] {
+            tx.readings.push(r)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let rows = |it: &mut dyn Iterator<Item = fold3::Result<(u8, i64, i64)>>| {
+        it.collect::<fold3::Result<Vec<_>>>().unwrap()
+    };
+    db.read(|r| {
+        // every group in the range, keys then values ascending, with
+        // multiplicities; bounds on keys, never splitting a group
+        assert_eq!(
+            rows(&mut r.by_sensor.range(2..=3)),
+            vec![(2, 3, 1), (2, 9, 1), (3, 4, 1)]
+        );
+        assert_eq!(
+            rows(&mut r.by_sensor.range(2..5)),
+            vec![(2, 3, 1), (2, 9, 1), (3, 4, 1)]
+        );
+        assert_eq!(rows(&mut r.by_sensor.range(4..)), vec![(5, 1, 2)]);
+        assert_eq!(rows(&mut r.by_sensor.range(..2)), vec![(1, 5, 1)]);
+        let after = (std::ops::Bound::Excluded(2), std::ops::Bound::Unbounded);
+        assert_eq!(
+            rows(&mut r.by_sensor.range(after)),
+            vec![(3, 4, 1), (5, 1, 2)]
+        );
+        assert_eq!(
+            rows(&mut r.by_sensor.range_rev(1..=2)),
+            vec![(2, 9, 1), (2, 3, 1), (1, 5, 1)]
+        );
+        assert!(rows(&mut r.by_sensor.range(6..)).is_empty());
+    });
+    // inside a transaction, the range sees the transaction's own writes
+    db.write(|tx| {
+        tx.readings.push((4, 8))?;
+        let seen = tx
+            .by_sensor
+            .range(3..=4)
+            .collect::<fold3::Result<Vec<_>>>()?;
+        assert_eq!(seen, vec![(3, 4, 1), (4, 8, 1)]);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[derive(Schema)]
 struct People {
     people: Table<Id<(String, u8)>, (String, u8)>,
     #[view]

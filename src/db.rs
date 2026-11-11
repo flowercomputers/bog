@@ -80,6 +80,8 @@ impl Db {
     ) -> Result<Db> {
         let fp = graph.fingerprint();
         let builder = graph.declare(builder).graph(fp);
+        // unless the graph was given its own limit
+        graph.retain_default(builder.resolved_options().graph_retain);
         let mut started = false;
         let mut next_table = 0;
         let mut tables_done = false;
@@ -102,6 +104,7 @@ impl Db {
             let more = replay(tx, &mut graph)?;
             tx.failure().map_or(Ok(more), Err)
         })?;
+        graph.gauge(store.graph_gauge());
         Ok(Db {
             store,
             graph: Mutex::new(graph),

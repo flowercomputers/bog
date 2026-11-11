@@ -99,6 +99,10 @@ where
 
     fn state(&self) {}
 
+    fn scratch(&mut self, release: bool) -> usize {
+        self.left_rows.scratch(release) + self.right_rows.scratch(release)
+    }
+
     fn eval(&mut self, tx: &mut WriteTx, l: &L::Delta, r: &R::Delta, out: &mut Bag<O>) {
         // on failure the tx has failed, and the graph stops after this node
         let _ = self.run(tx, l, r, out);

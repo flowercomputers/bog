@@ -60,6 +60,37 @@ fn roundtrip<T: Codec + OrderedCodec + PartialEq + std::fmt::Debug>(value: &T) {
     assert!(input.is_empty());
 }
 
+/// Fields named like the generated code's own bindings (the buffers
+/// `encode` writes to and `decode` reads from, an enum's tag): the
+/// derive must not let them shadow its parameters.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, DeriveCodec)]
+struct Tether {
+    a: u32,
+    b: u32,
+    out: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, DeriveCodec)]
+enum Shadowed {
+    Named { b: i64, out: u8, tag: u8 },
+    Tuple(u8, String),
+}
+
+#[test]
+fn fields_named_like_the_generated_bindings() {
+    roundtrip(&Tether {
+        a: 1,
+        b: 2,
+        out: "x".into(),
+    });
+    roundtrip(&Shadowed::Named {
+        b: -4,
+        out: 5,
+        tag: 6,
+    });
+    roundtrip(&Shadowed::Tuple(7, "y".into()));
+}
+
 #[test]
 fn derived_types_roundtrip() {
     roundtrip(&Order {

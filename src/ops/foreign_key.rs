@@ -73,6 +73,10 @@ where
 
     fn state(&self) {}
 
+    fn scratch(&mut self, release: bool) -> usize {
+        crate::vec_scratch(&mut self.dirty, release)
+    }
+
     fn eval(&mut self, tx: &mut WriteTx, l: &L::Delta, r: &R::Delta, out: &mut Bag<L::Key>) {
         let _ = self.run(tx, l, r, out);
     }

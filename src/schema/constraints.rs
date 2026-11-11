@@ -389,6 +389,10 @@ where
         fp.write_u64(self.output.raw());
     }
 
+    fn scratch(&mut self, release: bool) -> usize {
+        crate::vec_scratch(&mut self.dirty, release) + crate::vec_scratch(&mut self.vals, release)
+    }
+
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {
         let _ = self.run(tx, batches, out);
     }

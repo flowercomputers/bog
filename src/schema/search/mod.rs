@@ -163,6 +163,16 @@ impl<D: Data, T: Tokenizer> Nary for Index<D, T> {
         fp.write_str(T::NAME);
     }
 
+    fn scratch(&mut self, release: bool) -> usize {
+        if release {
+            self.tf = HashMap::new();
+        }
+        self.tf.capacity() * size_of::<(String, Delta)>()
+            + crate::vec_scratch(&mut self.postings, release)
+            + crate::vec_scratch(&mut self.terms, release)
+            + crate::vec_scratch(&mut self.lengths, release)
+    }
+
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Self::Takes], out: &mut Self::Gives) {
         if self.run(tx, batches, out).is_err() {
             crate::Buffer::clear(out);

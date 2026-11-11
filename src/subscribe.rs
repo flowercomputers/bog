@@ -16,6 +16,7 @@ use std::{
     any::Any,
     sync::{
         Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
         mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     time::{Duration, Instant},
@@ -25,7 +26,7 @@ use crate::{
     Change,
     codec::{Codec, OrderedCodec},
     merge::Merge,
-    tx::{ErasedUnderlay, net_changes},
+    tx::{ErasedUnderlay, entry_bytes, net_changes},
 };
 
 /// One committed transaction's net change to a keyspace.
@@ -37,6 +38,22 @@ pub struct Delta<K, M: Merge> {
     /// In a [`Tally`](crate::Tally) keyspace, an `Insert` of the amount
     /// added, which may be negative.
     pub changes: Arc<Vec<(K, Change<M>)>>,
+    /// Counts the changes as unread until every subscriber's copy of
+    /// this delta has been received and dropped.
+    held: Arc<Held>,
+}
+
+/// A batch of changes counted in the store's memory stats while any
+/// subscription has yet to receive it.
+struct Held {
+    bytes: usize,
+    gauge: Arc<AtomicUsize>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.gauge.fetch_sub(self.bytes, Relaxed);
+    }
 }
 
 impl<K, M: Merge> Clone for Delta<K, M> {
@@ -44,6 +61,7 @@ impl<K, M: Merge> Clone for Delta<K, M> {
         Delta {
             epoch: self.epoch,
             changes: self.changes.clone(),
+            held: self.held.clone(),
         }
     }
 }
@@ -133,7 +151,23 @@ pub(crate) trait Publish: Send {
     fn publish(&mut self, epoch: u64, staged: Box<dyn Any + Send>) -> bool;
 }
 
-pub(crate) struct Senders<K, M: Merge>(pub Vec<Sender<Delta<K, M>>>);
+pub(crate) struct Senders<K, M: Merge> {
+    pub senders: Vec<Sender<Delta<K, M>>>,
+    /// The store's count of unread bytes.
+    gauge: Arc<AtomicUsize>,
+}
+
+impl<K, M: Merge> Senders<K, M> {
+    pub(crate) fn new(gauge: Arc<AtomicUsize>) -> Self {
+        Senders {
+            senders: Vec::new(),
+            gauge,
+        }
+    }
+}
+
+/// What [`Publish::stage`] copies: the changes, and their estimated size.
+type Staged<K, M> = (Arc<Vec<(K, Change<M>)>>, usize);
 
 impl<K, M> Publish for Senders<K, M>
 where
@@ -147,20 +181,29 @@ where
     }
 
     fn stage(&self, handle: &dyn ErasedUnderlay) -> Box<dyn Any + Send> {
-        Box::new(Arc::new(net_changes::<K, M>(handle)))
+        let changes = net_changes::<K, M>(handle);
+        let bytes = changes.iter().map(|(k, c)| entry_bytes(k, c)).sum();
+        let staged: Staged<K, M> = (Arc::new(changes), bytes);
+        Box::new(staged)
     }
 
     fn publish(&mut self, epoch: u64, staged: Box<dyn Any + Send>) -> bool {
-        let changes = *staged
-            .downcast::<Arc<Vec<(K, Change<M>)>>>()
+        let (changes, bytes) = *staged
+            .downcast::<Staged<K, M>>()
             .expect("staged by the same subscribers");
-        self.0.retain(|s| {
+        self.gauge.fetch_add(bytes, Relaxed);
+        let held = Arc::new(Held {
+            bytes,
+            gauge: self.gauge.clone(),
+        });
+        self.senders.retain(|s| {
             s.send(Delta {
                 epoch,
                 changes: changes.clone(),
+                held: held.clone(),
             })
             .is_ok()
         });
-        !self.0.is_empty()
+        !self.senders.is_empty()
     }
 }

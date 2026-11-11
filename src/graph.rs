@@ -13,7 +13,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     ops::Bound,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
 };
 
 /// A stable 64-bit hash (FNV-1a) for fingerprinting what derived state
@@ -231,7 +234,26 @@ struct OpDagNode {
     out: Box<dyn Buffer>,
     /// Its state handle, cloned for children that read it.
     state: Box<dyn Any + Send>,
+    /// The scratch bytes it held when last asked; see [`OpDag::retain`].
+    held: usize,
 }
+
+impl OpDagNode {
+    /// The allocation this node keeps between runs: its output buffer,
+    /// a source's staging buffer, an operator's scratch. With `release`,
+    /// after giving back what is empty.
+    fn scratch(&mut self, release: bool) -> usize {
+        self.out.scratch(release)
+            + match &mut self.kind {
+                Kind::Source { staging, .. } => staging.scratch(release),
+                Kind::Op(op) => op.scratch(release),
+            }
+    }
+}
+
+/// What a graph keeps of its buffers between runs unless told otherwise;
+/// see [`OpDag::retain`].
+pub const DEFAULT_GRAPH_RETAIN: usize = 4 << 20;
 
 // TODO:
 // better memory accounting—we should always know how many bytes are allocated
@@ -252,6 +274,12 @@ pub struct OpDag {
     tables: Vec<OpDagNodeId>,
     /// Sources fed by `give`, whose history a rebuild cannot read.
     given: usize,
+    /// See [`retain`](Self::retain); `None` is the default.
+    retain: Option<usize>,
+    /// The scratch bytes every node holds, as of the last run.
+    held: usize,
+    /// Where `held` is published, for the store's memory stats.
+    gauge: Option<Arc<AtomicUsize>>,
 }
 
 impl OpDag {
@@ -266,6 +294,58 @@ impl OpDag {
     pub fn version(&mut self, version: u64) -> &mut Self {
         self.version = version;
         self
+    }
+
+    /// How many bytes of buffers the graph may keep between runs.
+    ///
+    /// Every node's output buffer and every operator's scratch is reused
+    /// from run to run, so a steady stream of small transactions
+    /// allocates nothing. After a run that leaves the graph holding more
+    /// than this, all of it is given back: one large transaction, or the
+    /// rebuild at open, does not leave every node it passed through sized
+    /// for it. Defaults to [`DEFAULT_GRAPH_RETAIN`].
+    pub fn retain(&mut self, bytes: usize) -> &mut Self {
+        self.retain = Some(bytes);
+        self
+    }
+
+    /// [`retain`](Self::retain), unless it was already called.
+    pub(crate) fn retain_default(&mut self, bytes: usize) {
+        self.retain.get_or_insert(bytes);
+    }
+
+    /// The bytes of buffers the graph holds between runs, as of the last
+    /// one.
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Publish [`held`](Self::held) to `gauge` after every run.
+    pub(crate) fn gauge(&mut self, gauge: Arc<AtomicUsize>) {
+        gauge.store(self.held, Relaxed);
+        self.gauge = Some(gauge);
+    }
+
+    /// Clear the output of `nodes`, which ran or were staged into, and
+    /// bring the graph's scratch back under its limit.
+    fn settle(&mut self, nodes: impl Iterator<Item = OpDagNodeId>) {
+        for id in nodes {
+            let node = &mut self.nodes[id];
+            node.out.clear();
+            let now = node.scratch(false);
+            self.held = self.held - node.held + now;
+            node.held = now;
+        }
+        if self.held > self.retain.unwrap_or(DEFAULT_GRAPH_RETAIN) {
+            self.held = 0;
+            for node in self.nodes.iter_mut().filter(|n| n.held > 0) {
+                node.held = node.scratch(true);
+                self.held += node.held;
+            }
+        }
+        if let Some(gauge) = &self.gauge {
+            gauge.store(self.held, Relaxed);
+        }
     }
 
     /// A source fed by [`give`](Self::give), for rows the store does not
@@ -495,6 +575,7 @@ impl OpDag {
             children: Default::default(),
             out,
             state,
+            held: 0,
         });
         NodeRef(id, PhantomData)
     }
@@ -576,8 +657,8 @@ impl OpDag {
             if let Kind::Source { staging, .. } = &mut node.kind {
                 staging.clear();
             }
-            node.out.clear();
         }
+        self.settle(0..self.nodes.len());
     }
 
     /// Start a rebuild of derived state from the tables: each shows
@@ -692,10 +773,12 @@ impl OpDag {
             }
         }
 
-        // Every consumed delta is now stale. Clear (keep allocations).
-        for id in self.touched.drain(..) {
-            self.nodes[id].out.clear();
-        }
+        // Every consumed delta is now stale. Clear, keeping allocations
+        // while the graph holds no more than it may.
+        let touched = std::mem::take(&mut self.touched);
+        self.settle(touched.iter().copied());
+        self.touched = touched;
+        self.touched.clear();
         tx.end_run();
     }
 }
@@ -709,6 +792,9 @@ struct NaryNode<N>(N);
 impl<U: Unary> Node for UnaryNode<U> {
     fn fingerprint(&self, fp: &mut Fingerprint) {
         self.0.fingerprint(fp)
+    }
+    fn scratch(&mut self, release: bool) -> usize {
+        self.0.scratch(release)
     }
     #[inline(always)]
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any) {
@@ -725,6 +811,9 @@ impl<B: Binary> Node for BinaryNode<B> {
     fn fingerprint(&self, fp: &mut Fingerprint) {
         self.0.fingerprint(fp)
     }
+    fn scratch(&mut self, release: bool) -> usize {
+        self.0.scratch(release)
+    }
     #[inline(always)]
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any) {
         debug_assert_eq!(inputs.len(), 2);
@@ -740,6 +829,9 @@ impl<B: Binary> Node for BinaryNode<B> {
 impl<N: Nary> Node for NaryNode<N> {
     fn fingerprint(&self, fp: &mut Fingerprint) {
         self.0.fingerprint(fp)
+    }
+    fn scratch(&mut self, release: bool) -> usize {
+        self.0.scratch(release)
     }
     #[inline(always)]
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any) {
@@ -883,5 +975,43 @@ mod tests {
             assert_eq!(n.out.len(), 0, "outputs are cleared after a run");
         }
         let _ = dd;
+    }
+
+    #[test]
+    fn buffers_are_kept_up_to_the_limit_and_released_past_it() {
+        let mut g = OpDag::new();
+        let a = g.source::<Bag<u32>>();
+        let d = g.unary(a, Double);
+        let _ = g.unary(d, Double);
+        g.retain(4096);
+        let store = StoreBuilder::new(DurabilityPolicy::NONE).build().unwrap();
+        let feed = |g: &mut OpDag, n: u32| {
+            let mut rows = Bag::new();
+            for i in 0..n {
+                rows.push(i, 1);
+            }
+            g.give(a, &mut rows);
+            g.run(&mut store.begin().unwrap());
+        };
+
+        // a small run's buffers are kept, and counted
+        // (twice: a source swaps its staging and output buffers each run)
+        feed(&mut g, 8);
+        feed(&mut g, 8);
+        let small = g.held();
+        assert!(small > 0 && small <= 4096, "{small}");
+        feed(&mut g, 8);
+        assert_eq!(g.held(), small, "reused, not regrown");
+
+        // a large one's are given back, every node's
+        feed(&mut g, 100_000);
+        assert_eq!(g.held(), 0);
+        for n in &mut g.nodes {
+            assert_eq!(n.scratch(false), 0);
+        }
+
+        // and the graph still runs
+        feed(&mut g, 8);
+        assert!(g.held() > 0 && g.held() <= small);
     }
 }

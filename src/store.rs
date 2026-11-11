@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     thread::{self, JoinHandle},
     time::Instant,
@@ -22,7 +22,7 @@ use crate::{
     codec::{Codec, DecodeError, OrderedCodec, ResidentSize, decode_all},
     cursor::{Cursor, Source, empty_bounds},
     error::{Error, IoContext, Result},
-    graph::Fingerprint,
+    graph::{DEFAULT_GRAPH_RETAIN, Fingerprint},
     index::{Aux, EncodedBuilder, IndexKind, IndexedRun, LayerIndexes, Run, RunIndex, table_index},
     manifest::{self, Checkpoint, InstallError, MANIFEST_TMP, Manifest, Segment},
     merge::Merge,
@@ -59,6 +59,14 @@ pub struct StoreOptions {
     /// layers than this. Every layer is checked on a read, so this bounds
     /// read cost when maintenance falls behind.
     pub max_layers: usize,
+    /// Bytes of buffers a [`Db`](crate::Db)'s graph may keep between
+    /// runs; see [`OpDag::retain`](crate::graph::OpDag::retain).
+    pub graph_retain: usize,
+    /// How much memory the store should plan to use in all, or `None`
+    /// for no plan. It is not enforced as such: it sets every memory
+    /// limit above that was left at its default to a share of it, so one
+    /// number sizes the store. See [`resolved`](Self::resolved).
+    pub memory_budget: Option<usize>,
 }
 
 impl Default for StoreOptions {
@@ -72,11 +80,54 @@ impl Default for StoreOptions {
             max_tables: 8,
             compaction_width: 4,
             max_layers: 8,
+            graph_retain: DEFAULT_GRAPH_RETAIN,
+            memory_budget: None,
         }
     }
 }
 
 impl StoreOptions {
+    /// The options as the store uses them: with a
+    /// [`memory_budget`](Self::memory_budget), each memory limit still at
+    /// its default becomes a share of the budget, and one set to anything
+    /// else is kept.
+    ///
+    /// | limit | share |
+    /// |---|---|
+    /// | `memtable_limit` | 1/4 (commits wait at twice it) |
+    /// | `tx_memory_limit` | 1/4 |
+    /// | `cache_size` | 1/8 |
+    /// | `graph_retain` | 1/32 |
+    /// | `wal_limit` | at most 1/4, since open replays it into memory |
+    ///
+    /// Together those are at most 29/32 of the budget; the rest is for
+    /// what has no limit of its own: table and run indexes, layers held
+    /// by old snapshots, and unread subscriptions. [`MemoryStats::total`]
+    /// is the figure to hold against the budget.
+    pub fn resolved(&self) -> StoreOptions {
+        let Some(budget) = self.memory_budget else {
+            return *self;
+        };
+        let default = StoreOptions::default();
+        let mut o = *self;
+        if o.memtable_limit == default.memtable_limit {
+            o.memtable_limit = budget / 4;
+        }
+        if o.tx_memory_limit == default.tx_memory_limit {
+            o.tx_memory_limit = budget / 4;
+        }
+        if o.cache_size == default.cache_size {
+            o.cache_size = budget / 8;
+        }
+        if o.graph_retain == default.graph_retain {
+            o.graph_retain = budget / 32;
+        }
+        if o.wal_limit == default.wal_limit {
+            o.wal_limit = o.wal_limit.min(budget as u64 / 4);
+        }
+        o
+    }
+
     fn validate(&self) -> Result<()> {
         if self.max_tables == 0 {
             return Err(Error::InvalidOption("max tables must be at least one"));
@@ -109,6 +160,8 @@ impl StoreOptions {
             ("max-tables", self.max_tables as u64),
             ("compaction-width", self.compaction_width as u64),
             ("max-layers", self.max_layers as u64),
+            ("graph-retain", self.graph_retain as u64),
+            ("memory-budget", self.memory_budget.unwrap_or(0) as u64),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -134,6 +187,38 @@ pub struct MemoryStats {
     pub tables: usize,
     /// Layers in memory: commits not yet folded together or checkpointed.
     pub layers: usize,
+    /// Layers no longer current that a snapshot still holds. They are
+    /// freed when the last snapshot that can see them is dropped.
+    pub pinned_bytes: usize,
+    /// What the open write transaction, if any, has written so far.
+    pub tx_bytes: usize,
+    /// The WAL's write buffer as of the last commit: frames the
+    /// durability policy has yet to write out.
+    pub wal_buffer_bytes: usize,
+    /// Changes sent to subscriptions and not yet received, counted once
+    /// however many subscribers share them.
+    pub subscription_bytes: usize,
+    /// Buffers the [`Db`](crate::Db)'s graph holds between runs; see
+    /// [`OpDag::retain`](crate::graph::OpDag::retain). Zero for a store
+    /// without one.
+    pub graph_bytes: usize,
+}
+
+impl MemoryStats {
+    /// Every byte of memory counted here, together: the figure to hold
+    /// against a [memory budget](StoreOptions::memory_budget). The WAL is
+    /// on disk, so it is not part of it.
+    pub fn total(&self) -> usize {
+        self.memtable_bytes
+            + self.cache_bytes
+            + self.index_bytes
+            + self.run_index_bytes
+            + self.pinned_bytes
+            + self.tx_bytes
+            + self.wal_buffer_bytes
+            + self.subscription_bytes
+            + self.graph_bytes
+    }
 }
 
 /// Estimated bookkeeping a `BTreeMap` spends per entry beyond the key and
@@ -350,6 +435,10 @@ impl Version {
     }
 }
 
+/// The most the WAL's write buffer keeps allocated once it is written
+/// out.
+const WAL_BUFFER_RETAIN: usize = 1 << 20;
+
 struct Wal {
     path: PathBuf,
     file: File,
@@ -388,6 +477,10 @@ impl Wal {
                 .write_all(&self.buffer)
                 .ctx("writing WAL", &self.path)?;
             self.buffer.clear();
+            // one large tx should not leave its size allocated for good
+            if self.buffer.capacity() > WAL_BUFFER_RETAIN {
+                self.buffer = Vec::new();
+            }
         }
         if sync {
             self.file.sync_data().ctx("syncing WAL", &self.path)?;
@@ -1207,6 +1300,18 @@ impl StoreBuilder {
         self
     }
 
+    /// Size the store's memory limits from one number; see
+    /// [`StoreOptions::resolved`]. No budget by default.
+    pub fn memory_budget(mut self, bytes: usize) -> Self {
+        self.opts.memory_budget = Some(bytes);
+        self
+    }
+
+    /// The size limits as the store will use them.
+    pub fn resolved_options(&self) -> StoreOptions {
+        self.opts.resolved()
+    }
+
     /// Replace the durability policy.
     pub fn durability(mut self, policy: DurabilityPolicy) -> Self {
         self.durability_policy = policy;
@@ -1358,6 +1463,7 @@ impl StoreBuilder {
             graph,
         } = self;
         dp.validate().map_err(Error::Policy)?;
+        let opts = opts.resolved();
         opts.validate()?;
 
         // the fingerprint covers which keyspaces are derived, and as what
@@ -1828,6 +1934,20 @@ pub struct Shared {
     /// its snapshot, so each sees exactly the commits after its snapshot.
     /// Taken after the writer lock, never before.
     subscribers: Mutex<HashMap<u64, Box<dyn Publish>>>,
+    /// Estimated bytes of changes sent to subscriptions and not yet
+    /// received.
+    subscription_bytes: Arc<AtomicUsize>,
+    /// Estimated bytes the open write tx holds.
+    tx_bytes: Arc<AtomicUsize>,
+    /// The WAL's write buffer, as of the last commit.
+    wal_buffer_bytes: AtomicUsize,
+    /// Bytes of buffers a `Db`'s graph holds between runs, which it
+    /// publishes here.
+    graph_bytes: Arc<AtomicUsize>,
+    /// Every version a live snapshot was taken of, so stats can count
+    /// the layers only they still hold. Dead ones are dropped as new
+    /// ones are added.
+    snapshot_versions: Mutex<Vec<Weak<Version>>>,
     /// Called with the epoch each checkpoint covers through.
     checkpoint_hooks: Mutex<Vec<Box<dyn FnMut(u64) + Send>>>,
     /// Held while compacting, so one compaction runs at a time.
@@ -1943,6 +2063,11 @@ impl Store {
             opts,
             wal_bytes: AtomicU64::new(wal_bytes),
             subscribers: Mutex::new(HashMap::new()),
+            subscription_bytes: Arc::default(),
+            tx_bytes: Arc::default(),
+            wal_buffer_bytes: AtomicUsize::new(0),
+            graph_bytes: Arc::default(),
+            snapshot_versions: Mutex::new(Vec::new()),
             checkpoint_hooks: Mutex::new(Vec::new()),
             compaction: Mutex::new(()),
             layer_work: Mutex::new(()),
@@ -1983,7 +2108,44 @@ impl Shared {
             run_index_bytes: self.run_index_bytes(&version),
             tables: version.tables.len(),
             layers: version.layers.len(),
+            pinned_bytes: self.pinned_bytes(&version),
+            tx_bytes: self.tx_bytes.load(Relaxed),
+            wal_buffer_bytes: self.wal_buffer_bytes.load(Relaxed),
+            subscription_bytes: self.subscription_bytes.load(Relaxed),
+            graph_bytes: self.graph_bytes.load(Relaxed),
         }
+    }
+
+    /// The size limits in force: the options the store was built with,
+    /// [resolved](StoreOptions::resolved).
+    pub fn options(&self) -> &StoreOptions {
+        &self.opts
+    }
+
+    /// Where a `Db` publishes what its graph holds between runs.
+    pub(crate) fn graph_gauge(&self) -> Arc<AtomicUsize> {
+        self.graph_bytes.clone()
+    }
+
+    /// The estimated bytes of layers that are not in `current` and that
+    /// a live snapshot still holds, each counted once.
+    fn pinned_bytes(&self, current: &Version) -> usize {
+        let versions = self
+            .snapshot_versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut seen: Vec<*const Layer> = current.layers.iter().map(Arc::as_ptr).collect();
+        let mut bytes = 0;
+        for version in versions.iter().filter_map(Weak::upgrade) {
+            for layer in &version.layers {
+                let ptr = Arc::as_ptr(layer);
+                if !seen.contains(&ptr) {
+                    seen.push(ptr);
+                    bytes += layer.bytes;
+                }
+            }
+        }
+        bytes
     }
 
     fn run_index_bytes(&self, version: &Version) -> usize {
@@ -2047,6 +2209,18 @@ impl Store {
         let version = self.current.load_full();
         *map.entry(version.epoch).or_default() += 1;
         drop(map);
+        let mut versions = self
+            .snapshot_versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !versions
+            .last()
+            .is_some_and(|v| std::ptr::eq(v.as_ptr(), Arc::as_ptr(&version)))
+        {
+            versions.retain(|v| v.strong_count() > 0);
+            versions.push(Arc::downgrade(&version));
+        }
+        drop(versions);
         Snapshot {
             version,
             store: self,
@@ -2074,7 +2248,7 @@ impl Store {
         // taken under the lock: a commit not in it has yet to send
         let snapshot = self.snapshot();
         let after = snapshot.epoch();
-        let sub = Self::subscribe_locked(&mut subscribers, keyspace, after);
+        let sub = self.subscribe_locked(&mut subscribers, keyspace, after);
         (snapshot, sub)
     }
 
@@ -2099,10 +2273,11 @@ impl Store {
             .subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        Self::subscribe_locked(&mut subscribers, keyspace, after)
+        self.subscribe_locked(&mut subscribers, keyspace, after)
     }
 
     fn subscribe_locked<K, M>(
+        &self,
         subscribers: &mut HashMap<u64, Box<dyn Publish>>,
         keyspace: KeyspaceId<K, M>,
         after: u64,
@@ -2116,11 +2291,11 @@ impl Store {
         let (tx, rx) = std::sync::mpsc::channel();
         subscribers
             .entry(keyspace.raw())
-            .or_insert_with(|| Box::new(Senders::<K, M>(Vec::new())))
+            .or_insert_with(|| Box::new(Senders::<K, M>::new(self.subscription_bytes.clone())))
             .as_any_mut()
             .downcast_mut::<Senders<K, M>>()
             .expect("keyspace id reused with a different type")
-            .0
+            .senders
             .push(tx);
         Subscription { rx, after }
     }
@@ -2149,6 +2324,7 @@ impl Store {
             self.snapshot(),
             writer,
             self.opts.tx_memory_limit,
+            self.tx_bytes.clone(),
         ))
     }
 
@@ -2215,6 +2391,10 @@ impl Store {
             }
         })?;
         self.wal_bytes.fetch_add(logged, Relaxed);
+        self.wal_buffer_bytes.store(
+            writer.wal.as_ref().map_or(0, |w| w.buffer.capacity()),
+            Relaxed,
+        );
 
         let current = self.current.load();
         debug_assert_eq!(current.epoch + 1, epoch, "commit out of order");
@@ -4976,5 +5156,88 @@ mod tests {
         assert_eq!(store.finish(tx).unwrap(), Some(2));
         drop(store);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_memory_budget_sizes_the_limits_left_at_their_defaults() {
+        let plain = StoreOptions::default();
+        assert_eq!(plain.resolved(), plain, "no budget, no change");
+
+        let o = StoreOptions {
+            memory_budget: Some(256 << 20),
+            cache_size: 1 << 20,
+            ..StoreOptions::default()
+        }
+        .resolved();
+        assert_eq!(o.memtable_limit, 64 << 20);
+        assert_eq!(o.tx_memory_limit, 64 << 20);
+        assert_eq!(o.graph_retain, 8 << 20);
+        assert_eq!(o.wal_limit, 64 << 20);
+        assert_eq!(o.cache_size, 1 << 20, "set by hand, so kept");
+
+        let small = StoreOptions {
+            memory_budget: Some(32 << 20),
+            ..StoreOptions::default()
+        }
+        .resolved();
+        assert_eq!(small.memtable_limit, 8 << 20);
+        assert_eq!(small.wal_limit, 8 << 20);
+
+        // the store runs on the resolved limits
+        let store = StoreBuilder::new(DurabilityPolicy::NONE)
+            .keyspace(KS)
+            .memory_budget(32 << 20)
+            .build()
+            .unwrap();
+        assert_eq!(store.options().tx_memory_limit, 8 << 20);
+    }
+
+    #[test]
+    fn stats_count_the_open_tx_pinned_layers_and_unread_subscriptions() {
+        let store = mem();
+        assert_eq!(store.stats().total(), 0);
+
+        // an open tx's writes
+        let mut tx = store.begin().unwrap();
+        let mut ks = tx.keyspace(KS);
+        ks.absorb(1, Change::Insert(10)).unwrap();
+        ks.absorb(2, Change::Insert(20)).unwrap();
+        assert!(store.stats().tx_bytes > 0);
+        store.finish(tx).unwrap();
+        let s = store.stats();
+        assert_eq!(s.tx_bytes, 0);
+        assert!(s.memtable_bytes > 0);
+        assert_eq!(s.pinned_bytes, 0);
+        assert_eq!(s.total(), s.memtable_bytes);
+
+        // a snapshot keeps the layers it saw once a fold replaces them
+        let snap = store.snapshot();
+        put(&store, &[(3, Some(30))]);
+        put(&store, &[(4, Some(40))]);
+        while store.fold_once() {}
+        let s = store.stats();
+        assert_eq!(s.layers, 1, "folded beneath the snapshot");
+        assert!(s.pinned_bytes > 0, "{s:?}");
+        drop(snap);
+        assert_eq!(store.stats().pinned_bytes, 0);
+
+        // changes no subscriber has received yet, counted once for all
+        let (_, one) = store.subscribe(KS);
+        let (_, two) = store.subscribe(KS);
+        put(&store, &[(5, Some(50))]);
+        let unread = store.stats().subscription_bytes;
+        assert!(unread > 0);
+        put(&store, &[(6, Some(60))]);
+        assert_eq!(store.stats().subscription_bytes, 2 * unread);
+        drop(one.recv());
+        assert_eq!(
+            store.stats().subscription_bytes,
+            2 * unread,
+            "the other subscriber has yet to read it"
+        );
+        drop(two.recv());
+        assert_eq!(store.stats().subscription_bytes, unread);
+        drop((one, two));
+        assert_eq!(store.stats().subscription_bytes, 0);
     }
 }

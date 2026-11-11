@@ -88,6 +88,22 @@ pub trait Buffer: Any + Send {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// The bytes of allocation the buffer holds, whether or not they are
+    /// in use; with `release`, an empty buffer gives them back first.
+    /// The graph asks after every run, and releases once the whole graph
+    /// holds more than its limit; see [`OpDag::retain`](graph::OpDag::retain).
+    fn scratch(&mut self, _release: bool) -> usize {
+        0
+    }
+}
+
+/// [`Buffer::scratch`] of a `Vec` an operator or buffer reuses across
+/// runs: its capacity in bytes, after dropping it if `release`.
+pub fn vec_scratch<T>(v: &mut Vec<T>, release: bool) -> usize {
+    if release {
+        *v = Vec::new();
+    }
+    v.capacity() * size_of::<T>()
 }
 
 /// A keyed, consolidated batch: at most one `Change` per key. Composing
@@ -291,6 +307,10 @@ impl<T: Ord + Send + 'static> Buffer for Bag<T> {
     fn consolidate(&mut self) {
         Bag::consolidate(self)
     }
+    fn scratch(&mut self, release: bool) -> usize {
+        let release = release && self.rows.is_empty();
+        vec_scratch(&mut self.rows, release)
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -420,6 +440,7 @@ where
 pub trait Node: Send {
     fn eval(&mut self, tx: &mut WriteTx, inputs: &[&dyn Any], out: &mut dyn Any);
     fn fingerprint(&self, fp: &mut Fingerprint);
+    fn scratch(&mut self, release: bool) -> usize;
 }
 
 /// Commutative, variable-arity
@@ -440,6 +461,12 @@ pub trait Nary: Send {
     /// Add whatever the operator's type does not already say to the
     /// graph's fingerprint. Owned keyspaces are added for it.
     fn fingerprint(&self, _fp: &mut Fingerprint) {}
+    /// The bytes of allocation the operator keeps between runs to reuse,
+    /// such as scratch vectors; with `release`, it gives them back first.
+    /// An operator that keeps any should say so: see [`vec_scratch`].
+    fn scratch(&mut self, _release: bool) -> usize {
+        0
+    }
 }
 
 pub trait Unary: Send {
@@ -454,6 +481,10 @@ pub trait Unary: Send {
     }
     /// See [`Nary::fingerprint`].
     fn fingerprint(&self, _fp: &mut Fingerprint) {}
+    /// See [`Nary::scratch`].
+    fn scratch(&mut self, _release: bool) -> usize {
+        0
+    }
 }
 
 impl<N: Nary> Unary for N {
@@ -473,6 +504,9 @@ impl<N: Nary> Unary for N {
     fn fingerprint(&self, fp: &mut Fingerprint) {
         N::fingerprint(self, fp)
     }
+    fn scratch(&mut self, release: bool) -> usize {
+        N::scratch(self, release)
+    }
 }
 
 pub trait Binary: Send {
@@ -488,6 +522,10 @@ pub trait Binary: Send {
     }
     /// See [`Nary::fingerprint`].
     fn fingerprint(&self, _fp: &mut Fingerprint) {}
+    /// See [`Nary::scratch`].
+    fn scratch(&mut self, _release: bool) -> usize {
+        0
+    }
 }
 
 pub struct Sum<K, V: Merge> {
@@ -525,6 +563,10 @@ where
 
     fn fingerprint(&self, fp: &mut Fingerprint) {
         fp.write_u64(self.ks.raw());
+    }
+
+    fn scratch(&mut self, release: bool) -> usize {
+        vec_scratch(&mut self.resolved, release)
     }
 
     fn eval(
@@ -623,6 +665,10 @@ where
 
     fn fingerprint(&self, fp: &mut Fingerprint) {
         fp.write_u64(self.counts.raw());
+    }
+
+    fn scratch(&mut self, release: bool) -> usize {
+        Buffer::scratch(&mut self.scratch, release)
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<T>], out: &mut Bag<T>) {

@@ -471,10 +471,6 @@ enum GroupSource<K, V> {
     },
 }
 
-fn group_span<K: Clone, V>(key: &K) -> std::ops::RangeInclusive<(K, Edge<V>)> {
-    (key.clone(), Edge::Lo)..=(key.clone(), Edge::Hi)
-}
-
 fn row<K: Clone, V: Clone>(k: Cow<'_, (K, Edge<V>)>, d: Delta) -> (K, V, Delta) {
     let (k, v) = k.into_owned();
     let Edge::Val(v) = v else {
@@ -501,20 +497,31 @@ impl<K: Data, V: Data> GroupReader<K, V> {
         }
     }
 
-    fn bounds(key: Option<&K>) -> (Bound<(K, Edge<V>)>, Bound<(K, Edge<V>)>) {
-        match key {
-            Some(k) => clone_bounds(group_span::<K, V>(k)),
-            None => (Bound::Unbounded, Bound::Unbounded),
-        }
+    /// Key bounds as row bounds: a key's rows lie between its `Lo` and
+    /// `Hi` edges, so an included key takes all of them and an excluded
+    /// one none.
+    fn bounds(lo: Bound<K>, hi: Bound<K>) -> (Bound<(K, Edge<V>)>, Bound<(K, Edge<V>)>) {
+        let lo = match lo {
+            Bound::Included(k) => Bound::Included((k, Edge::Lo)),
+            Bound::Excluded(k) => Bound::Excluded((k, Edge::Hi)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let hi = match hi {
+            Bound::Included(k) => Bound::Included((k, Edge::Hi)),
+            Bound::Excluded(k) => Bound::Excluded((k, Edge::Lo)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        (lo, hi)
     }
 
     fn scan<'s>(
         &self,
         snap: &'s Snapshot<'s>,
-        key: Option<&K>,
+        lo: Bound<K>,
+        hi: Bound<K>,
         rev: bool,
     ) -> Box<dyn Iterator<Item = Result<(K, V, Delta)>> + 's> {
-        let (lo, hi) = Self::bounds(key);
+        let (lo, hi) = Self::bounds(lo, hi);
         match self.source {
             GroupSource::Arranged { id, .. } => {
                 let rows = if rev {
@@ -541,11 +548,12 @@ impl<K: Data, V: Data> GroupReader<K, V> {
     fn scan_tx(
         &self,
         tx: &mut WriteTx<'_>,
-        key: Option<&K>,
+        lo: Bound<K>,
+        hi: Bound<K>,
         rev: bool,
         out: &mut Vec<(K, V, Delta)>,
     ) -> Result<()> {
-        let (lo, hi) = Self::bounds(key);
+        let (lo, hi) = Self::bounds(lo, hi);
         match self.source {
             GroupSource::Arranged { id, .. } => {
                 let mut ks = tx.keyspace(id);
@@ -585,8 +593,9 @@ impl<K: Data, V: Data> GroupReader<K, V> {
         {
             return Ok(snap.get(totals, key)?.is_some_and(|t| *t > 0));
         }
+        let k = || Bound::Included(key.clone());
         Ok(self
-            .scan(snap, Some(key), false)
+            .scan(snap, k(), k(), false)
             .next()
             .transpose()?
             .is_some())
@@ -601,7 +610,8 @@ impl<K: Data, V: Data> GroupReader<K, V> {
             return Ok(tx.keyspace(totals).get(key)?.is_some_and(|t| *t > 0));
         }
         let mut out = Vec::new();
-        self.scan_tx(tx, Some(key), false, &mut out)?;
+        let k = || Bound::Included(key.clone());
+        self.scan_tx(tx, k(), k(), false, &mut out)?;
         Ok(!out.is_empty())
     }
 
@@ -636,31 +646,57 @@ impl<'a, K: Data, V: Data> GroupRead<'a, K, V> {
         GroupRead { at, reader }
     }
 
-    fn scan(&self, key: Option<&K>, rev: bool) -> Scan<'a, (K, V, Delta)> {
+    fn scan(&self, lo: Bound<K>, hi: Bound<K>, rev: bool) -> Scan<'a, (K, V, Delta)> {
         let reader = self.reader;
         match self.at {
-            At::Snapshot(s) => reader.scan(s, key, rev),
-            at => collected(at.with(
-                |s| reader.scan(s, key, rev).collect(),
-                |tx| {
-                    let mut out = Vec::new();
-                    reader.scan_tx(tx, key, rev, &mut out)?;
-                    Ok(out)
-                },
-            )),
+            At::Snapshot(s) => reader.scan(s, lo, hi, rev),
+            at => {
+                let (lo2, hi2) = (lo.clone(), hi.clone());
+                collected(at.with(
+                    |s| reader.scan(s, lo2, hi2, rev).collect(),
+                    |tx| {
+                        let mut out = Vec::new();
+                        reader.scan_tx(tx, lo, hi, rev, &mut out)?;
+                        Ok(out)
+                    },
+                ))
+            }
         }
+    }
+
+    /// `key`'s rows.
+    fn group(&self, key: &K, rev: bool) -> impl Iterator<Item = Result<(V, Delta)>> + 'a {
+        let k = || Bound::Included(key.clone());
+        self.scan(k(), k(), rev).map(|r| r.map(|(_, v, d)| (v, d)))
     }
 
     /// `key`'s values, ascending, each with its multiplicity.
     pub fn values(&self, key: &K) -> impl Iterator<Item = Result<(V, Delta)>> + 'a {
-        self.scan(Some(key), false)
-            .map(|r| r.map(|(_, v, d)| (v, d)))
+        self.group(key, false)
     }
 
     /// `key`'s values, descending.
     pub fn values_rev(&self, key: &K) -> impl Iterator<Item = Result<(V, Delta)>> + 'a {
-        self.scan(Some(key), true)
-            .map(|r| r.map(|(_, v, d)| (v, d)))
+        self.group(key, true)
+    }
+
+    /// The rows of every key in `bounds`, in key then value order: one
+    /// scan, however many groups it spans.
+    pub fn range(
+        &self,
+        bounds: impl RangeBounds<K>,
+    ) -> impl Iterator<Item = Result<(K, V, Delta)>> + 'a {
+        let (lo, hi) = clone_bounds(bounds);
+        self.scan(lo, hi, false)
+    }
+
+    /// The rows of every key in `bounds`, greatest key (and value) first.
+    pub fn range_rev(
+        &self,
+        bounds: impl RangeBounds<K>,
+    ) -> impl Iterator<Item = Result<(K, V, Delta)>> + 'a {
+        let (lo, hi) = clone_bounds(bounds);
+        self.scan(lo, hi, true)
     }
 
     /// `key`'s `n` greatest values, greatest first.
@@ -683,7 +719,7 @@ impl<'a, K: Data, V: Data> GroupRead<'a, K, V> {
 
     /// Every row, in key then value order.
     pub fn iter(&self) -> impl Iterator<Item = Result<(K, V, Delta)>> + 'a {
-        self.scan(None, false)
+        self.scan(Bound::Unbounded, Bound::Unbounded, false)
     }
 
     /// Every commit after the state this facade reads, as each row's

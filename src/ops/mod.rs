@@ -107,6 +107,15 @@ impl<K, V> Default for Groups<K, V> {
     }
 }
 
+impl<K, V> Groups<K, V> {
+    /// See [`Nary::scratch`](crate::Nary::scratch).
+    pub(crate) fn scratch(&mut self, release: bool) -> usize {
+        crate::vec_scratch(&mut self.keys, release)
+            + crate::vec_scratch(&mut self.rows, release)
+            + crate::vec_scratch(&mut self.ends, release)
+    }
+}
+
 impl<K: Clone + PartialEq, V: Clone> Groups<K, V> {
     /// Replace the contents with `delta`'s rows.
     pub fn fill<S: State<Key = K, Value = V>>(&mut self, delta: &S::Delta) {

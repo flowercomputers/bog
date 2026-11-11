@@ -137,6 +137,10 @@ where
         take_fingerprint(self.take, fp);
     }
 
+    fn scratch(&mut self, release: bool) -> usize {
+        crate::vec_scratch(&mut self.dirty, release) + crate::vec_scratch(&mut self.vals, release)
+    }
+
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {
         let _ = self.run(tx, batches, out);
     }
@@ -254,6 +258,13 @@ where
 
     fn fingerprint(&self, fp: &mut crate::graph::Fingerprint) {
         take_fingerprint(self.take, fp);
+    }
+
+    fn scratch(&mut self, release: bool) -> usize {
+        crate::vec_scratch(&mut self.dirty, release)
+            + crate::vec_scratch(&mut self.vals, release)
+            + crate::vec_scratch(&mut self.fresh, release)
+            + crate::vec_scratch(&mut self.old, release)
     }
 
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&S::Delta], out: &mut Self::Gives) {

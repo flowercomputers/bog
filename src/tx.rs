@@ -6,6 +6,10 @@ use std::{
     fmt,
     marker::PhantomData,
     ops::RangeBounds,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
 };
 
 use crate::{
@@ -45,6 +49,14 @@ pub(crate) struct TxState {
     used: Cell<usize>,
     limit: usize,
     failure: RefCell<Option<Error>>,
+    /// `used`, published for the store's memory stats.
+    gauge: Arc<AtomicUsize>,
+}
+
+impl Drop for TxState {
+    fn drop(&mut self) {
+        self.gauge.store(0, Relaxed);
+    }
 }
 
 impl TxState {
@@ -79,15 +91,17 @@ impl TxState {
                 limit: self.limit,
             }));
             self.used.set(0);
+            self.gauge.store(0, Relaxed);
             return true;
         }
         self.used.set(used);
+        self.gauge.store(used, Relaxed);
         false
     }
 }
 
 /// Estimated resident bytes of one overlay entry.
-fn entry_bytes<K: ResidentSize, M: Merge>(key: &K, change: &Change<M>) -> usize
+pub(crate) fn entry_bytes<K: ResidentSize, M: Merge>(key: &K, change: &Change<M>) -> usize
 where
     M::Value: ResidentSize,
 {
@@ -265,6 +279,7 @@ impl<'tx> WriteTx<'tx> {
         snapshot: Snapshot<'tx>,
         writer: WriterGuard<'tx>,
         memory_limit: usize,
+        gauge: Arc<AtomicUsize>,
     ) -> Self {
         WriteTx {
             epoch: snapshot.epoch() + 1,
@@ -273,6 +288,7 @@ impl<'tx> WriteTx<'tx> {
                 used: Cell::new(0),
                 limit: memory_limit,
                 failure: RefCell::new(None),
+                gauge,
             },
             snapshot,
             writer,
@@ -519,10 +535,11 @@ where
         for r in &mut self.runs {
             r.settle();
         }
-        // composed across runs and in key order, so collect bulk-builds
-        // the tree
+        // composed across runs and in key order into a sorted run, which
+        // the tree is then built from in one pass: its nodes come out
+        // full, where inserting in order would leave each half empty
         let mut bytes = 0;
-        let mut tree = Resident::<K, M::Value>::new();
+        let mut rows: Vec<(K, Option<M::Value>)> = Vec::new();
         composed(
             self.runs.into_iter().map(|r| r.entries.into_iter()),
             |k, change| {
@@ -539,9 +556,10 @@ where
                     v.encode(out);
                 }
                 bytes += resident_entry_bytes(&k, &v);
-                tree.insert(k, v);
+                rows.push((k, v));
             },
         );
+        let tree: Resident<K, M::Value> = rows.into_iter().collect();
         (Box::new(tree), bytes)
     }
 }

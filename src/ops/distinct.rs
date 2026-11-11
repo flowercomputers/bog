@@ -102,6 +102,10 @@ impl<K: Key, V: Key> Nary for DistinctRows<K, V> {
         fp.write_u64(self.counts.raw());
     }
 
+    fn scratch(&mut self, release: bool) -> usize {
+        Buffer::scratch(&mut self.scratch, release)
+    }
+
     fn eval(&mut self, tx: &mut WriteTx, batches: &[&Bag<(K, V)>], out: &mut Bag<(K, V)>) {
         if self.run(tx, batches, out).is_err() {
             out.clear();
