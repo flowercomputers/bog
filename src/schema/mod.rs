@@ -93,12 +93,14 @@ use std::{
 
 use crate::{database::DbTx, store::Snapshot};
 
+mod changes;
 mod db;
 pub(crate) mod read;
 pub(crate) mod source;
 pub(crate) mod subscribe;
 pub(crate) mod view;
 
+pub use changes::*;
 pub use db::*;
 pub use read::*;
 pub use source::*;
@@ -153,6 +155,23 @@ impl<'a> TxCell<'a> {
     /// The epoch the transaction commits as.
     pub fn epoch(&self) -> u64 {
         self.borrow().epoch()
+    }
+
+    /// [`DbTx::attempt`], with `f` free to borrow the transaction.
+    pub fn attempt<R>(&self, f: impl FnOnce() -> crate::Result<R>) -> crate::Result<R> {
+        self.borrow_mut().savepoint();
+        let r = f().and_then(|r| self.borrow_mut().run().map(|()| r));
+        let mut tx = self.borrow_mut();
+        match r {
+            Ok(r) => {
+                tx.release();
+                Ok(r)
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -225,6 +244,10 @@ pub trait Schema: Sized + 'static {
     type Write<'a>;
     /// Every field's read facade, bound to one snapshot or transaction.
     type Read<'a>;
+    /// One commit's changes to every source; see [`ChangeSet`].
+    type Changes: ChangeSet + Clone + Send + 'static;
+    #[doc(hidden)]
+    type Feed: CommitFeed<Changes = Self::Changes> + Send + 'static;
 
     /// Open every field under `prefix` (`""` at the root, `"ledger."`
     /// for a nested schema).
@@ -240,6 +263,20 @@ pub trait Schema: Sized + 'static {
     fn write<'a>(h: &'a Self::Handles, tx: &'a TxCell<'a>) -> Self::Write<'a>;
 
     fn read<'a>(h: &'a Self::Handles, at: At<'a>) -> Self::Read<'a>;
+
+    /// Follow every source from the state `read` reads.
+    #[doc(hidden)]
+    fn feed(read: &Self::Read<'_>) -> Self::Feed;
+
+    /// Write `changes` to the sources.
+    #[doc(hidden)]
+    fn apply(write: &Self::Write<'_>, changes: &Self::Changes) -> crate::Result<()>;
+
+    /// The write facade's `attempt`, for code generic over the schema.
+    fn attempt<'a, T>(
+        write: &mut Self::Write<'a>,
+        f: impl FnOnce(&mut Self::Write<'a>) -> crate::Result<T>,
+    ) -> crate::Result<T>;
 }
 
 /// The application's half: constraints and view definitions over the

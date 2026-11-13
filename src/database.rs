@@ -142,6 +142,7 @@ impl Db {
             graph,
             retention,
             minted: HashMap::new(),
+            saved: Vec::new(),
         })
     }
 
@@ -152,6 +153,7 @@ impl Db {
             mut graph,
             mut retention,
             minted,
+            saved: _,
         } = tx;
         // evictions are part of the transaction that caused them
         let mut evicted = Ok(());
@@ -275,6 +277,8 @@ pub struct DbTx<'t> {
     retention: MutexGuard<'t, Vec<Box<dyn Retention>>>,
     /// Ids minted so far, by the keyspace they were minted for.
     minted: HashMap<u64, u32>,
+    /// `minted` as of each open savepoint, innermost last.
+    saved: Vec<HashMap<u64, u32>>,
 }
 
 impl<'t> DbTx<'t> {
@@ -336,6 +340,59 @@ impl<'t> DbTx<'t> {
     /// Stage rows at an unstored source.
     pub fn give<B: Buffer>(&mut self, src: NodeRef<B>, input: &mut B) {
         self.graph.give(src, input);
+    }
+
+    /// Open a savepoint: [`rollback`](Self::rollback) returns the
+    /// transaction to this point, and [`release`](Self::release) keeps
+    /// what was written since. Savepoints nest.
+    pub fn savepoint(&mut self) {
+        self.tx.savepoint();
+        self.saved.push(self.minted.clone());
+    }
+
+    /// Close the innermost savepoint by undoing everything since it:
+    /// writes to tables, what graph runs derived from them, and ids
+    /// minted. A rejection since the savepoint is forgotten too, so the
+    /// transaction carries on; any other failure stays and is returned.
+    ///
+    /// Rows [given](Self::give) to unstored sources and not yet run are
+    /// dropped, whether given before the savepoint or after.
+    ///
+    /// # Panics
+    ///
+    /// If no savepoint is open.
+    pub fn rollback(&mut self) -> Result<()> {
+        self.minted = self.saved.pop().expect("rollback without a savepoint");
+        self.graph.abort();
+        self.tx.rollback()
+    }
+
+    /// Close the innermost savepoint, keeping everything since it.
+    ///
+    /// # Panics
+    ///
+    /// If no savepoint is open.
+    pub fn release(&mut self) {
+        self.saved.pop().expect("release without a savepoint");
+        self.tx.release();
+    }
+
+    /// Run `f` as a unit within this transaction: then the graph, so a
+    /// constraint on derived state that `f`'s writes break shows now. If
+    /// either fails, everything since the call is undone and the error
+    /// returned, and the transaction carries on as if `f` never ran.
+    pub fn attempt<R>(&mut self, f: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+        self.savepoint();
+        match f(self).and_then(|r| self.run().map(|()| r)) {
+            Ok(r) => {
+                self.release();
+                Ok(r)
+            }
+            Err(e) => {
+                self.rollback()?;
+                Err(e)
+            }
+        }
     }
 
     /// Run the graph now, so derived state reflects this transaction's

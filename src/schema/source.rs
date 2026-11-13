@@ -17,6 +17,11 @@ use crate::{
 };
 
 use super::{
+    Invert,
+    subscribe::{Change, Subscription},
+};
+use crate::store::codec::Codec;
+use super::{
     At, Data, Keyed, KeyedOrigin, MultisetRead, Read, Root, SetRead, Shared, Stream, TxCell, Value,
     ValueRead, read::RegisterReader,
 };
@@ -45,6 +50,15 @@ pub trait SourceDecl: 'static {
     type Handle: Send + Sync + 'static;
     type Write<'a>;
     type Read<'a>;
+    /// A change to one of its rows, as a commit reports it.
+    type Change: Codec + Invert + Clone + Send + 'static;
+
+    /// Every commit's changes after the state `read` reads.
+    fn subscribe(read: &Self::Read<'_>) -> Subscription<Self::Change>;
+
+    /// Write `changes` as another database of the schema committed
+    /// them. They are taken as given: write-time checks do not run.
+    fn apply(write: &Self::Write<'_>, changes: &[Self::Change]) -> Result<()>;
 
     /// Open the base keyspace `name` in the build.
     fn open(name: Arc<str>, build: &Shared) -> Self::Head;
@@ -215,6 +229,39 @@ impl<K: Data, V: Data> SourceDecl for Table<K, V> {
     type Handle = TableHandle<K, V>;
     type Write<'a> = TableWrite<'a, K, V>;
     type Read<'a> = TableRead<'a, K, V>;
+    type Change = (K, Change<V>);
+
+    fn subscribe(read: &Self::Read<'_>) -> Subscription<Self::Change> {
+        read.subscribe()
+    }
+
+    fn apply(w: &Self::Write<'_>, changes: &[Self::Change]) -> Result<()> {
+        let mut tx = w.tx.borrow_mut();
+        if w.h.alts.is_empty() {
+            for (k, c) in changes {
+                match c.after() {
+                    Some(v) => w.h.raw.upsert(&mut tx, k.clone(), v.clone())?,
+                    None => drop(w.h.raw.remove(&mut tx, k)?),
+                }
+            }
+            return Ok(());
+        }
+        // Rows may trade unique keys within one commit, so free every
+        // key the changed rows hold before claiming the new ones.
+        for (k, _) in changes {
+            if let Some(old) = w.h.raw.get(&mut tx, k)? {
+                w.alts(&mut tx, k, Some(&old), None)?;
+                w.h.raw.remove(&mut tx, k)?;
+            }
+        }
+        for (k, c) in changes {
+            if let Some(v) = c.after() {
+                w.alts(&mut tx, k, None, Some(v))?;
+                w.h.raw.upsert(&mut tx, k.clone(), v.clone())?;
+            }
+        }
+        Ok(())
+    }
 
     fn open(name: Arc<str>, build: &Shared) -> Self::Head {
         let id = build.borrow_mut().id(&name);
@@ -312,6 +359,22 @@ impl<V: Data> SourceDecl for Events<V> {
     type Handle = EventsHandle<V>;
     type Write<'a> = EventsWrite<'a, V>;
     type Read<'a> = EventsRead<'a, V>;
+    type Change = (Id<V>, Change<V>);
+
+    fn subscribe(read: &Self::Read<'_>) -> Subscription<Self::Change> {
+        read.subscribe()
+    }
+
+    /// Rows keep the ids they were minted with elsewhere. They are not
+    /// counted by a [`Retain::Count`] policy here until the next open.
+    fn apply(w: &Self::Write<'_>, changes: &[Self::Change]) -> Result<()> {
+        let mut tx = w.tx.borrow_mut();
+        let mut ks = tx.table(w.h.raw.id());
+        for (id, c) in changes {
+            ks.set(*id, c.after().cloned())?;
+        }
+        Ok(())
+    }
 
     fn open(name: Arc<str>, build: &Shared) -> Self::Head {
         let id = build.borrow_mut().id(&name);
@@ -419,6 +482,23 @@ impl<T: Data> SourceDecl for Set<T> {
     type Handle = SetHandle<T>;
     type Write<'a> = SetWrite<'a, T>;
     type Read<'a> = SetRead<'a, T>;
+    type Change = (T, Change<()>);
+
+    fn subscribe(read: &Self::Read<'_>) -> Subscription<Self::Change> {
+        read.subscribe()
+    }
+
+    fn apply(w: &Self::Write<'_>, changes: &[Self::Change]) -> Result<()> {
+        let mut tx = w.tx.borrow_mut();
+        for (t, c) in changes {
+            match c {
+                Change::Insert(()) => drop(w.h.raw.insert(&mut tx, t.clone())?),
+                Change::Delete(()) => drop(w.h.raw.remove(&mut tx, t)?),
+                Change::Replace((), ()) => {}
+            }
+        }
+        Ok(())
+    }
 
     fn open(name: Arc<str>, build: &Shared) -> Self::Head {
         let id = build.borrow_mut().id(&name);
@@ -501,6 +581,22 @@ impl<V: Data> SourceDecl for Cell<V> {
     type Handle = CellHandle<V>;
     type Write<'a> = CellWrite<'a, V>;
     type Read<'a> = CellRead<'a, V>;
+    type Change = Change<V>;
+
+    fn subscribe(read: &Self::Read<'_>) -> Subscription<Self::Change> {
+        read.subscribe()
+    }
+
+    fn apply(w: &Self::Write<'_>, changes: &[Self::Change]) -> Result<()> {
+        let mut tx = w.tx.borrow_mut();
+        for c in changes {
+            match c.after() {
+                Some(v) => w.h.raw.set(&mut tx, v.clone())?,
+                None => w.h.raw.clear(&mut tx)?,
+            }
+        }
+        Ok(())
+    }
 
     fn open(name: Arc<str>, build: &Shared) -> Self::Head {
         let id = build.borrow_mut().id(&name);
@@ -590,6 +686,19 @@ impl<T: Data> SourceDecl for Multiset<T> {
     type Handle = MultisetHandle<T>;
     type Write<'a> = MultisetWrite<'a, T>;
     type Read<'a> = MultisetRead<'a, T>;
+    type Change = (T, Delta);
+
+    fn subscribe(read: &Self::Read<'_>) -> Subscription<Self::Change> {
+        read.subscribe()
+    }
+
+    fn apply(w: &Self::Write<'_>, changes: &[Self::Change]) -> Result<()> {
+        let mut tx = w.tx.borrow_mut();
+        for (row, times) in changes {
+            w.h.raw.add(&mut tx, row.clone(), *times)?;
+        }
+        Ok(())
+    }
 
     fn open(name: Arc<str>, build: &Shared) -> Self::Head {
         let mut b = build.borrow_mut();

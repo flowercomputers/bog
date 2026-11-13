@@ -34,7 +34,7 @@
 //! - [`stream`]: the typed stream kinds views are declared over.
 //! - [`schema`]: sources and views as one struct, with the write and
 //!   read sides derived. [`constraints`] and [`search`] are domains
-//!   built on it.
+//!   built on it, and [`tick`] batches writes into one commit per tick.
 
 //!
 //! The crate root exports the schema surface. The dataflow runtime, the
@@ -79,6 +79,8 @@ pub use schema::*;
 pub mod constraints;
 
 pub mod search;
+
+pub mod tick;
 
 mod database;
 

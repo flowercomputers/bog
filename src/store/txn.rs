@@ -77,6 +77,21 @@ impl TxState {
         }
     }
 
+    /// Set the bytes held, as a savepoint recorded them.
+    fn restore(&self, used: usize) {
+        self.used.set(used);
+        self.gauge.store(used, Relaxed);
+    }
+
+    /// Forget a rejection, which undoing the writes that caused it
+    /// cures. Any other failure stays.
+    fn clear_rejection(&self) {
+        let mut failure = self.failure.borrow_mut();
+        if matches!(*failure, Some(Error::Rejected(_))) {
+            *failure = None;
+        }
+    }
+
     /// Run a read, failing the tx if it fails.
     fn read<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         self.check()?;
@@ -146,6 +161,17 @@ pub trait ErasedUnderlay: Any {
     fn end_run(&mut self) -> isize;
     /// Settle every run, before `is_empty` or `seal`.
     fn settle(&mut self);
+    /// Open a savepoint: settle, then freeze every run so far, so later
+    /// writes start a new one. Returns how many runs there are, how
+    /// many were frozen before, and how the bytes held changed.
+    fn freeze(&mut self) -> (usize, usize, isize);
+    /// Roll back to a savepoint: drop the runs written since it.
+    fn rollback(&mut self, runs: usize, frozen: usize);
+    /// Release a savepoint, keeping its writes, with `run` the tx's
+    /// current run: unfreeze back to `frozen`, and merge the runs it
+    /// left behind where that keeps them few. Returns how the bytes
+    /// held changed.
+    fn thaw(&mut self, frozen: usize, run: u64) -> isize;
     /// Turn this tx's changes into the committed form, a
     /// `Resident` of new values and tombstones, encoding each entry
     /// into `wal` on the way when there is one. Also returns the tree's
@@ -178,6 +204,18 @@ pub struct WriteTx<'tx> {
     rebuilding: bool,
     /// Which graph run this is; see [`WriteTx::end_run`].
     run: u64,
+    /// Open savepoints, innermost last.
+    savepoints: Vec<Savepoint>,
+}
+
+/// What [`WriteTx::rollback`] restores.
+struct Savepoint {
+    run: u64,
+    used: usize,
+    /// Whether the tx had already failed: then rolling back cures nothing.
+    failed: bool,
+    /// Each keyspace written by then: its id, run count, and frozen count.
+    marks: Vec<(u64, usize, usize)>,
 }
 
 /// One graph run's writes to one keyspace: each key once, in order, with
@@ -295,7 +333,84 @@ impl<'tx> WriteTx<'tx> {
             writer,
             rebuilding: false,
             run: 0,
+            savepoints: Vec::new(),
         }
+    }
+
+    /// Open a savepoint: a point in this tx that
+    /// [`rollback`](Self::rollback) returns to, undoing every write
+    /// since, the graph's included. Savepoints nest; each is closed by
+    /// one `rollback` or [`release`](Self::release).
+    pub fn savepoint(&mut self) {
+        let failed = self.state.check().is_err();
+        let mut marks = Vec::with_capacity(self.overlay.len());
+        let mut delta = 0;
+        for (&id, handle) in &mut self.overlay {
+            let (runs, frozen, d) = handle.freeze();
+            delta += d;
+            marks.push((id, runs, frozen));
+        }
+        if !failed {
+            self.state.grow(delta);
+        }
+        self.savepoints.push(Savepoint {
+            run: self.run,
+            used: self.state.used.get(),
+            failed: failed || self.state.check().is_err(),
+            marks,
+        });
+    }
+
+    /// Close the innermost savepoint by undoing every write since it. A
+    /// rejection since then is forgotten with the writes that caused
+    /// it; any other failure (a read error, the memory limit) stays,
+    /// and is returned.
+    ///
+    /// The graph must be told separately to forget what it had staged:
+    /// [`DbTx::rollback`](crate::raw::DbTx::rollback) does both.
+    ///
+    /// # Panics
+    ///
+    /// If no savepoint is open.
+    pub fn rollback(&mut self) -> Result<()> {
+        let sp = self.savepoints.pop().expect("rollback without a savepoint");
+        if sp.failed {
+            return self.state.check();
+        }
+        self.state.clear_rejection();
+        self.state.check()?;
+        for (id, handle) in &mut self.overlay {
+            match sp.marks.iter().find(|(m, ..)| m == id) {
+                Some(&(_, runs, frozen)) => handle.rollback(runs, frozen),
+                // first written after the savepoint
+                None => handle.rollback(0, 0),
+            }
+        }
+        self.run = sp.run;
+        self.state.restore(sp.used);
+        Ok(())
+    }
+
+    /// Close the innermost savepoint, keeping the writes since it.
+    ///
+    /// # Panics
+    ///
+    /// If no savepoint is open.
+    pub fn release(&mut self) {
+        let sp = self.savepoints.pop().expect("release without a savepoint");
+        if self.state.check().is_err() {
+            return;
+        }
+        let mut delta = 0;
+        for (id, handle) in &mut self.overlay {
+            let frozen = sp
+                .marks
+                .iter()
+                .find(|(m, ..)| m == id)
+                .map_or(0, |&(_, _, frozen)| frozen);
+            delta += handle.thaw(frozen, self.run);
+        }
+        self.state.grow(delta);
     }
 
     /// End a graph run: what was written so far becomes the "old" state
@@ -365,6 +480,7 @@ impl<'tx> WriteTx<'tx> {
             writer,
             rebuilding: _,
             run: _,
+            savepoints: _,
         } = self;
         for handle in overlay.values_mut() {
             handle.settle();
@@ -381,6 +497,9 @@ impl<'tx> WriteTx<'tx> {
 /// graph run that wrote it, oldest first.
 pub struct KeyspaceHandle<K, M: Merge> {
     runs: Vec<OverlayRun<K, M>>,
+    /// `runs[..frozen]` are behind an open savepoint: settled, and not
+    /// written or merged until it closes.
+    frozen: usize,
 }
 
 /// A transaction's view of one keyspace: its own writes plus the
@@ -390,13 +509,18 @@ pub struct Keyspace<'a, 'tx, K, M: Merge> {
     id: KeyspaceId<K, M>,
     runs: &'a mut Vec<OverlayRun<K, M>>,
     run: u64,
+    /// See [`KeyspaceHandle::frozen`].
+    frozen: usize,
     state: &'a TxState,
     snap: &'a Snapshot<'tx>,
 }
 
 impl<K: Ord, M: Merge> Default for KeyspaceHandle<K, M> {
     fn default() -> Self {
-        Self { runs: Vec::new() }
+        Self {
+            runs: Vec::new(),
+            frozen: 0,
+        }
     }
 }
 
@@ -529,6 +653,40 @@ where
         last.settle();
         runs_bytes(std::slice::from_ref(last)) as isize - before as isize
     }
+    fn freeze(&mut self) -> (usize, usize, isize) {
+        let delta = self.end_run();
+        let frozen = std::mem::replace(&mut self.frozen, self.runs.len());
+        (self.runs.len(), frozen, delta)
+    }
+    fn rollback(&mut self, runs: usize, frozen: usize) {
+        self.runs.truncate(runs);
+        self.frozen = frozen;
+    }
+    fn thaw(&mut self, frozen: usize, run: u64) -> isize {
+        self.frozen = frozen;
+        let mut delta = self.end_run();
+        // Each savepoint leaves a run behind, and a read searches every
+        // run. Merge the newest into the one before while that one is no
+        // more than twice its size, so the runs stay logarithmic in the
+        // writes. Two runs merge when no reader tells them apart: both
+        // of the current graph run, or both older than it.
+        while let [.., a, b] = &self.runs[self.frozen..] {
+            if !(a.run == b.run || b.run < run) {
+                break;
+            }
+            if !b.entries.is_empty() && a.entries.len() > 2 * b.entries.len() {
+                break;
+            }
+            let b = self.runs.pop().expect("two runs");
+            let a = self.runs.last_mut().expect("two runs");
+            let before = runs_bytes(std::slice::from_ref(a)) + runs_bytes(std::slice::from_ref(&b));
+            a.run = b.run;
+            a.entries.extend(b.entries);
+            a.settle();
+            delta += runs_bytes(std::slice::from_ref(a)) as isize - before as isize;
+        }
+        delta
+    }
     fn seal(
         mut self: Box<Self>,
         mut wal: Option<&mut Vec<u8>>,
@@ -581,7 +739,7 @@ where
 
     /// The run being written, settled.
     fn current(&mut self) -> &mut OverlayRun<K, M> {
-        if self.runs.last().is_none_or(|r| r.run != self.run) {
+        if self.runs.len() <= self.frozen || self.runs.last().is_none_or(|r| r.run != self.run) {
             self.runs.push(OverlayRun::new(self.run));
         }
         self.runs.last_mut().expect("just ensured")
@@ -827,8 +985,10 @@ where
     /// Whether anything was written to this keyspace in this graph run.
     pub fn changed_this_run(&self) -> bool {
         self.runs
-            .last()
-            .is_some_and(|r| r.run == self.run && !r.entries.is_empty())
+            .iter()
+            .rev()
+            .take_while(|r| r.run == self.run)
+            .any(|r| !r.entries.is_empty())
     }
 
     /// Every key whose value this graph run changed, from its value at
@@ -840,18 +1000,33 @@ where
         M::Value: PartialEq,
     {
         self.settle();
-        let Some(last) = self.runs.last() else { return };
-        if last.run != self.run {
+        // a savepoint splits a graph run's writes over several runs
+        let start = self.runs.partition_point(|r| r.run < self.run);
+        if let [only] = &self.runs[start..] {
+            for (k, c) in &only.entries {
+                if let (Some(o), Some(n)) = (c.old_value(), c.new_value())
+                    && o == n
+                {
+                    continue;
+                }
+                out.absorb_one(k.clone(), c.clone());
+            }
             return;
         }
-        for (k, c) in &last.entries {
-            if let (Some(o), Some(n)) = (c.old_value(), c.new_value())
-                && o == n
-            {
-                continue;
-            }
-            out.absorb_one(k.clone(), c.clone());
-        }
+        composed(
+            self.runs[start..]
+                .iter()
+                .map(|r| r.entries.iter().map(|(k, c)| (k, c.clone()))),
+            |k, c| {
+                let Some(c) = c else { return };
+                if let (Some(o), Some(n)) = (c.old_value(), c.new_value())
+                    && o == n
+                {
+                    return;
+                }
+                out.absorb_one(k.clone(), c);
+            },
+        );
     }
 
     fn cursor(&self, range: impl RangeBounds<K>, rev: bool, old: bool) -> Cursor<'_, K, M>
@@ -944,8 +1119,9 @@ impl<'tx> WriteTx<'tx> {
         M: Merge,
         M::Value: Codec + Sync,
     {
-        if self.state.check().is_err() {
-            // a failed tx will not commit, so its writes are dead weight
+        if self.state.check().is_err() && self.savepoints.is_empty() {
+            // a failed tx will not commit, so its writes are dead weight;
+            // under a savepoint, a rollback may yet cure it
             self.overlay.clear();
         }
         let store = self.snapshot.store();
@@ -961,6 +1137,7 @@ impl<'tx> WriteTx<'tx> {
             .expect("keyspace id reused with a different type");
         Keyspace {
             id,
+            frozen: handle.frozen,
             runs: &mut handle.runs,
             run: self.run,
             state: &self.state,

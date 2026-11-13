@@ -2,7 +2,7 @@
 
 use std::{path::Path, rc::Rc, sync::Arc};
 
-use super::{At, Declare, Schema, TxCell};
+use super::{At, CommitFeed, Declare, Schema, TxCell};
 use crate::{
     database::Db as RawDb,
     dataflow::Build,
@@ -15,8 +15,11 @@ pub struct DbBuilder<S: Schema> {
     store: StoreBuilder,
     version: u64,
     commit_hooks: Vec<CommitHook<S>>,
+    change_hooks: Vec<ChangeHook<S>>,
     checkpoint_hooks: Vec<Box<dyn FnMut(u64) + Send>>,
 }
+
+type ChangeHook<S> = Box<dyn FnMut(&<S as Schema>::Changes, &<S as Schema>::Read<'_>) + Send>;
 
 type CommitHook<S> = Box<dyn FnMut(&<S as Schema>::Read<'_>) + Send>;
 
@@ -43,6 +46,7 @@ impl<S: Declare> DbBuilder<S> {
             store,
             version: 0,
             commit_hooks: Vec::new(),
+            change_hooks: Vec::new(),
             checkpoint_hooks: Vec::new(),
         }
     }
@@ -76,6 +80,17 @@ impl<S: Declare> DbBuilder<S> {
     /// the committed state.
     pub fn commit_hook(mut self, hook: impl FnMut(&S::Read<'_>) + Send + 'static) -> Self {
         self.commit_hooks.push(Box::new(hook));
+        self
+    }
+
+    /// Call `hook` after every commit that changed a source, on the
+    /// committing thread, with what it changed and the committed state.
+    /// See [`ChangeSet`](super::ChangeSet).
+    pub fn on_changes(
+        mut self,
+        hook: impl FnMut(&S::Changes, &S::Read<'_>) + Send + 'static,
+    ) -> Self {
+        self.change_hooks.push(Box::new(hook));
         self
     }
 
@@ -121,6 +136,23 @@ impl<S: Declare> DbBuilder<S> {
         for mut hook in self.commit_hooks {
             let handles = handles.clone();
             inner.on_commit(move |snap| hook(&S::read(&handles, At::Snapshot(snap))));
+        }
+        if !self.change_hooks.is_empty() {
+            let mut hooks = self.change_hooks;
+            let mut feed = {
+                let snap = inner.snapshot();
+                S::feed(&S::read(&handles, At::Snapshot(&snap)))
+            };
+            let handles = handles.clone();
+            inner.on_commit(move |snap| {
+                let read = S::read(&handles, At::Snapshot(snap));
+                while let Some(epoch) = feed.epoch() {
+                    let changes = feed.take(epoch);
+                    for hook in &mut hooks {
+                        hook(&changes, &read);
+                    }
+                }
+            });
         }
         for hook in self.checkpoint_hooks {
             inner.on_checkpoint(hook);

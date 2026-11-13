@@ -300,6 +300,8 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
     let handles = format_ident!("{name}Handles");
     let read = format_ident!("{name}Read");
     let builder = format_ident!("{name}Builder");
+    let changes = format_ident!("{name}Changes");
+    let feed = format_ident!("{name}Feed");
     let sch = quote!(#krate::schema);
 
     let s_ident: Vec<_> = sources.iter().map(|f| f.ident).collect();
@@ -337,6 +339,25 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
             #vis fn epoch(&self) -> u64 {
                 self.__tx.epoch()
             }
+
+            /// Write `changes`, as another database of this schema
+            /// committed them, to the sources. Write-time checks do
+            /// not run; the graph derives the views as for any write.
+            #vis fn apply(&mut self, changes: &#changes) -> #krate::Result<()> {
+                <#name as #sch::Schema>::apply(self, changes)
+            }
+
+            /// Run `f` as a unit within this transaction. If it fails,
+            /// or a constraint refuses what it wrote, everything it did
+            /// is undone and the error returned, and the transaction
+            /// carries on as if `f` never ran.
+            #vis fn attempt<T>(
+                &mut self,
+                f: impl ::std::ops::FnOnce(&mut Self) -> #krate::Result<T>,
+            ) -> #krate::Result<T> {
+                let tx = self.__tx;
+                tx.attempt(|| f(self))
+            }
         }
 
         #vis struct #handles {
@@ -351,6 +372,74 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
             #( #n_vis #n_ident: <#n_ty as #sch::Schema>::Read<'a>, )*
         }
 
+        /// One commit's changes to every source.
+        #[derive(Clone)]
+        #vis struct #changes {
+            /// The epoch the commit committed as.
+            pub epoch: u64,
+            #( #s_vis #s_ident: ::std::vec::Vec<<#s_ty as #sch::SourceDecl>::Change>, )*
+            #( #n_vis #n_ident: <#n_ty as #sch::Schema>::Changes, )*
+        }
+
+        impl #sch::ChangeSet for #changes {
+            fn epoch(&self) -> u64 {
+                self.epoch
+            }
+
+            fn is_empty(&self) -> bool {
+                true
+                    #( && self.#s_ident.is_empty() )*
+                    #( && #sch::ChangeSet::is_empty(&self.#n_ident) )*
+            }
+
+            fn invert(self) -> Self {
+                #changes {
+                    epoch: self.epoch,
+                    #( #s_ident: self.#s_ident.into_iter().map(#sch::Invert::invert).collect(), )*
+                    #( #n_ident: #sch::ChangeSet::invert(self.#n_ident), )*
+                }
+            }
+
+            fn encode_into(&self, out: &mut ::std::vec::Vec<u8>) {
+                #krate::store::codec::Codec::encode(&self.epoch, out);
+                #( #krate::store::codec::Codec::encode(&self.#s_ident, out); )*
+                #( #sch::ChangeSet::encode_into(&self.#n_ident, out); )*
+            }
+
+            fn decode_from(b: &mut &[u8]) -> #krate::store::codec::Result<Self> {
+                ::std::result::Result::Ok(#changes {
+                    epoch: #krate::store::codec::Codec::decode(b)?,
+                    #( #s_ident: #krate::store::codec::Codec::decode(b)?, )*
+                    #( #n_ident: #sch::ChangeSet::decode_from(b)?, )*
+                })
+            }
+        }
+
+        #[doc(hidden)]
+        #vis struct #feed {
+            #( #s_ident: #sch::Tap<<#s_ty as #sch::SourceDecl>::Change>, )*
+            #( #n_ident: <#n_ty as #sch::Schema>::Feed, )*
+        }
+
+        impl #sch::CommitFeed for #feed {
+            type Changes = #changes;
+
+            fn epoch(&mut self) -> ::std::option::Option<u64> {
+                #sch::first_epoch([
+                    #( self.#s_ident.epoch(), )*
+                    #( #sch::CommitFeed::epoch(&mut self.#n_ident), )*
+                ])
+            }
+
+            fn take(&mut self, epoch: u64) -> #changes {
+                #changes {
+                    epoch,
+                    #( #s_ident: self.#s_ident.take(epoch), )*
+                    #( #n_ident: #sch::CommitFeed::take(&mut self.#n_ident, epoch), )*
+                }
+            }
+        }
+
         #vis struct #builder {
             #( #s_vis #s_ident: <#s_ty as #sch::SourceDecl>::Head, )*
             #( #v_vis #v_ident: <#v_ty as #sch::ViewDecl>::Slot, )*
@@ -362,6 +451,28 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
             type Builder = #builder;
             type Write<'a> = #write<'a>;
             type Read<'a> = #read<'a>;
+            type Changes = #changes;
+            type Feed = #feed;
+
+            fn feed(read: &#read<'_>) -> #feed {
+                #feed {
+                    #( #s_ident: #sch::Tap::new(<#s_ty as #sch::SourceDecl>::subscribe(&read.#s_ident)), )*
+                    #( #n_ident: <#n_ty as #sch::Schema>::feed(&read.#n_ident), )*
+                }
+            }
+
+            fn attempt<'a, T>(
+                write: &mut #write<'a>,
+                f: impl ::std::ops::FnOnce(&mut #write<'a>) -> #krate::Result<T>,
+            ) -> #krate::Result<T> {
+                write.attempt(f)
+            }
+
+            fn apply(write: &#write<'_>, changes: &#changes) -> #krate::Result<()> {
+                #( <#s_ty as #sch::SourceDecl>::apply(&write.#s_ident, &changes.#s_ident)?; )*
+                #( <#n_ty as #sch::Schema>::apply(&write.#n_ident, &changes.#n_ident)?; )*
+                ::std::result::Result::Ok(())
+            }
 
             fn open(prefix: &str, build: &#sch::Shared) -> #builder {
                 #builder {

@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use crate::{
     dataflow::Delta,
     dataflow::state::Edge,
-    store::codec::{Codec, OrderedCodec},
+    store::codec::{Codec, OrderedCodec, ResidentSize, heap_size},
     store::merge::Change as RawChange,
     store::merge::Merge,
     store::merge::{Mergeless, Tally},
@@ -33,6 +33,54 @@ pub enum Change<V> {
     Delete(V),
     /// The value before, and after.
     Replace(V, V),
+}
+
+impl<V: ResidentSize> ResidentSize for Change<V> {
+    fn resident_size(&self) -> usize {
+        size_of::<Self>()
+            + match self {
+                Change::Insert(v) | Change::Delete(v) => heap_size(v),
+                Change::Replace(old, new) => heap_size(old) + heap_size(new),
+            }
+    }
+}
+
+/// A one-byte tag, then the value, or the old and the new.
+impl<V: Codec> Codec for Change<V> {
+    fn encode(&self, out: &mut impl bytes::BufMut) {
+        match self {
+            Change::Insert(v) => {
+                out.put_u8(0);
+                v.encode(out);
+            }
+            Change::Delete(v) => {
+                out.put_u8(1);
+                v.encode(out);
+            }
+            Change::Replace(old, new) => {
+                out.put_u8(2);
+                old.encode(out);
+                new.encode(out);
+            }
+        }
+    }
+    fn decode(b: &mut &[u8]) -> crate::store::codec::Result<Self> {
+        match u8::decode(b)? {
+            0 => Ok(Change::Insert(V::decode(b)?)),
+            1 => Ok(Change::Delete(V::decode(b)?)),
+            2 => Ok(Change::Replace(V::decode(b)?, V::decode(b)?)),
+            tag => Err(crate::store::codec::DecodeError::InvalidTag {
+                what: "change",
+                tag,
+            }),
+        }
+    }
+    fn encode_size(&self) -> usize {
+        1 + match self {
+            Change::Insert(v) | Change::Delete(v) => v.encode_size(),
+            Change::Replace(old, new) => old.encode_size() + new.encode_size(),
+        }
+    }
 }
 
 impl<V> Change<V> {
