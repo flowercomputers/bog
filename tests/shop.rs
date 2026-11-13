@@ -605,6 +605,19 @@ fn a_group_view_scans_a_range_of_keys() {
             vec![(2, 9, 1), (2, 3, 1), (1, 5, 1)]
         );
         assert!(rows(&mut r.by_sensor.range(6..)).is_empty());
+        // bounds on rows resume mid-group, either way
+        let after = (
+            std::ops::Bound::Excluded((2, 3)),
+            std::ops::Bound::Unbounded,
+        );
+        assert_eq!(
+            rows(&mut r.by_sensor.rows(after)),
+            vec![(2, 9, 1), (3, 4, 1), (5, 1, 2)]
+        );
+        assert_eq!(
+            rows(&mut r.by_sensor.rows_rev(..(2, 9))),
+            vec![(2, 3, 1), (1, 5, 1)]
+        );
     });
     // inside a transaction, the range sees the transaction's own writes
     db.write(|tx| {
@@ -614,9 +627,59 @@ fn a_group_view_scans_a_range_of_keys() {
             .range(3..=4)
             .collect::<bog::Result<Vec<_>>>()?;
         assert_eq!(seen, vec![(3, 4, 1), (4, 8, 1)]);
+        let seen = tx
+            .by_sensor
+            .rows((3, 5)..)
+            .collect::<bog::Result<Vec<_>>>()?;
+        assert_eq!(seen, vec![(4, 8, 1), (5, 1, 2)]);
         Ok(())
     })
     .unwrap();
+}
+
+#[derive(Schema)]
+struct Shelf {
+    names: Set<String>,
+    stock: Multiset<String>,
+}
+
+impl Declare for Shelf {
+    fn declare(_: &mut ShelfBuilder) {}
+}
+
+#[test]
+fn sets_and_multisets_read_ranges_and_a_write_reports_its_epoch() {
+    let db = Shelf::memory().build().unwrap();
+    let ((), epoch) = db
+        .write_epoch(|tx| {
+            tx.names.extend(["a", "b", "c"].map(String::from))?;
+            tx.stock.add("x".into(), 2)?;
+            tx.stock.add("y".into(), 1)?;
+            tx.stock.add("z".into(), 3)
+        })
+        .unwrap();
+    assert_eq!(epoch, Some(db.snapshot().epoch()));
+    // a transaction that writes nothing commits nothing
+    let (removed, epoch) = db
+        .write_epoch(|tx| tx.names.remove(&"nobody".into()))
+        .unwrap();
+    assert_eq!((removed, epoch), (false, None));
+
+    let b = |s: &str| s.to_string();
+    db.read(|r| {
+        let names = r
+            .names
+            .range_rev(..b("c"))
+            .collect::<bog::Result<Vec<_>>>();
+        assert_eq!(names.unwrap(), ["b", "a"]);
+        let stock = r.stock.range(b("y")..).collect::<bog::Result<Vec<_>>>();
+        assert_eq!(stock.unwrap(), [(b("y"), 1), (b("z"), 3)]);
+        let stock = r
+            .stock
+            .range_rev(..b("z"))
+            .collect::<bog::Result<Vec<_>>>();
+        assert_eq!(stock.unwrap(), [(b("y"), 1), (b("x"), 2)]);
+    });
 }
 
 #[derive(Schema)]

@@ -175,6 +175,15 @@ impl<S: Declare> Db<S> {
     /// graph, as [`Error::Rejected`](crate::error::Error::Rejected). Blocks
     /// while another write is in progress.
     pub fn write<T>(&self, f: impl FnOnce(&mut S::Write<'_>) -> Result<T>) -> Result<T> {
+        self.write_epoch(f).map(|(v, _)| v)
+    }
+
+    /// [`write`](Self::write), returning also the epoch the transaction
+    /// committed as: `None` if it wrote nothing, so nothing committed.
+    pub fn write_epoch<T>(
+        &self,
+        f: impl FnOnce(&mut S::Write<'_>) -> Result<T>,
+    ) -> Result<(T, Option<u64>)> {
         let mut tx = self.inner.begin()?;
         let r = {
             let cell = TxCell::new(&mut tx);
@@ -182,7 +191,7 @@ impl<S: Declare> Db<S> {
             f(&mut w)
         };
         match r {
-            Ok(v) => self.inner.commit(tx).map(|()| v),
+            Ok(v) => self.inner.commit(tx).map(|epoch| (v, epoch)),
             Err(e) => {
                 self.inner.abort(tx);
                 Err(e)

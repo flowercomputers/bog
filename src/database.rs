@@ -119,7 +119,7 @@ impl Db {
     pub fn write<R>(&self, f: impl FnOnce(&mut DbTx<'_>) -> Result<R>) -> Result<R> {
         let mut tx = self.begin()?;
         match f(&mut tx) {
-            Ok(r) => self.commit(tx).map(|()| r),
+            Ok(r) => self.commit(tx).map(|_| r),
             Err(e) => {
                 self.abort(tx);
                 Err(e)
@@ -146,8 +146,9 @@ impl Db {
         })
     }
 
-    /// Run the graph over what `tx` wrote, then commit it.
-    pub fn commit(&self, tx: DbTx<'_>) -> Result<()> {
+    /// Run the graph over what `tx` wrote, then commit it. Returns the
+    /// epoch it committed as, or `None` if it wrote nothing.
+    pub fn commit(&self, tx: DbTx<'_>) -> Result<Option<u64>> {
         let DbTx {
             mut tx,
             mut graph,
@@ -184,7 +185,7 @@ impl Db {
         if epoch.is_some() {
             self.run_hooks();
         }
-        Ok(())
+        Ok(epoch)
     }
 
     /// Drop `tx` without committing it.

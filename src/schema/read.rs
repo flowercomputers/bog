@@ -458,6 +458,9 @@ impl<K: Data, V: Data> Seek<'_, K, V> {
     }
 }
 
+/// Bounds on an arrangement's stored rows.
+type RowBounds<K, V> = (Bound<(K, Edge<V>)>, Bound<(K, Edge<V>)>);
+
 /// Reads an arrangement, or a [`DistinctRows`] node's counts, as groups.
 pub(crate) struct GroupReader<K, V> {
     source: GroupSource<K, V>,
@@ -502,7 +505,7 @@ impl<K: Data, V: Data> GroupReader<K, V> {
     /// Key bounds as row bounds: a key's rows lie between its `Lo` and
     /// `Hi` edges, so an included key takes all of them and an excluded
     /// one none.
-    fn bounds(lo: Bound<K>, hi: Bound<K>) -> (Bound<(K, Edge<V>)>, Bound<(K, Edge<V>)>) {
+    fn bounds(lo: Bound<K>, hi: Bound<K>) -> RowBounds<K, V> {
         let lo = match lo {
             Bound::Included(k) => Bound::Included((k, Edge::Lo)),
             Bound::Excluded(k) => Bound::Excluded((k, Edge::Hi)),
@@ -516,14 +519,22 @@ impl<K: Data, V: Data> GroupReader<K, V> {
         (lo, hi)
     }
 
+    /// Bounds on `(key, value)` rows as stored row bounds.
+    fn row_bounds(lo: Bound<(K, V)>, hi: Bound<(K, V)>) -> RowBounds<K, V> {
+        let edge = |b: Bound<(K, V)>| match b {
+            Bound::Included((k, v)) => Bound::Included((k, Edge::Val(v))),
+            Bound::Excluded((k, v)) => Bound::Excluded((k, Edge::Val(v))),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        (edge(lo), edge(hi))
+    }
+
     fn scan<'s>(
         &self,
         snap: &'s Snapshot<'s>,
-        lo: Bound<K>,
-        hi: Bound<K>,
+        (lo, hi): RowBounds<K, V>,
         rev: bool,
     ) -> Box<dyn Iterator<Item = Result<(K, V, Delta)>> + 's> {
-        let (lo, hi) = Self::bounds(lo, hi);
         match self.source {
             GroupSource::Arranged { id, .. } => {
                 let rows = if rev {
@@ -550,12 +561,10 @@ impl<K: Data, V: Data> GroupReader<K, V> {
     fn scan_tx(
         &self,
         tx: &mut WriteTx<'_>,
-        lo: Bound<K>,
-        hi: Bound<K>,
+        (lo, hi): RowBounds<K, V>,
         rev: bool,
         out: &mut Vec<(K, V, Delta)>,
     ) -> Result<()> {
-        let (lo, hi) = Self::bounds(lo, hi);
         match self.source {
             GroupSource::Arranged { id, .. } => {
                 let mut ks = tx.keyspace(id);
@@ -597,7 +606,7 @@ impl<K: Data, V: Data> GroupReader<K, V> {
         }
         let k = || Bound::Included(key.clone());
         Ok(self
-            .scan(snap, k(), k(), false)
+            .scan(snap, Self::bounds(k(), k()), false)
             .next()
             .transpose()?
             .is_some())
@@ -613,7 +622,7 @@ impl<K: Data, V: Data> GroupReader<K, V> {
         }
         let mut out = Vec::new();
         let k = || Bound::Included(key.clone());
-        self.scan_tx(tx, k(), k(), false, &mut out)?;
+        self.scan_tx(tx, Self::bounds(k(), k()), false, &mut out)?;
         Ok(!out.is_empty())
     }
 
@@ -649,16 +658,20 @@ impl<'a, K: Data, V: Data> GroupRead<'a, K, V> {
     }
 
     fn scan(&self, lo: Bound<K>, hi: Bound<K>, rev: bool) -> Scan<'a, (K, V, Delta)> {
+        self.scan_rows(GroupReader::bounds(lo, hi), rev)
+    }
+
+    fn scan_rows(&self, bounds: RowBounds<K, V>, rev: bool) -> Scan<'a, (K, V, Delta)> {
         let reader = self.reader;
         match self.at {
-            At::Snapshot(s) => reader.scan(s, lo, hi, rev),
+            At::Snapshot(s) => reader.scan(s, bounds, rev),
             at => {
-                let (lo2, hi2) = (lo.clone(), hi.clone());
+                let bounds2 = bounds.clone();
                 collected(at.with(
-                    |s| reader.scan(s, lo2, hi2, rev).collect(),
+                    |s| reader.scan(s, bounds2, rev).collect(),
                     |tx| {
                         let mut out = Vec::new();
-                        reader.scan_tx(tx, lo, hi, rev, &mut out)?;
+                        reader.scan_tx(tx, bounds, rev, &mut out)?;
                         Ok(out)
                     },
                 ))
@@ -699,6 +712,25 @@ impl<'a, K: Data, V: Data> GroupRead<'a, K, V> {
     ) -> impl Iterator<Item = Result<(K, V, Delta)>> + 'a {
         let (lo, hi) = clone_bounds(bounds);
         self.scan(lo, hi, true)
+    }
+
+    /// The rows in `bounds` of `(key, value)`, in key then value order:
+    /// where a listing resumes from a row, mid-group.
+    pub fn rows(
+        &self,
+        bounds: impl RangeBounds<(K, V)>,
+    ) -> impl Iterator<Item = Result<(K, V, Delta)>> + 'a {
+        let (lo, hi) = clone_bounds(bounds);
+        self.scan_rows(GroupReader::row_bounds(lo, hi), false)
+    }
+
+    /// [`rows`](Self::rows), greatest key (and value) first.
+    pub fn rows_rev(
+        &self,
+        bounds: impl RangeBounds<(K, V)>,
+    ) -> impl Iterator<Item = Result<(K, V, Delta)>> + 'a {
+        let (lo, hi) = clone_bounds(bounds);
+        self.scan_rows(GroupReader::row_bounds(lo, hi), true)
     }
 
     /// `key`'s `n` greatest values, greatest first.
@@ -921,6 +953,11 @@ impl<'a, T: Data> SetRead<'a, T> {
         self.read.range(bounds).map(|r| r.map(|(t, ())| t))
     }
 
+    /// Members in `bounds`, greatest first.
+    pub fn range_rev(&self, bounds: impl RangeBounds<T>) -> impl Iterator<Item = Result<T>> + 'a {
+        self.read.range_rev(bounds).map(|r| r.map(|(t, ())| t))
+    }
+
     /// See [`Read::seek`].
     pub fn seek(&self) -> Seek<'a, T, ()> {
         self.read.seek()
@@ -973,6 +1010,22 @@ impl<'a, T: Data> MultisetRead<'a, T> {
     /// Every row present, with its count, in order.
     pub fn iter(&self) -> impl Iterator<Item = Result<(T, Delta)>> + 'a {
         self.read.iter()
+    }
+
+    /// Rows in `bounds`, with their counts, in order.
+    pub fn range(
+        &self,
+        bounds: impl RangeBounds<T>,
+    ) -> impl Iterator<Item = Result<(T, Delta)>> + 'a {
+        self.read.range(bounds)
+    }
+
+    /// Rows in `bounds`, with their counts, greatest first.
+    pub fn range_rev(
+        &self,
+        bounds: impl RangeBounds<T>,
+    ) -> impl Iterator<Item = Result<(T, Delta)>> + 'a {
+        self.read.range_rev(bounds)
     }
 
     /// Every commit after the state this facade reads, as each row's

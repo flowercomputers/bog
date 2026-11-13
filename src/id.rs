@@ -136,6 +136,36 @@ impl<T> OrderedCodec for Id<T> {
     }
 }
 
+/// On the wire an id is its raw `u64`: the type parameter is a
+/// compile-time tag only, so `Id<User>` and `Id<Order>` encode alike.
+#[cfg(feature = "serde")]
+impl<T> serde::Serialize for Id<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(self.raw)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T> serde::Deserialize<'de> for Id<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        <u64 as serde::Deserialize>::deserialize(d).map(Id::new)
+    }
+}
+
+/// Described as its raw `u64`, inlined: an id has no schema of its own.
+#[cfg(feature = "schemars")]
+impl<T> schemars::JsonSchema for Id<T> {
+    fn inline_schema() -> bool {
+        true
+    }
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Id".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <u64 as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
