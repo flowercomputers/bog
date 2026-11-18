@@ -1,6 +1,6 @@
 # bog
 
-bog is a library for incremental dataflow over an (ACID) store. It its currently available as a pre-publication research preview.
+bog is a library for incremental dataflow over an (ACID) store. It its currently available in beta.
 
 ## repo layout
 
