@@ -79,7 +79,7 @@ impl Shared {
         }
         let me = self.me.upgrade().expect("a store is alive while used");
         match thread::Builder::new()
-            .name("fold3-maintenance".into())
+            .name("bog-maintenance".into())
             .spawn(move || me.maintenance_loop())
         {
             Ok(handle) => *worker = Some(handle),

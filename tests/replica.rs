@@ -4,7 +4,7 @@
 
 use std::sync::mpsc;
 
-use fold3::schema::{
+use bog::schema::{
     Cell, ChangeSet, Declare, Events, MapView, Multiset, OrderedView, Schema, Set, Table,
     ValueView,
 };
@@ -53,7 +53,7 @@ impl Declare for World {
 }
 
 /// Everything readable, as one comparable value.
-fn state(db: &fold3::Db<World>) -> String {
+fn state(db: &bog::Db<World>) -> String {
     db.read(|r| {
         format!(
             "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
@@ -71,7 +71,7 @@ fn state(db: &fold3::Db<World>) -> String {
     })
 }
 
-fn primary() -> (fold3::Db<World>, mpsc::Receiver<Vec<u8>>) {
+fn primary() -> (bog::Db<World>, mpsc::Receiver<Vec<u8>>) {
     let (send, recv) = mpsc::channel();
     let db = World::memory()
         .on_changes(move |changes, _| send.send(changes.encode()).unwrap())
@@ -84,7 +84,7 @@ fn primary() -> (fold3::Db<World>, mpsc::Receiver<Vec<u8>>) {
 fn a_replica_fed_every_commit_derives_the_same_state() {
     let (db, wire) = primary();
     let replica = World::memory().build().unwrap();
-    let sync = |db: &fold3::Db<World>| {
+    let sync = |db: &bog::Db<World>| {
         let mut epochs = Vec::new();
         for bytes in wire.try_iter() {
             let changes = WorldChanges::decode(&bytes).unwrap();

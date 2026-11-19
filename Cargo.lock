@@ -12,6 +12,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bog"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bog-derive",
+ "bytes",
+ "crc32fast",
+ "smallvec",
+]
+
+[[package]]
+name = "bog-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -30,26 +50,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f97d3416d5337d15c4b0d78c8c91df922ca143f57ec20e2d1c188333047ef04"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "fold3"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "bytes",
- "crc32fast",
- "fold3-derive",
- "smallvec",
-]
-
-[[package]]
-name = "fold3-derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

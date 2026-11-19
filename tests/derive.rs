@@ -2,7 +2,7 @@
 //! trip through both codecs, truncated input is an error, and a derived
 //! type works as a key and a value of a stored keyspace.
 
-use fold3::{
+use bog::{
     DurabilityPolicy, Mergeless, StoreBuilder,
     raw::KeyspaceId,
     schema::Codec as DeriveCodec,
@@ -36,11 +36,11 @@ struct Wrap<T> {
 
 /// The library under an alias, as a renamed dependency would see it.
 mod renamed {
-    pub use fold3 as thefold;
+    pub use bog as thefold;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, DeriveCodec)]
-#[fold3(crate = "crate::renamed::thefold")]
+#[bog(crate = "crate::renamed::thefold")]
 struct Aliased {
     id: u64,
 }

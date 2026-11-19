@@ -1,4 +1,4 @@
-//! The fold2 ledger benchmark's workload on fold3, as a standalone binary
+//! The fold2 ledger benchmark's workload on bog, as a standalone binary
 //! so each run gets a fresh process to measure: 10,000 users each minted a
 //! large balance, then random transfers, each checked (amount, distinct
 //! parties, both parties exist, no overdraft) and folded into balances,
@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use fold3::{
+use bog::{
     DurabilityPolicy, Mergeless, StoreBuilder, Tally,
     dataflow::state::Arrangement,
     raw::{
@@ -182,7 +182,7 @@ fn main() {
     let per_tx: u64 = args[2].parse().unwrap();
     let txs: u64 = args[3].parse().unwrap();
 
-    let dir = std::env::temp_dir().join(format!("fold3-ledger-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-ledger-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let builder = match mode.as_str() {
         "memory" => StoreBuilder::new(DurabilityPolicy::NONE),
@@ -244,7 +244,7 @@ fn main() {
     let transfers = txs * per_tx;
     let cpu = cpu1 - cpu0;
     println!(
-        "fold3,{mode},{per_tx},{txs},{transfers},{secs:.3},{:.0},{:.0},{cpu:.3},{:.2},{:.1},{seed_s:.3}",
+        "bog,{mode},{per_tx},{txs},{transfers},{secs:.3},{:.0},{:.0},{cpu:.3},{:.2},{:.1},{seed_s:.3}",
         transfers as f64 / secs,
         txs as f64 / secs,
         cpu * 1e6 / transfers as f64,

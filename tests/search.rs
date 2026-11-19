@@ -2,7 +2,7 @@
 //! completion, retraction correctness, recovery, a tokenizer as a type,
 //! and block-max top-k against brute force.
 
-use fold3::schema::{Codec, Declare, Id, MapView, Schema, SearchView, Table, Tokenizer, intern};
+use bog::schema::{Codec, Declare, Id, MapView, Schema, SearchView, Table, Tokenizer, intern};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Codec)]
 struct Album {
@@ -36,7 +36,7 @@ fn album(title: &str, blurb: &str) -> Album {
     }
 }
 
-fn seed(db: &fold3::schema::Db<Catalog>) -> Vec<Id<Album>> {
+fn seed(db: &bog::schema::Db<Catalog>) -> Vec<Id<Album>> {
     db.write(|tx| {
         tx.albums.insert_all([
             album("Blue Train", "hard bop, Coltrane's Blue Note classic"),
@@ -152,7 +152,7 @@ fn updates_and_removals_retract_cleanly() {
 
 #[test]
 fn index_persists_recovers_and_rebuilds() {
-    let dir = std::env::temp_dir().join(format!("fold3-search-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-search-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let supreme = {
         let db = Catalog::open(&dir).build().unwrap();
@@ -271,7 +271,7 @@ fn block_max_top_k_matches_brute_force() {
             .join(" ")
     };
 
-    let dir = std::env::temp_dir().join(format!("fold3-search-topk-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-search-topk-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let db = Corpus::open(&dir).build().unwrap();
     // one large commit, checkpointed, then small ones: updates and
@@ -301,7 +301,7 @@ fn block_max_top_k_matches_brute_force() {
     db.read(|r| {
         let n = r.search.len().unwrap() as f64;
         let avg = r.search.avg_len().unwrap();
-        let p = fold3::schema::Bm25::default();
+        let p = bog::schema::Bm25::default();
         let idf = |df: usize| ((n - df as f64 + 0.5) / (df as f64 + 0.5) + 1.0).ln();
         for query in [
             "alpha",

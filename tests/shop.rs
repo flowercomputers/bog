@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use fold3::{
+use bog::{
     Error,
     schema::{
         Cell, Change, Codec, Declare, Events, GroupView, Id, MapView, Multiset, OrderedView,
@@ -128,7 +128,7 @@ fn album(title: &str, price_cents: i64) -> Album {
 }
 
 fn dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fold3-shop-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-shop-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -579,8 +579,8 @@ fn a_group_view_scans_a_range_of_keys() {
         Ok(())
     })
     .unwrap();
-    let rows = |it: &mut dyn Iterator<Item = fold3::Result<(u8, i64, i64)>>| {
-        it.collect::<fold3::Result<Vec<_>>>().unwrap()
+    let rows = |it: &mut dyn Iterator<Item = bog::Result<(u8, i64, i64)>>| {
+        it.collect::<bog::Result<Vec<_>>>().unwrap()
     };
     db.read(|r| {
         // every group in the range, keys then values ascending, with
@@ -612,7 +612,7 @@ fn a_group_view_scans_a_range_of_keys() {
         let seen = tx
             .by_sensor
             .range(3..=4)
-            .collect::<fold3::Result<Vec<_>>>()?;
+            .collect::<bog::Result<Vec<_>>>()?;
         assert_eq!(seen, vec![(3, 4, 1), (4, 8, 1)]);
         Ok(())
     })

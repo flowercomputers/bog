@@ -103,7 +103,7 @@ impl Rng {
 }
 
 fn tmpdir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fold3-ops-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-ops-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
