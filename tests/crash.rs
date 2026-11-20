@@ -1,6 +1,6 @@
 //! Kill-9 crash harness.
 //!
-//! The parent re-executes this binary with `FOLD3_CRASH_DIR` set; the
+//! The parent re-executes this binary with `BOG_CRASH_DIR` set; the
 //! child opens the database, commits strictly durable transactions in a
 //! loop, checkpointing and compacting every few commits, and prints an
 //! ack after each `write` returns. The parent kills it cold at a random
@@ -27,7 +27,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use fold3::{
+use bog::{
     DurabilityPolicy, StoreBuilder,
     schema::{Db, Declare, MapView, Schema, Set, ValueView},
 };
@@ -88,11 +88,11 @@ fn child(dir: &Path) -> ! {
 }
 
 fn main() {
-    if let Ok(dir) = std::env::var("FOLD3_CRASH_DIR") {
+    if let Ok(dir) = std::env::var("BOG_CRASH_DIR") {
         child(Path::new(&dir));
     }
 
-    let dir = std::env::temp_dir().join(format!("fold3-crash-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-crash-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let exe = std::env::current_exe().unwrap();
     let mut seed = SystemTime::now()
@@ -104,7 +104,7 @@ fn main() {
 
     for round in 0..ROUNDS {
         let mut victim = Command::new(&exe)
-            .env("FOLD3_CRASH_DIR", &dir)
+            .env("BOG_CRASH_DIR", &dir)
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn child");

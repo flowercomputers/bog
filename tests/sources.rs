@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-use fold3::{
+use bog::{
     DurabilityPolicy, Id, StoreBuilder, Tally,
     raw::{
         Cell, Change, Db, Distinct, Events, FlatMap, Flatten, FusedLinears, KeyspaceId, Multiset,
@@ -53,7 +53,7 @@ fn graph(version: u64) -> OpDag {
 }
 
 fn dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fold3-sources-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-sources-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -177,7 +177,7 @@ fn an_event_log_keeps_what_its_policy_says() {
     // a refused commit evicts nothing, and the count stays right after it
     let err = db.write(|tx| {
         READINGS.push(tx, (3, 1))?;
-        Err::<(), _>(fold3::Error::Rejected(Arc::new(std::fmt::Error)))
+        Err::<(), _>(bog::Error::Rejected(Arc::new(std::fmt::Error)))
     });
     assert!(err.is_err());
     db.write(|tx| READINGS.push(tx, (3, 100)).map(|_| ()))
@@ -285,7 +285,7 @@ fn a_subscription_follows_a_keyspace_from_its_snapshot() {
     assert_eq!(checkpoints.load(Ordering::SeqCst), through);
 
     drop(db);
-    assert!(matches!(sub.try_recv(), Err(fold3::raw::Closed)));
+    assert!(matches!(sub.try_recv(), Err(bog::raw::Closed)));
     assert!(late.recv().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }

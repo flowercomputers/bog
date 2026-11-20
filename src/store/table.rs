@@ -6,7 +6,7 @@
 //! never needs to know key or value types.
 //!
 //! ```text
-//! magic "fold3sst"
+//! magic "bogsst\0\0"
 //! data block*      entries, then crc32 of the entries
 //! index frame*     a run index's encoding, then crc32 of it
 //! index            per keyspace: the offset, length and first key of each
@@ -39,7 +39,7 @@ use crate::{
     store::index::TableIndexes,
 };
 
-const MAGIC: &[u8; 8] = b"fold3sst";
+const MAGIC: &[u8; 8] = b"bogsst\0\0";
 const FOOTER: usize = 8 + 8 + 8 + 4 + 8;
 /// The default block size: a block is cut once its entries reach this.
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4096;
@@ -781,7 +781,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("fold3-table-{name}-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("bog-table-{name}-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
     }

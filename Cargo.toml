@@ -1,15 +1,15 @@
 [package]
-name = "fold3"
+name = "bog"
 version = "0.1.0"
 edition = "2024"
 
 [features]
 default = ["derive"]
-derive = ["dep:fold3-derive"]
+derive = ["dep:bog-derive"]
 
 [dependencies]
 arc-swap = "1.9.3"
-fold3-derive = { path = "derive", optional = true }
+bog-derive = { path = "derive", optional = true }
 bytes = "1.12.1"
 crc32fast = "1.5.4"
 smallvec = "1.16.4"

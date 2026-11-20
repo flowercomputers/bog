@@ -1,4 +1,4 @@
-//! Derive macros for fold3.
+//! Derive macros for bog.
 //!
 //! - [`Codec`](macro@Codec): the positional binary encoding of a struct
 //!   or enum, for keys and values of stored keyspaces: `Codec`,
@@ -8,9 +8,9 @@
 //! - [`Schema`](macro@Schema): the faces of a database from a struct of
 //!   sources and views.
 //!
-//! Generated code refers to the library as `::fold3`. If the crate is
+//! Generated code refers to the library as `::bog`. If the crate is
 //! renamed or re-exported, point the derives at it with
-//! `#[fold3(crate = "path::to::fold3")]` on the deriving type.
+//! `#[bog(crate = "path::to::bog")]` on the deriving type.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as Ts;
@@ -21,24 +21,24 @@ fn compile_error(span: proc_macro2::Span, msg: &str) -> TokenStream {
     syn::Error::new(span, msg).to_compile_error().into()
 }
 
-/// The path generated code uses to reach the library: `::fold3` unless
-/// the deriving type overrides it with `#[fold3(crate = "path")]`.
+/// The path generated code uses to reach the library: `::bog` unless
+/// the deriving type overrides it with `#[bog(crate = "path")]`.
 fn crate_path(input: &DeriveInput) -> syn::Result<Path> {
     let mut path = None;
     for attr in &input.attrs {
-        if attr.path().is_ident("fold3") {
+        if attr.path().is_ident("bog") {
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("crate") {
                     let lit: syn::LitStr = meta.value()?.parse()?;
                     path = Some(lit.parse::<Path>()?);
                     Ok(())
                 } else {
-                    Err(meta.error("unsupported fold3 attribute; expected `crate = \"path\"`"))
+                    Err(meta.error("unsupported bog attribute; expected `crate = \"path\"`"))
                 }
             })?;
         }
     }
-    Ok(path.unwrap_or_else(|| parse_quote!(::fold3)))
+    Ok(path.unwrap_or_else(|| parse_quote!(::bog)))
 }
 
 /// Destructuring pattern and bound names for `fields`.
@@ -96,7 +96,7 @@ fn shape(fields: &Fields) -> Shape {
 /// retyping, adding or removing them changes the on-disk format of any
 /// keyspace using the type. Type parameters are bound by `Codec` and
 /// `OrderedCodec`.
-#[proc_macro_derive(Codec, attributes(fold3))]
+#[proc_macro_derive(Codec, attributes(bog))]
 pub fn derive_codec(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -248,7 +248,7 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
 ///
 /// The macro never inspects field *types*: each field's faces come from
 /// that type's `SourceDecl`, `ViewDecl` or `Schema` impl.
-#[proc_macro_derive(Schema, attributes(view, schema, fold3))]
+#[proc_macro_derive(Schema, attributes(view, schema, bog))]
 pub fn derive_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;

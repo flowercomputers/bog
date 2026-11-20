@@ -117,7 +117,7 @@ pub use crate::id::Id;
 pub use crate::source::Retain;
 
 #[cfg(feature = "derive")]
-pub use fold3_derive::{Codec, Schema};
+pub use bog_derive::{Codec, Schema};
 
 /// A write transaction, shared by the write facades of one
 /// transaction: a `RefCell` over a borrowed [`DbTx`], covariant in its

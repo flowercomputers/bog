@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use fold3::{
+use bog::{
     Error,
     schema::{Change, Declare, Events, MapView, Rejected, Schema, Table, ValueView},
 };
@@ -36,7 +36,7 @@ impl Declare for Bank {
     }
 }
 
-fn balances(db: &fold3::Db<Bank>) -> BTreeMap<u64, i64> {
+fn balances(db: &bog::Db<Bank>) -> BTreeMap<u64, i64> {
     db.read(|r| r.balances.iter().map(|r| r.unwrap()).collect())
 }
 

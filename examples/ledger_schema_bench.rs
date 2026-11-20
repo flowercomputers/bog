@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use fold3::{
+use bog::{
     DurabilityPolicy, StoreBuilder,
     schema::{
         Codec, Declare, Events, GroupView, Id, MapView, OrderedView, Schema, Table, ValueView,
@@ -119,7 +119,7 @@ fn main() {
     let txs: u64 = args[3].parse().unwrap();
 
     let dir =
-        std::env::temp_dir().join(format!("fold3-ledger-schema-bench-{}", std::process::id()));
+        std::env::temp_dir().join(format!("bog-ledger-schema-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = match mode.as_str() {
         "memory" => StoreBuilder::new(DurabilityPolicy::NONE),
@@ -173,7 +173,7 @@ fn main() {
     let transfers = txs * per_tx;
     let cpu = cpu1 - cpu0;
     println!(
-        "fold3-schema,{mode},{per_tx},{txs},{transfers},{secs:.3},{:.0},{:.0},{cpu:.3},{:.2},{:.1},{seed_s:.3}",
+        "bog-schema,{mode},{per_tx},{txs},{transfers},{secs:.3},{:.0},{:.0},{cpu:.3},{:.2},{:.1},{seed_s:.3}",
         transfers as f64 / secs,
         txs as f64 / secs,
         cpu * 1e6 / transfers as f64,

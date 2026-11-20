@@ -1,6 +1,6 @@
 #!/bin/sh
-# Run the ledger benchmark on fold2 and fold3, each config in a fresh
-# process, and print one CSV. Expects fold2 checked out beside fold3.
+# Run the ledger benchmark on fold2 and bog, each config in a fresh
+# process, and print one CSV. Expects fold2 checked out beside bog.
 set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
 fold2=${FOLD2:-$here/../fold2}

@@ -4,7 +4,7 @@
 
 use std::{borrow::Cow, collections::BTreeMap, path::PathBuf};
 
-use fold3::{
+use bog::{
     DurabilityPolicy, Error, Mergeless, StoreBuilder, Tally,
     dataflow::state::{Arrangement, Edge},
     raw::{
@@ -76,7 +76,7 @@ fn ledger(version: u64) -> OpDag {
 }
 
 fn dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fold3-ledger-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-ledger-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }

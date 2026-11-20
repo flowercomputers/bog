@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use fold3::{
+use bog::{
     schema::{Cell, ChangeSet, Declare, Events, MapView, Schema},
     tick::Ticker,
 };

@@ -11,7 +11,7 @@
 //! contain spaces but never tabs).
 //!
 //! ```text
-//! fold3 manifest v1
+//! bog manifest v1
 //! policy	write=always	fsync=every:1000000000ns
 //! next-file	3
 //! option	wal-limit	67108864
@@ -36,7 +36,7 @@ use crate::store::{DurabilityPolicy, DurabilityPolicyCadence};
 
 pub(crate) const MANIFEST: &str = "MANIFEST";
 pub(crate) const MANIFEST_TMP: &str = "MANIFEST.tmp";
-const HEADER: &str = "fold3 manifest v1";
+const HEADER: &str = "bog manifest v1";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Manifest {
@@ -420,9 +420,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_manifests() {
-        let ok = "fold3 manifest v1\npolicy\twrite=always\tfsync=never\nnext-file\t3\n";
+        let ok = "bog manifest v1\npolicy\twrite=always\tfsync=never\nnext-file\t3\n";
         assert!(Manifest::parse(ok).is_ok());
-        assert!(Manifest::parse("fold3 manifest v2\n").is_err());
+        assert!(Manifest::parse("bog manifest v2\n").is_err());
         assert!(Manifest::parse(&format!("{ok}wal\t1\tactive\nwal\t2\tactive\n")).is_err());
         assert!(Manifest::parse(&format!("{ok}wal\t2\tsealed\t0\nwal\t1\tactive\n")).is_err());
         assert!(Manifest::parse(&format!("{ok}wal\t3\tactive\n")).is_err());
