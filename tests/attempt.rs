@@ -25,13 +25,15 @@ struct Bank {
 
 impl Declare for Bank {
     fn declare(b: &mut BankBuilder) {
-        b.transfers.reject(|&(from, to, amount)| amount <= 0 || from == to);
+        b.transfers
+            .reject(|&(from, to, amount)| amount <= 0 || from == to);
         let out = b.transfers.key_by(|t| t.0).map(|t| -t.2);
         let into = b.transfers.key_by(|t| t.1).map(|t| t.2);
         b.balances.define(&out.concat(&into).sum());
         // checked after the graph runs: nobody but the mint (0) overdraws
         b.balances.reject(|acct, bal| *acct != 0 && *bal < 0);
-        b.by_owner.define(&b.accounts.unique_key(|name| name.clone()));
+        b.by_owner
+            .define(&b.accounts.unique_key(|name| name.clone()));
         b.transfer_count.define(&b.transfers.count());
     }
 }
@@ -80,7 +82,13 @@ fn a_failed_attempt_is_undone_and_the_rest_commits() {
         .unwrap();
     let ok: Vec<bool> = outcomes.iter().map(|r| r.is_ok()).collect();
     assert_eq!(ok, [true, false, false, false, false, true]);
-    assert!(outcomes[2].as_ref().unwrap_err().rejected::<Rejected>().is_some());
+    assert!(
+        outcomes[2]
+            .as_ref()
+            .unwrap_err()
+            .rejected::<Rejected>()
+            .is_some()
+    );
 
     assert_eq!(balances(&db), BTreeMap::from([(0, -100), (1, 60), (5, 40)]));
     db.read(|r| {
@@ -110,7 +118,10 @@ fn attempts_nest() {
         let r = tx.attempt(|tx| {
             tx.transfers.push((0, 2, 10))?;
             // the inner one fails alone
-            assert!(tx.attempt(|tx| tx.transfers.push((3, 1, 1)).map(drop)).is_err());
+            assert!(
+                tx.attempt(|tx| tx.transfers.push((3, 1, 1)).map(drop))
+                    .is_err()
+            );
             assert_eq!(tx.balances.get(&2)?, Some(10));
             tx.attempt(|tx| tx.transfers.push((0, 4, 10)).map(drop))?;
             // then the outer fails, taking the inner success with it
@@ -146,7 +157,11 @@ fn a_long_run_of_attempts_matches_a_model() {
                 let legal = amount > 0
                     && from != to
                     && (from == 0 || model.get(&from).copied().unwrap_or(0) >= amount);
-                assert_eq!(r.is_ok(), legal, "round {round} step {i}: {from}->{to} {amount}");
+                assert_eq!(
+                    r.is_ok(),
+                    legal,
+                    "round {round} step {i}: {from}->{to} {amount}"
+                );
                 if legal {
                     *model.entry(from).or_default() -= amount;
                     *model.entry(to).or_default() += amount;

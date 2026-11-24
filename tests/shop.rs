@@ -609,10 +609,7 @@ fn a_group_view_scans_a_range_of_keys() {
     // inside a transaction, the range sees the transaction's own writes
     db.write(|tx| {
         tx.readings.push((4, 8))?;
-        let seen = tx
-            .by_sensor
-            .range(3..=4)
-            .collect::<bog::Result<Vec<_>>>()?;
+        let seen = tx.by_sensor.range(3..=4).collect::<bog::Result<Vec<_>>>()?;
         assert_eq!(seen, vec![(3, 4, 1), (4, 8, 1)]);
         Ok(())
     })

@@ -11,10 +11,7 @@
 //! Views are left out: a replica derives them from the sources. To
 //! follow one view's changes, subscribe to it.
 
-use crate::{
-    dataflow::Delta,
-    store::codec,
-};
+use crate::{dataflow::Delta, store::codec};
 
 use super::subscribe::{Change, Commit, Subscription};
 

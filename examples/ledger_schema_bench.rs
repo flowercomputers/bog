@@ -118,8 +118,7 @@ fn main() {
     let per_tx: u64 = args[2].parse().unwrap();
     let txs: u64 = args[3].parse().unwrap();
 
-    let dir =
-        std::env::temp_dir().join(format!("bog-ledger-schema-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bog-ledger-schema-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = match mode.as_str() {
         "memory" => StoreBuilder::new(DurabilityPolicy::NONE),

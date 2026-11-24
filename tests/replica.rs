@@ -5,8 +5,7 @@
 use std::sync::mpsc;
 
 use bog::schema::{
-    Cell, ChangeSet, Declare, Events, MapView, Multiset, OrderedView, Schema, Set, Table,
-    ValueView,
+    Cell, ChangeSet, Declare, Events, MapView, Multiset, OrderedView, Schema, Set, Table, ValueView,
 };
 
 #[derive(Schema)]
@@ -61,10 +60,17 @@ fn state(db: &bog::Db<World>) -> String {
             r.log.iter().map(|r| r.unwrap().1).collect::<Vec<_>>(),
             r.title.get().unwrap(),
             r.tags.iter().map(|r| r.unwrap()).collect::<Vec<_>>(),
-            r.inner.members.iter().map(|r| r.unwrap()).collect::<Vec<_>>(),
+            r.inner
+                .members
+                .iter()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>(),
             r.inner.member_count.get().unwrap(),
             r.at.iter().map(|r| r.unwrap()).collect::<Vec<_>>(),
-            r.name_lengths.desc().map(|r| r.unwrap()).collect::<Vec<_>>(),
+            r.name_lengths
+                .desc()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>(),
             r.tag_total.get().unwrap(),
             r.log_count.get().unwrap(),
         )
@@ -127,14 +133,18 @@ fn a_replica_fed_every_commit_derives_the_same_state() {
 
     // an attempt that fails leaves no trace in the commit's changes
     db.write(|tx| {
-        assert!(tx.attempt(|tx| tx.players.upsert(7, ("zed".into(), 20))).is_err());
+        assert!(
+            tx.attempt(|tx| tx.players.upsert(7, ("zed".into(), 20)))
+                .is_err()
+        );
         tx.players.upsert(8, ("yan".into(), 30))
     })
     .unwrap();
     assert_eq!(sync(&db), [4]);
 
     // a commit that changes nothing reports nothing
-    db.write(|tx| tx.players.upsert(8, ("yan".into(), 30))).unwrap();
+    db.write(|tx| tx.players.upsert(8, ("yan".into(), 30)))
+        .unwrap();
     assert_eq!(sync(&db), [] as [u64; 0]);
 }
 

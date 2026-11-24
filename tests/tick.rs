@@ -55,7 +55,10 @@ fn a_tick_is_one_commit_and_bad_units_fail_alone() {
         });
     }
     assert_eq!(ticker.queued(), 4);
-    assert!(commits.lock().unwrap().is_empty(), "nothing runs before the tick");
+    assert!(
+        commits.lock().unwrap().is_empty(),
+        "nothing runs before the tick"
+    );
 
     assert_eq!(ticker.tick().unwrap(), 1);
     // 2 has nothing to send at first, and too little later
