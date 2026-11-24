@@ -4,7 +4,7 @@ use std::fmt;
 
 pub use bytes::BufMut;
 
-// TODO: derive Codec, OrderedCodec needed
+use crate::dataflow::Fingerprint;
 
 /// Why a byte slice could not be decoded.
 ///
@@ -135,12 +135,166 @@ impl ResidentSize for std::sync::Arc<str> {
     }
 }
 
-pub trait Codec: Sized + ResidentSize {
+/// The shape of a type's encoding, for telling whether stored bytes
+/// still decode as the type that reads them.
+///
+/// A keyspace records the [`LayoutHash`] of its key and value types, and
+/// opening it under types with another refuses, where decoding
+/// positional bytes as the wrong shape would otherwise go unnoticed.
+///
+/// The hash covers what the bytes are, not what the types are called:
+/// names, field names and module paths are left out, and a struct or
+/// tuple contributes its fields one after another, as it encodes. So
+/// renaming, moving or newtype-wrapping a type is free, while adding,
+/// removing, reordering or retyping a field is a different layout.
+///
+/// The derive implements it. A hand-written codec describes itself with
+/// [`LayoutHash::atom`], under a tag to change whenever its bytes do:
+///
+/// ```ignore
+/// impl Layout for Money {
+///     fn layout(l: &mut LayoutHash) {
+///         l.atom("money/1");
+///     }
+/// }
+/// ```
+///
+/// One layout covers both the plain and the ordered encoding, which are
+/// two writings of the same fields.
+pub trait Layout {
+    fn layout(l: &mut LayoutHash);
+}
+
+/// What a [`Layout`] is written to: a stable hash of a token stream.
+pub struct LayoutHash {
+    fp: Fingerprint,
+    /// The named types being described, outermost first, so one that
+    /// contains itself is described once.
+    open: Vec<&'static str>,
+}
+
+impl Default for LayoutHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LayoutHash {
+    const ATOM: u8 = 1;
+    const OPEN: u8 = 2;
+    const CLOSE: u8 = 3;
+    const AGAIN: u8 = 4;
+
+    pub fn new() -> Self {
+        LayoutHash {
+            fp: Fingerprint::new(),
+            open: Vec::new(),
+        }
+    }
+
+    /// The layout of `T`.
+    pub fn of<T: Layout>() -> u64 {
+        let mut l = Self::new();
+        T::layout(&mut l);
+        l.finish()
+    }
+
+    pub fn finish(&self) -> u64 {
+        self.fp.finish()
+    }
+
+    /// An encoding with no parts: a primitive, or a hand-written codec.
+    pub fn atom(&mut self, tag: &str) {
+        self.fp.write(&[Self::ATOM]);
+        self.fp.write_str(tag);
+    }
+
+    /// An encoding that frames its parts, so they do not run on from
+    /// what is around them: an option, a list, one variant of an enum.
+    /// `parts` writes the parts.
+    pub fn group(&mut self, kind: &str, parts: impl FnOnce(&mut Self)) {
+        self.fp.write(&[Self::OPEN]);
+        self.fp.write_str(kind);
+        parts(self);
+        self.fp.write(&[Self::CLOSE]);
+    }
+
+    /// The fields of the named type `T`, written by `fields`. A type
+    /// reached again inside itself is written as a reference back to
+    /// the first, so a recursive type has a finite layout.
+    pub fn named<T: ?Sized>(&mut self, fields: impl FnOnce(&mut Self)) {
+        let name = std::any::type_name::<T>();
+        if let Some(at) = self.open.iter().rposition(|open| *open == name) {
+            self.fp.write(&[Self::AGAIN]);
+            self.fp.write_u64((self.open.len() - at) as u64);
+            return;
+        }
+        self.open.push(name);
+        fields(self);
+        self.open.pop();
+    }
+}
+
+macro_rules! impl_atom_layout {
+    ($($t:ty => $tag:literal),* $(,)?) => {$(
+        impl Layout for $t {
+            fn layout(l: &mut LayoutHash) {
+                l.atom($tag);
+            }
+        }
+    )*};
+}
+impl_atom_layout!(
+    bool => "bool", char => "char",
+    u8 => "u8", u16 => "u16", u32 => "u32", u64 => "u64", u128 => "u128",
+    i8 => "i8", i16 => "i16", i32 => "i32", i64 => "i64", i128 => "i128",
+    // every string type encodes alike
+    String => "str", Box<str> => "str", std::rc::Rc<str> => "str", std::sync::Arc<str> => "str",
+);
+
+impl Layout for () {
+    fn layout(_: &mut LayoutHash) {}
+}
+
+impl<T: Layout> Layout for Option<T> {
+    fn layout(l: &mut LayoutHash) {
+        l.group("option", T::layout);
+    }
+}
+
+impl<T: Layout> Layout for crate::dataflow::state::Edge<T> {
+    fn layout(l: &mut LayoutHash) {
+        l.group("edge", T::layout);
+    }
+}
+
+impl<T: Layout, const N: usize> Layout for [T; N] {
+    fn layout(l: &mut LayoutHash) {
+        l.group("array", |l| {
+            l.atom(&N.to_string());
+            T::layout(l);
+        });
+    }
+}
+
+impl<T: Layout> Layout for Vec<T> {
+    fn layout(l: &mut LayoutHash) {
+        l.group("vec", T::layout);
+    }
+}
+
+impl<T: Layout> Layout for std::cmp::Reverse<T> {
+    fn layout(l: &mut LayoutHash) {
+        l.group("reverse", T::layout);
+    }
+}
+
+pub trait Codec: Sized + ResidentSize + Layout {
     fn encode(&self, out: &mut impl BufMut);
     fn decode(b: &mut &[u8]) -> Result<Self>;
     fn encode_size(&self) -> usize;
 }
-pub trait OrderedCodec: Ord + Sized + ResidentSize {
+pub trait OrderedCodec: Ord + Sized + ResidentSize + Layout {
     fn encode_ordered(&self, out: &mut impl BufMut);
     fn decode_ordered(b: &mut &[u8]) -> Result<Self>;
     fn encode_ordered_size(&self) -> usize;
@@ -631,6 +785,10 @@ macro_rules! impl_tuple_codec {
             fn resident_size(&self) -> usize {
                 size_of::<Self>() $( + heap_size(&self.$idx) )+
             }
+        }
+        // a tuple encodes as its fields, one after another
+        impl<$($name: Layout),+> Layout for ($($name,)+) {
+            fn layout(l: &mut LayoutHash) { $( $name::layout(l); )+ }
         }
         impl<$($name: Codec),+> Codec for ($($name,)+) {
             fn encode(&self, out: &mut impl BufMut) { $( self.$idx.encode(out); )+ }

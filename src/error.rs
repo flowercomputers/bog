@@ -40,6 +40,15 @@ pub enum Error {
         recorded: (String, String),
         registered: (&'static str, &'static str),
     },
+    /// A keyspace is registered with types that encode differently from
+    /// those it was written with: a field added, removed, reordered or
+    /// retyped. Carries the type names on each side, which may well be
+    /// the same. See [`Layout`](crate::store::codec::Layout).
+    KeyspaceLayout {
+        id: u64,
+        recorded: (String, String),
+        registered: (&'static str, &'static str),
+    },
     /// The store holds data for a keyspace that was not registered.
     UnknownKeyspace(u64),
     /// A write transaction outgrew its memory limit and was killed.
@@ -114,6 +123,15 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "keyspace {id} was written as {recorded:?} but is registered as {registered:?}"
+            ),
+            Self::KeyspaceLayout {
+                id,
+                recorded,
+                registered,
+            } => write!(
+                f,
+                "keyspace {id}, registered as {registered:?}, was written as {recorded:?} \
+                 under another layout: its rows no longer decode as these types"
             ),
             Self::UnknownKeyspace(id) => {
                 write!(f, "the store holds keyspace {id}, which is not registered")

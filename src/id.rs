@@ -20,7 +20,7 @@ use std::{
     marker::PhantomData,
 };
 
-use crate::store::codec::{self, BufMut, Codec, OrderedCodec, ResidentSize};
+use crate::store::codec::{self, BufMut, Codec, Layout, LayoutHash, OrderedCodec, ResidentSize};
 
 const SEQ_BITS: u32 = 24;
 const SEQ_MASK: u64 = (1 << SEQ_BITS) - 1;
@@ -111,6 +111,12 @@ impl<T> From<u64> for Id<T> {
 impl<T> ResidentSize for Id<T> {
     fn resident_size(&self) -> usize {
         size_of::<Self>()
+    }
+}
+/// An id encodes as its integer, whatever it names.
+impl<T> Layout for Id<T> {
+    fn layout(l: &mut LayoutHash) {
+        u64::layout(l);
     }
 }
 impl<T> Codec for Id<T> {

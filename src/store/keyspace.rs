@@ -2,12 +2,30 @@
 
 use super::*;
 
+/// The layout of a keyspace's rows: its key's, how its values merge,
+/// and its value's. See [`Layout`](codec::Layout).
+pub(super) fn keyspace_layout<K, M>() -> u64
+where
+    K: OrderedCodec,
+    M: Merge,
+    M::Value: Codec,
+{
+    let mut l = codec::LayoutHash::new();
+    l.group("key", K::layout);
+    l.group("merge", M::kind);
+    l.group("value", <M::Value as codec::Layout>::layout);
+    l.finish()
+}
+
 /// A keyspace's types, captured when it is registered with the builder.
 /// Replay uses it to decode WAL sections; transactions use it to refuse
 /// keyspaces nobody declared.
 pub(super) struct KeyspaceDecl {
     pub(super) key: &'static str,
     pub(super) merge: &'static str,
+    /// The [layout](keyspace_layout) of its rows, which is what the
+    /// manifest holds it to; the names above are for messages.
+    pub(super) layout: u64,
     /// Whether a graph computes it from other keyspaces, so it can be
     /// truncated and recomputed when the graph changes.
     pub(super) derived: bool,

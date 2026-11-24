@@ -8,6 +8,7 @@ pub struct StoreBuilder {
     pub(super) keyspaces: HashMap<u64, KeyspaceDecl>,
     pub(super) opts: StoreOptions,
     pub(super) graph: u64,
+    pub(super) adopt_layouts: bool,
 }
 
 impl StoreBuilder {
@@ -20,7 +21,24 @@ impl StoreBuilder {
             keyspaces: HashMap::new(),
             opts: StoreOptions::default(),
             graph: 0,
+            adopt_layouts: false,
         }
+    }
+
+    /// Open even where a keyspace's registered [layout](codec::Layout)
+    /// differs from the one it was written with, and record the
+    /// registered one, instead of failing with
+    /// [`Error::KeyspaceLayout`].
+    ///
+    /// For a change the stored bytes still decode under, which the
+    /// layout cannot tell from one they do not: a variant appended to an
+    /// enum, or a hand-written codec that reads both its old and new
+    /// forms. Nothing is checked, for any keyspace: rows written under a
+    /// layout they do not decode as fail, or decode as something else,
+    /// when they are read. Open once with it and take it out again.
+    pub fn adopt_layouts(mut self) -> Self {
+        self.adopt_layouts = true;
+        self
     }
 
     /// Replace every size limit at once.
@@ -137,6 +155,7 @@ impl StoreBuilder {
         let decl = KeyspaceDecl {
             key: type_name::<K>(),
             merge: type_name::<M>(),
+            layout: keyspace_layout::<K, M>(),
             derived,
             replay: replay_section::<K, M>,
             write_run: write_run::<K, M>,
@@ -228,6 +247,7 @@ impl StoreBuilder {
             keyspaces,
             opts,
             graph,
+            adopt_layouts,
         } = self;
         dp.validate().map_err(Error::Policy)?;
         let opts = opts.resolved();
@@ -241,8 +261,7 @@ impl StoreBuilder {
         derived.sort_unstable_by_key(|(id, _)| **id);
         for (id, d) in derived {
             fp.write_u64(*id);
-            fp.write_str(d.key);
-            fp.write_str(d.merge);
+            fp.write_u64(d.layout);
         }
         let fp = fp.finish();
 
@@ -285,14 +304,31 @@ impl StoreBuilder {
             None => Manifest::new(dp),
         };
         for (id, decl) in &keyspaces {
-            if let Some((key, merge)) = m.keyspaces.get(id)
-                && (key.as_str(), merge.as_str()) != (decl.key, decl.merge)
-            {
-                return Err(Error::KeyspaceType {
-                    id: *id,
-                    recorded: (key.clone(), merge.clone()),
-                    registered: (decl.key, decl.merge),
-                });
+            let Some((key, merge)) = m.keyspaces.get(id) else {
+                continue;
+            };
+            let recorded = (key.clone(), merge.clone());
+            let registered = (decl.key, decl.merge);
+            match m.layouts.get(id) {
+                Some(layout) if *layout == decl.layout || adopt_layouts => {}
+                Some(_) => {
+                    return Err(Error::KeyspaceLayout {
+                        id: *id,
+                        recorded,
+                        registered,
+                    });
+                }
+                // written before layouts were recorded: the type names
+                // are all there is to hold it to, and its layout is
+                // recorded from here on
+                None if (key.as_str(), merge.as_str()) == registered => {}
+                None => {
+                    return Err(Error::KeyspaceType {
+                        id: *id,
+                        recorded,
+                        registered,
+                    });
+                }
             }
         }
         // derived keyspaces nobody declares any more; their data is ignored
@@ -356,6 +392,9 @@ impl StoreBuilder {
                 .iter()
                 .map(|(id, d)| (*id, (d.key.to_string(), d.merge.to_string()))),
         );
+        m.layouts.retain(|id, _| dropped.contains(id));
+        m.layouts
+            .extend(keyspaces.iter().map(|(id, d)| (*id, d.layout)));
         m.derived = keyspaces
             .iter()
             .filter(|(_, d)| d.derived)

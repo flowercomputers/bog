@@ -17,6 +17,8 @@
 //! option	wal-limit	67108864
 //! keyspace	7	u8	(i64, i64)
 //! keyspace	9	u8	()	derived
+//! layout	7	01c477aa9e02d3b5
+//! layout	9	5d0e88f3a1c2b497
 //! graph	9f3c6a1e2b4d5c70
 //! floor	9	31
 //! checkpoint	1	40
@@ -50,6 +52,10 @@ pub(crate) struct Manifest {
     pub options: BTreeMap<String, u64>,
     /// Keyspace id to (key type, merge type), as `std::any::type_name`.
     pub keyspaces: BTreeMap<u64, (String, String)>,
+    /// Keyspace id to the layout of its rows, which a keyspace is held
+    /// to when it is registered; the type names are kept for messages.
+    /// Absent for a keyspace last written before layouts were recorded.
+    pub layouts: BTreeMap<u64, u64>,
     /// The keyspaces among `keyspaces` that hold derived state, which a
     /// graph computes from the rest and can recompute.
     pub derived: BTreeSet<u64>,
@@ -105,6 +111,7 @@ impl Manifest {
             next_file: 1,
             options: BTreeMap::new(),
             keyspaces: BTreeMap::new(),
+            layouts: BTreeMap::new(),
             derived: BTreeSet::new(),
             graph: None,
             floors: BTreeMap::new(),
@@ -165,6 +172,9 @@ impl Manifest {
             };
             s.push_str(&format!("keyspace\t{id}\t{key}\t{merge}{role}\n"));
         }
+        for (id, layout) in &self.layouts {
+            s.push_str(&format!("layout\t{id}\t{layout:016x}\n"));
+        }
         if let Some(fp) = self.graph {
             s.push_str(&format!("graph\t{fp:016x}\n"));
         }
@@ -194,6 +204,7 @@ impl Manifest {
         let mut policy = None;
         let mut next_file = None;
         let mut keyspaces = BTreeMap::new();
+        let mut layouts = BTreeMap::new();
         let mut derived = BTreeSet::new();
         let mut graph = None;
         let mut floors = BTreeMap::new();
@@ -245,6 +256,14 @@ impl Manifest {
                         .is_some()
                     {
                         return Err(at(format!("duplicate keyspace {id}")));
+                    }
+                }
+                ["layout", id, layout] => {
+                    let id = parse_u64(id).map_err(at)?;
+                    let layout = u64::from_str_radix(layout, 16)
+                        .map_err(|_| at(format!("bad layout {layout:?}")))?;
+                    if layouts.insert(id, layout).is_some() {
+                        return Err(at(format!("duplicate layout for keyspace {id}")));
                     }
                 }
                 ["graph", fp] => {
@@ -304,6 +323,7 @@ impl Manifest {
             next_file: next_file.ok_or("manifest has no next-file")?,
             options,
             keyspaces,
+            layouts,
             derived,
             graph,
             floors,
@@ -399,6 +419,7 @@ mod tests {
         m.options.insert("wal-limit".into(), 1 << 26);
         m.keyspaces.insert(7, ("u8".into(), "(i64, i64)".into()));
         m.keyspaces.insert(9, ("u8".into(), "()".into()));
+        m.layouts.insert(7, 0x01c4_77aa_9e02_d3b5);
         m.derived.insert(9);
         m.graph = Some(0x9f3c_6a1e_2b4d_5c70);
         m.floors.insert(9, 4);

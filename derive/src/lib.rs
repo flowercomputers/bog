@@ -2,7 +2,7 @@
 //!
 //! - [`Codec`](macro@Codec): the positional binary encoding of a struct
 //!   or enum, for keys and values of stored keyspaces: `Codec`,
-//!   `OrderedCodec` and `ResidentSize` at once. **Field order is the
+//!   `OrderedCodec`, `ResidentSize` and `Layout` at once. **Field order is the
 //!   schema and the sort order**: fields encode one after another with
 //!   no names or tags, and a key struct sorts by its leading fields.
 //! - [`Schema`](macro@Schema): the faces of a database from a struct of
@@ -89,12 +89,15 @@ fn shape(fields: &Fields) -> Shape {
 }
 
 /// Positional binary encoding for keys and values: `Codec`,
-/// `OrderedCodec` and `ResidentSize`. Fields encode in declaration
-/// order; enum variants carry a one-byte tag in declaration order.
+/// `OrderedCodec`, `ResidentSize` and `Layout`. Fields encode in
+/// declaration order; enum variants carry a one-byte tag in declaration
+/// order.
 ///
-/// The layout carries no names: renaming fields is free, but reordering,
-/// retyping, adding or removing them changes the on-disk format of any
-/// keyspace using the type. Type parameters are bound by `Codec` and
+/// The layout carries no names: renaming the type or its fields is free,
+/// but reordering, retyping, adding or removing fields or variants
+/// changes the on-disk format of any keyspace using the type, and its
+/// `Layout` with it, so a store written under the old one refuses to
+/// open rather than misread its rows. Type parameters are bound by `Codec` and
 /// `OrderedCodec`.
 #[proc_macro_derive(Codec, attributes(bog))]
 pub fn derive_codec(input: TokenStream) -> TokenStream {
@@ -113,8 +116,8 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
     }
     let (impl_g, ty_g, where_c) = generics.split_for_impl();
 
-    // the body of each of the seven methods
-    let (encode, encode_ordered, size, size_ordered, resident, decode, decode_ordered);
+    // the body of each of the eight methods
+    let (encode, encode_ordered, size, size_ordered, resident, decode, decode_ordered, layout);
     match &input.data {
         Data::Struct(s) => {
             let Shape {
@@ -128,6 +131,8 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
             size = quote! { let Self #pattern = self; 0 #( + <#types as #codec::Codec>::encode_size(#names) )* };
             size_ordered = quote! { let Self #pattern = self; 0 #( + <#types as #codec::OrderedCodec>::encode_ordered_size(#names) )* };
             resident = quote! { let Self #pattern = self; ::std::mem::size_of::<Self>() #( + #codec::heap_size(#names) )* };
+            // a struct encodes as its fields, one after another
+            layout = quote! { #( <#types as #codec::Layout>::layout(__l); )* };
             decode = quote! {
                 #( let #names = <#types as #codec::Codec>::decode(__input)?; )*
                 ::std::result::Result::Ok(Self #ctor)
@@ -148,6 +153,7 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
             let mut res_arms = Ts::new();
             let mut dec_arms = Ts::new();
             let mut dec_ord_arms = Ts::new();
+            let mut variants = Ts::new();
             for (i, v) in e.variants.iter().enumerate() {
                 let tag = i as u8;
                 let vname = &v.ident;
@@ -175,6 +181,9 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
                 dec_arms.extend(quote! {
                     #tag => { #( let #names = <#types as #codec::Codec>::decode(__input)?; )* ::std::result::Result::Ok(Self::#vname #ctor) }
                 });
+                variants.extend(quote! {
+                    __l.group("variant", |__l| { #( <#types as #codec::Layout>::layout(__l); )* });
+                });
                 dec_ord_arms.extend(quote! {
                     #tag => { #( let #names = <#types as #codec::OrderedCodec>::decode_ordered(__input)?; )* ::std::result::Result::Ok(Self::#vname #ctor) }
                 });
@@ -185,6 +194,7 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
             size = quote! { match self { #size_arms } };
             size_ordered = quote! { match self { #size_ord_arms } };
             resident = quote! { match self { #res_arms } };
+            layout = quote! { __l.group("enum", |__l| { #variants }); };
             decode = quote! {
                 match <u8 as #codec::Codec>::decode(__input)? {
                     #dec_arms
@@ -205,6 +215,11 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
         impl #impl_g #codec::ResidentSize for #name #ty_g #where_c {
             fn resident_size(&self) -> usize {
                 #resident
+            }
+        }
+        impl #impl_g #codec::Layout for #name #ty_g #where_c {
+            fn layout(__l: &mut #codec::LayoutHash) {
+                __l.named::<Self>(|__l| { #layout });
             }
         }
         impl #impl_g #codec::Codec for #name #ty_g #where_c {

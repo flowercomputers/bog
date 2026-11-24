@@ -223,6 +223,130 @@ fn torn_tail_is_sealed_and_later_commits_survive() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Two key types that encode alike under different names, and one that
+/// keeps a name while its encoding changes.
+mod layouts {
+    use crate::store::codec::{BufMut, Codec, Layout, LayoutHash, OrderedCodec, ResidentSize};
+
+    macro_rules! byte_key {
+        ($name:ident, $tag:literal) => {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+            pub struct $name(pub u8);
+            impl ResidentSize for $name {
+                fn resident_size(&self) -> usize {
+                    1
+                }
+            }
+            impl Layout for $name {
+                fn layout(l: &mut LayoutHash) {
+                    l.atom($tag);
+                }
+            }
+            impl Codec for $name {
+                fn encode(&self, out: &mut impl BufMut) {
+                    self.0.encode(out)
+                }
+                fn decode(b: &mut &[u8]) -> crate::store::codec::Result<Self> {
+                    u8::decode(b).map($name)
+                }
+                fn encode_size(&self) -> usize {
+                    1
+                }
+            }
+            impl OrderedCodec for $name {
+                fn encode_ordered(&self, out: &mut impl BufMut) {
+                    self.0.encode_ordered(out)
+                }
+                fn decode_ordered(b: &mut &[u8]) -> crate::store::codec::Result<Self> {
+                    u8::decode_ordered(b).map($name)
+                }
+                fn encode_ordered_size(&self) -> usize {
+                    1
+                }
+            }
+        };
+    }
+    byte_key!(Renamed, "u8");
+    byte_key!(Reshaped, "byte-key/2");
+}
+
+#[test]
+fn a_keyspace_is_held_to_its_layout_and_not_its_type_names() {
+    use layouts::{Renamed, Reshaped};
+    let dir = tmpdir("layouts");
+    {
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        put(&store, &[(1, Some(10))]);
+    }
+    let reopen = |b: StoreBuilder| b.dir(&dir).build();
+    let relaxed = || StoreBuilder::new(DurabilityPolicy::RELAXED);
+
+    // another name for the same bytes opens and reads what was written
+    let renamed = KeyspaceId::<Renamed, i64>::new(3);
+    {
+        let store = reopen(relaxed().keyspace(renamed)).unwrap();
+        let snap = store.snapshot();
+        let got = snap.get(renamed, &Renamed(1)).unwrap();
+        assert_eq!(got.map(|v| *v), Some(10));
+    }
+    assert_eq!(
+        manifest_of(&dir).layouts.get(&3),
+        Some(&keyspace_layout::<u8, i64>())
+    );
+
+    // other bytes do not, whatever they are called
+    let reshaped = KeyspaceId::<Reshaped, i64>::new(3);
+    let refused = reopen(relaxed().keyspace(reshaped));
+    assert!(matches!(refused, Err(Error::KeyspaceLayout { id: 3, .. })));
+    // nor does another way of merging the same bytes
+    let remerged = reopen(relaxed().keyspace(KeyspaceId::<u8, crate::Mergeless<i64>>::new(3)));
+    assert!(matches!(remerged, Err(Error::KeyspaceLayout { id: 3, .. })));
+    // a refused open records nothing
+    assert!(open(&dir, DurabilityPolicy::RELAXED).is_ok());
+
+    // unless the caller vouches for the stored rows, once
+    drop(reopen(relaxed().keyspace(reshaped).adopt_layouts()).unwrap());
+    assert!(reopen(relaxed().keyspace(reshaped)).is_ok());
+    assert!(matches!(
+        open(&dir, DurabilityPolicy::RELAXED),
+        Err(Error::KeyspaceLayout { id: 3, .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_store_from_before_layouts_is_held_to_its_type_names_then_recorded() {
+    let dir = tmpdir("layouts-legacy");
+    {
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        put(&store, &[(1, Some(10))]);
+    }
+    let forget_layouts = || {
+        let mut m = manifest_of(&dir);
+        assert!(!m.layouts.is_empty());
+        m.layouts.clear();
+        manifest::stage(&dir, &m).unwrap();
+        assert!(manifest::install(&dir).is_ok());
+    };
+
+    forget_layouts();
+    let renamed = StoreBuilder::new(DurabilityPolicy::RELAXED)
+        .dir(&dir)
+        .keyspace(KeyspaceId::<layouts::Renamed, i64>::new(3))
+        .build();
+    assert!(matches!(renamed, Err(Error::KeyspaceType { id: 3, .. })));
+
+    {
+        let store = open(&dir, DurabilityPolicy::RELAXED).unwrap();
+        assert_eq!(read(&store, 1), Some(10));
+    }
+    assert_eq!(
+        manifest_of(&dir).layouts.get(&3),
+        Some(&keyspace_layout::<u8, i64>())
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn keyspaces_must_be_registered_with_their_written_types() {
     let dir = tmpdir("types");
@@ -234,7 +358,7 @@ fn keyspaces_must_be_registered_with_their_written_types() {
         .dir(&dir)
         .keyspace(KeyspaceId::<u8, (i64, i64)>::new(3))
         .build();
-    assert!(matches!(other, Err(Error::KeyspaceType { id: 3, .. })));
+    assert!(matches!(other, Err(Error::KeyspaceLayout { id: 3, .. })));
 
     let missing = StoreBuilder::new(DurabilityPolicy::RELAXED)
         .dir(&dir)

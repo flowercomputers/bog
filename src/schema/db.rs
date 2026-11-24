@@ -68,6 +68,14 @@ impl<S: Declare> DbBuilder<S> {
         self
     }
 
+    /// Record the schema's layouts over those the store was written
+    /// with, where they differ, instead of refusing to open. See
+    /// [`StoreBuilder::adopt_layouts`].
+    pub fn adopt_layouts(mut self) -> Self {
+        self.store = self.store.adopt_layouts();
+        self
+    }
+
     /// A version mixed into the graph's fingerprint. Derived state is
     /// rebuilt when the graph's shape changes; bump the version to
     /// rebuild it when only a closure's body did.

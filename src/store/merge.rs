@@ -3,6 +3,7 @@ use std::{borrow::Cow, convert::Infallible};
 use bytes::Bytes;
 
 use crate::dataflow::Delta;
+use crate::store::codec::LayoutHash;
 
 pub enum ValOp<M: Merge> {
     Store(M::Value),
@@ -19,6 +20,12 @@ pub trait Merge: 'static {
     fn merge<'a>(val: &mut Self::Value, diffs: impl Iterator<Item = Cow<'a, Self::Diff>>);
     fn combine<'a>(old: &mut Self::Diff, new: impl Iterator<Item = Cow<'a, Self::Diff>>);
     fn scale(diff: &mut Self::Diff, times: Delta);
+
+    /// How values of this type combine, as part of a keyspace's
+    /// recorded [layout](crate::store::codec::Layout): two merge types
+    /// that write the same kind keep a keyspace the same way. The
+    /// value's own layout is recorded beside it.
+    fn kind(l: &mut LayoutHash);
 
     /// Optional fast path for determining when a value should automatically be considered deleted
     fn consider_delete(_val: &Self::Value) -> bool {
@@ -58,6 +65,9 @@ impl Merge for Tally {
     fn base() -> Delta {
         0
     }
+    fn kind(l: &mut LayoutHash) {
+        l.atom("tally");
+    }
     #[inline]
     fn merge<'a>(val: &mut Delta, diffs: impl Iterator<Item = Cow<'a, Delta>>) {
         for d in diffs {
@@ -94,6 +104,9 @@ impl Merge for () {
     fn merge<'a>(_: &mut Self::Value, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {}
     fn combine<'a>(_: &mut Self::Diff, _: impl Iterator<Item = Cow<'a, Self::Diff>>) {}
     fn scale(_: &mut Self::Diff, _: Delta) {}
+    fn kind(l: &mut LayoutHash) {
+        l.atom("unit");
+    }
 }
 
 macro_rules! impl_int_merge {
@@ -118,6 +131,9 @@ macro_rules! impl_int_merge {
             }
             fn scale(d: &mut $t, n: Delta) {
                 *d *= n as $t;
+            }
+            fn kind(l: &mut LayoutHash) {
+                l.atom("sum");
             }
         }
     )*};
@@ -165,6 +181,12 @@ impl<A: Merge, B: Merge> Merge for (A, B) {
     fn noop(diff: &Self::Diff) -> bool {
         A::noop(&diff.0) && B::noop(&diff.1)
     }
+    fn kind(l: &mut LayoutHash) {
+        l.group("pair", |l| {
+            A::kind(l);
+            B::kind(l);
+        });
+    }
 }
 
 pub struct Sparse<M>(M);
@@ -201,6 +223,9 @@ impl<M: Merge> Merge for Sparse<M> {
         if let Some(d) = d {
             M::scale(d, n)
         }
+    }
+    fn kind(l: &mut LayoutHash) {
+        l.group("sparse", M::kind);
     }
     #[inline]
     fn consider_delete(val: &Self::Value) -> bool {
@@ -307,6 +332,9 @@ impl<T: 'static + Send + Clone> Merge for Mergeless<T> {
     }
     fn scale(_: &mut Self::Diff, _: Delta) {
         unreachable!("")
+    }
+    fn kind(l: &mut LayoutHash) {
+        l.atom("mergeless");
     }
 }
 

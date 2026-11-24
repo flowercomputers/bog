@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use crate::{
     dataflow::Delta,
     dataflow::state::Edge,
-    store::codec::{Codec, OrderedCodec, ResidentSize, heap_size},
+    store::codec::{Codec, Layout, LayoutHash, OrderedCodec, ResidentSize, heap_size},
     store::merge::Change as RawChange,
     store::merge::Merge,
     store::merge::{Mergeless, Tally},
@@ -42,6 +42,12 @@ impl<V: ResidentSize> ResidentSize for Change<V> {
                 Change::Insert(v) | Change::Delete(v) => heap_size(v),
                 Change::Replace(old, new) => heap_size(old) + heap_size(new),
             }
+    }
+}
+
+impl<V: Layout> Layout for Change<V> {
+    fn layout(l: &mut LayoutHash) {
+        l.group("change", V::layout);
     }
 }
 
